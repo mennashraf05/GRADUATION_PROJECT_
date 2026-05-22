@@ -1,0 +1,262 @@
+.ua-page {
+  padding-bottom: 24px;
+}
+
+.ua-page .mr-surface {
+  overflow: visible;
+}
+
+.ua-page .mr-history-panel {
+  overflow: hidden;
+}
+
+.ua-page .mr-title {
+  font-size: 44px;
+  line-height: 1.04;
+}
+
+.ua-page .mr-subtitle {
+  font-size: 15px;
+  line-height: 1.65;
+}
+
+.ua-page .mr-description {
+  font-size: 14px;
+  line-height: 1.72;
+}
+
+.ua-page .mr-control-title {
+  font-size: 18px;
+}
+
+.ua-page .mr-control-copy,
+.ua-page .mr-control-copy-secondary,
+.ua-page .mr-history-copy {
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.ua-page .mr-card-label,
+.ua-page .mr-cell-label {
+  font-size: 12px;
+}
+
+.ua-page .mr-card-value {
+  font-size: 17px;
+  line-height: 1.28;
+  letter-spacing: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+.ua-page .mr-stat-value {
+  font-size: 24px;
+}
+
+.ua-page .mr-card-note {
+  margin-top: 8px;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.ua-page .mr-hero-cards {
+  grid-template-columns: repeat(3, minmax(220px, 1fr));
+}
+
+.ua-page .mr-hero-card {
+  min-height: 174px;
+  padding: 24px 22px;
+  overflow: visible;
+}
+
+.ua-page .mr-hero-card .mr-card-head {
+  align-items: flex-start;
+  gap: 18px;
+}
+
+.ua-page .mr-hero-card .mr-card-copy {
+  min-width: 0;
+  padding-top: 2px;
+}
+
+.ua-page .mr-hero-card .mr-card-label {
+  font-size: 12px;
+  letter-spacing: 0.055em;
+}
+
+.ua-page .mr-hero-card .mr-card-value {
+  max-width: 100%;
+  margin-top: 10px;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  display: block;
+}
+
+.ua-page .mr-hero-card .mr-card-note {
+  max-width: none;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.ua-page .mr-report-grid {
+  grid-template-columns:
+    minmax(220px, 1.45fr)
+    minmax(150px, 0.72fr)
+    minmax(160px, 0.9fr)
+    minmax(120px, 0.52fr)
+    minmax(120px, 0.55fr)
+    minmax(190px, 0.84fr);
+  align-items: center;
+  gap: 14px;
+}
+
+.ua-page .mr-report-row {
+  padding: 16px 20px;
+}
+
+.ua-page .mr-report-month {
+  font-size: 26px;
+  line-height: 1.02;
+}
+
+.ua-report-support {
+  margin: 10px 0 0;
+  color: rgba(148, 163, 184, 0.96);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.ua-page .mr-report-meta {
+  margin-top: 10px;
+  font-size: 13px;
+}
+
+.ua-page .mr-section-badge {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.ua-page .mr-cell-number,
+.ua-page .mr-score-row {
+  margin-top: 10px;
+  font-size: 17px;
+  line-height: 1.1;
+}
+
+.ua-page .mr-score-arrow {
+  width: 16px;
+  height: 16px;
+}
+
+.ua-page .mr-report-cell:last-of-type {
+  border-left-color: rgba(34, 211, 238, 0.06);
+}
+
+.ua-page .mr-report-cell .mr-score-row {
+  white-space: nowrap;
+}
+
+.ua-page .mr-row-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-width: 92px;
+  min-height: 42px;
+  padding: 0 14px;
+  font-size: 13px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.ua-page .mr-row-button span {
+  line-height: 1;
+}
+
+.ua-page .mr-actions-cell {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+  padding-right: 8px;
+  border-left-color: rgba(34, 211, 238, 0.06);
+}
+
+.ua-page .mr-button,
+.ua-page .mr-refresh-button {
+  font-size: 14px;
+}
+
+.ua-page .mr-history-body {
+  max-height: none;
+  overflow: visible;
+}
+
+.ua-page .mr-sheet-panel,
+.ua-page .ua-sheet-content {
+  overflow: hidden;
+}
+
+.ua-page .ua-sheet-scroll {
+  height: 100%;
+  padding-bottom: 20px;
+}
+
+.ua-page .ua-sheet-scroll [data-radix-scroll-area-viewport] {
+  height: 100% !important;
+  max-height: 100%;
+}
+
+.ua-page .ua-sheet-content .text-2xl {
+  font-size: 1.6rem;
+}
+
+.ua-page .ua-sheet-content section {
+  overflow-wrap: anywhere;
+}
+
+.ua-page .ua-sheet-content pre {
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.ua-page .ua-sheet-content .text-lg {
+  font-size: 1.05rem;
+}
+
+.ua-page .ua-sheet-content .text-sm {
+  line-height: 1.55;
+}
+
+@media (max-width: 980px) {
+  .ua-page .mr-title {
+    font-size: 34px;
+  }
+}
+
+@media (max-width: 1240px) {
+  .ua-page .mr-hero-cards {
+    grid-template-columns: repeat(2, minmax(240px, 1fr));
+  }
+
+  .ua-page .mr-report-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .ua-page .mr-actions-cell {
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 720px) {
+  .ua-page .mr-hero-cards {
+    grid-template-columns: 1fr;
+  }
+}

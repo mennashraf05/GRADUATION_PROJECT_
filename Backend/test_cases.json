@@ -1,0 +1,65 @@
+[
+  {
+    "name": "benign_http",
+    "features": {
+      "src_port": 12345,
+      "dst_port": 80,
+      "ip_prot": "tcp",
+      "service": "http",
+      "flow_duration": 10.0,
+      "fwd_pkts_tot": 5,
+      "bwd_pkts_tot": 4,
+      "pkt_len_mean": 55.56,
+      "fwd_non_empty_pkt_cnt": 2
+    }
+  },
+  {
+    "name": "ddos_udp_flood",
+    "features": {
+      "src_port": 40000,
+      "dst_port": 80,
+      "ip_prot": "udp",
+      "service": "unknown",
+      "flow_duration": 5.0,
+      "fwd_pkts_tot": 50000,
+      "fwd_non_empty_pkt_cnt": 50000,
+      "pkt_len_mean": 60.0
+    }
+  },
+  {
+    "name": "portscan_many_ports",
+    "features": {
+      "src_port": 52345,
+      "dst_port": 443,
+      "ip_prot": "tcp",
+      "service": "unknown",
+      "flow_duration": 0.02,
+      "fwd_pkts_tot": 1,
+      "fwd_non_empty_pkt_cnt": 1,
+      "pkt_len_mean": 40.0
+    }
+  },
+  {
+    "name": "ssh_bruteforce",
+    "features": {
+      "src_port": 45123,
+      "dst_port": 22,
+      "ip_prot": "tcp",
+      "service": "ssh",
+      "flow_duration": 2.0,
+      "fwd_pkts_tot": 60,
+      "fwd_non_empty_pkt_cnt": 60,
+      "pkt_len_mean": 80.0
+    }
+  },
+  {
+    "name": "missing_fields_minimal",
+    "features": {
+      "src_port": 55555,
+      "dst_port": 443,
+      "flow_duration": 1.5,
+      "fwd_non_empty_pkt_cnt": 2,
+      "pkt_len_mean": 200.0
+    }
+  }
+]

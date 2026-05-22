@@ -1,0 +1,47 @@
+# Local environment / secrets
+.env
+*.env
+Backend/.env
+backend/.env
+Cybersecurity Dashboard Design/.env
+
+# Python local files
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+.vscode/
+
+# Databases and local runtime data
+instance/
+data/
+upload/
+uploads/
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# PCAP and generated security analysis files
+*.pcap
+*.pcapng
+pcap_runs/
+reports/
+
+# Node / frontend build
+node_modules/
+dist/
+build/
+Cybersecurity Dashboard Design/node_modules/
+Cybersecurity Dashboard Design/dist/
+Cybersecurity Dashboard Design/build/
+
+# Archives
+*.zip
+*.rar
+*.7z

@@ -114,9 +114,6 @@ export function Layout({ children, hideChrome = false }: LayoutProps) {
         const API_BASE_URL = import.meta.env.DEV ? '' : (import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000');
         const token = localStorage.getItem('sentinel_auth_token');
         
-        console.log('Layout: Verifying auth, token exists:', !!token);
-        console.log('Layout: Token value (first 20 chars):', token ? token.substring(0, 20) + '...' : 'none');
-        
         // Prepare headers - use Bearer token if we have one
         const headers: HeadersInit = {
           'Content-Type': 'application/json',
@@ -125,21 +122,13 @@ export function Layout({ children, hideChrome = false }: LayoutProps) {
         // If token is not "cookie_based", add it as Bearer token
         if (token && token !== 'cookie_based') {
           headers['Authorization'] = `Bearer ${token}`;
-          console.log('Layout: Sending Authorization header');
-        } else {
-          console.log('Layout: No Bearer token, relying on cookies');
         }
-        
-        console.log('Layout: Making request to /api/auth/me with headers:', Object.keys(headers));
         
         const response = await fetch(`${API_BASE_URL || ''}/api/auth/me`, {
           method: 'GET',
           credentials: 'include', // Send cookies if available
           headers: headers,
         });
-
-        console.log('Layout: Response status:', response.status);
-        console.log('Layout: Response ok:', response.ok);
 
         if (!response.ok) {
           const errorData = await response.json().catch(() => ({}));
@@ -170,7 +159,6 @@ export function Layout({ children, hideChrome = false }: LayoutProps) {
         
         // If OK, user is authenticated
         const data = await response.json();
-        console.log('Layout: Auth successful, user:', data.user?.email);
         if (data.success && data.user) {
           setActiveRecentPcapAlertScopeForUser({
             id: data.user.id,

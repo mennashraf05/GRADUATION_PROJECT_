@@ -157,16 +157,26 @@ def perform_scan_for_asset(asset_row, user_id):
         cursor.close()
         conn.close()
 
-def save_scan_result(monitored_asset_id, status, matches):
+def save_scan_result(monitored_asset_id, status, matches, user_id=None):
     conn = get_conn()
     cursor = conn.cursor()
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     try:
-        execute_with_retry(cursor, """
-            UPDATE monitored_assets
-            SET last_checked=?, last_status=?, last_matches=?, updated_at=?
-            WHERE id=?
-        """, (now, status, len(matches), now, monitored_asset_id))
+        if user_id is None:
+            execute_with_retry(cursor, """
+                UPDATE monitored_assets
+                SET last_checked=?, last_status=?, last_matches=?, updated_at=?
+                WHERE id=?
+            """, (now, status, len(matches), now, monitored_asset_id))
+        else:
+            execute_with_retry(cursor, """
+                UPDATE monitored_assets
+                SET last_checked=?, last_status=?, last_matches=?, updated_at=?
+                WHERE id=? AND user_id=?
+            """, (now, status, len(matches), now, monitored_asset_id, user_id))
+        if cursor.rowcount <= 0:
+            conn.rollback()
+            return
 
         if status == "malicious":
             for m in matches:
@@ -193,8 +203,8 @@ def full_scan(user_id):
         rows = cursor.fetchall()
         for r in rows:
             asset_row = {"id": r[0], "asset": r[1], "asset_type": r[2]}
-            status, matches = perform_scan_for_asset(asset_row)
-            save_scan_result(asset_row["id"], status, matches)
+            status, matches = perform_scan_for_asset(asset_row, user_id)
+            save_scan_result(asset_row["id"], status, matches, user_id)
     finally:
         cursor.close()
         conn.close()
@@ -217,7 +227,7 @@ def get_protection_rate(user_id):
     try:
         execute_with_retry(cursor, "SELECT COUNT(*) FROM monitored_assets WHERE user_id = ?", (user_id,))
         total_assets = cursor.fetchone()[0] or 1
-        execute_with_retry(cursor, "SELECT COUNT(*) FROM monitored_assets WHERE last_status='safe'", (user_id,))
+        execute_with_retry(cursor, "SELECT COUNT(*) FROM monitored_assets WHERE user_id = ? AND last_status='safe'", (user_id,))
         safe_assets = cursor.fetchone()[0] or 0
         rate = (safe_assets / total_assets) * 100
         return round(rate, 2)
@@ -238,7 +248,7 @@ def autoscan_job():
             asset_row = {"id": r[0], "asset": r[1], "asset_type": r[2]}
             user_id = r[3]
             status, matches = perform_scan_for_asset(asset_row, user_id)
-            save_scan_result(asset_row["id"], status, matches)
+            save_scan_result(asset_row["id"], status, matches, user_id)
     finally:
         cursor.close()
         conn.close()

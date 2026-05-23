@@ -8,6 +8,58 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parents[2]
 DB_PATH = BASE_DIR / "identity_monitor.db"
 
+_MIGRATION_COLUMNS = {
+    "identity_findings": {
+        "category": "TEXT DEFAULT 'public_mention'",
+        "detected_keywords": "TEXT DEFAULT '[]'",
+        "user_id": "INTEGER",
+    },
+    "identity_scans": {
+        "recommendation": "TEXT",
+        "source_status": "TEXT DEFAULT '{}'",
+        "user_id": "INTEGER",
+    },
+    "identity_alerts": {
+        "user_id": "INTEGER",
+        "email_status": "TEXT DEFAULT 'skipped'",
+        "email_sent_at": "TEXT",
+        "email_error": "TEXT",
+    },
+    "identity_monitored_assets": {
+        "label": "TEXT",
+        "auto_scan_enabled": "INTEGER DEFAULT 1",
+        "user_id": "INTEGER",
+    },
+}
+
+
+def _clamp_limit(value: int, default: int = 25, maximum: int = 500) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(1, min(parsed, maximum))
+
+
+def _clean_positive_ids(values: list[int], maximum: int = 500) -> list[int]:
+    clean: set[int] = set()
+    for value in values or []:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            clean.add(parsed)
+        if len(clean) >= maximum:
+            break
+    return sorted(clean)
+
+
+def _quoted_identifier(value: str) -> str:
+    if not value.replace("_", "").isalnum():
+        raise ValueError("Unsafe SQL identifier")
+    return f'"{value}"'
+
 
 def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -268,6 +320,7 @@ def backfill_missing_alerts(user_id: int, limit: int = 250) -> int:
 
 
 def list_scans(user_id: int, limit: int = 25) -> list[dict]:
+    limit = _clamp_limit(limit, default=25, maximum=100)
     with get_connection() as conn:
         rows = conn.execute(
             """
@@ -316,6 +369,7 @@ def list_findings(scan_id: int, user_id: int) -> list[dict]:
 
 
 def list_alerts(user_id: int, limit: int = 25) -> list[dict]:
+    limit = _clamp_limit(limit, default=25, maximum=100)
     with get_connection() as conn:
         rows = conn.execute(
             """
@@ -342,7 +396,7 @@ def unread_alert_count(user_id: int) -> int:
 
 
 def mark_alerts_read(user_id: int, alert_ids: list[int]) -> int:
-    clean_ids = sorted({int(alert_id) for alert_id in alert_ids if int(alert_id) > 0})
+    clean_ids = _clean_positive_ids(alert_ids, maximum=500)
     if not clean_ids:
         return 0
 
@@ -395,6 +449,9 @@ def clear_history(user_id: int) -> int:
         if not scan_ids:
             return 0
 
+        scan_ids = _clean_positive_ids(scan_ids, maximum=5000)
+        if not scan_ids:
+            return 0
         placeholders = ",".join("?" for _ in scan_ids)
         conn.execute(
             f"DELETE FROM identity_findings WHERE user_id=? AND scan_id IN ({placeholders})",
@@ -515,9 +572,15 @@ def _asset_row_to_dict(row: sqlite3.Row) -> dict:
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    allowed_columns = _MIGRATION_COLUMNS.get(table, {})
+    if allowed_columns.get(column) != definition:
+        raise ValueError("Unsafe schema migration request")
+
+    safe_table = _quoted_identifier(table)
+    safe_column = _quoted_identifier(column)
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({safe_table})").fetchall()}
     if column not in existing:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        conn.execute(f"ALTER TABLE {safe_table} ADD COLUMN {safe_column} {definition}")
 
 
 def _ensure_assets_user_scope_schema(conn: sqlite3.Connection) -> None:

@@ -7,7 +7,7 @@ import {
   MoreVertical, Filter, Plus, Play, Pause, CheckCircle,
   XCircle, Clock, TrendingUp, Server, Cpu, HardDrive,
   Globe, MessageSquare, Zap, Eye, Edit, Trash2, UserPlus,
-  Send, BarChart3, PieChart, AlertCircle, Check, X, ShieldAlert,
+  Send, BarChart3, PieChart, AlertCircle, Check, X, ShieldAlert, ShieldCheck,
   ArrowUpDown, ChevronDown, UserCog, FileSearch, Sliders,
   LogOut
 } from 'lucide-react';
@@ -34,13 +34,14 @@ import AdminAuditTrailPage from '../admin/AdminAuditTrailPage';
 import PcapAnalysisAdminControl from '../admin/PcapAnalysisAdminControl';
 import ReportsExportCenterPage from '../admin/ReportsExportCenterPage';
 import NotificationControlCenterPage from '../admin/NotificationControlCenterPage';
+import SecurityValidationLabPage from '../admin/SecurityValidationLabPage';
 import {
   NotificationSettings,
   getNotificationSettings,
   saveNotificationSettings,
 } from '../../services/adminNotificationsService';
 
-type SectionType = 'overview' | 'users' | 'alerts' | 'modules' | 'threat-intel' | 'pcap-analysis' | 'jobs' | 'system-health' | 'audit-logs' | 'notifications' | 'integrations' | 'reports' | 'settings';
+type SectionType = 'overview' | 'users' | 'alerts' | 'modules' | 'threat-intel' | 'pcap-analysis' | 'security-lab' | 'jobs' | 'system-health' | 'audit-logs' | 'notifications' | 'integrations' | 'reports' | 'settings';
 
 const ADMIN_VISIBLE_ROLES = new Set(['Admin', 'User']);
 const ADMIN_SECTIONS = new Set<SectionType>([
@@ -48,6 +49,7 @@ const ADMIN_SECTIONS = new Set<SectionType>([
   'users',
   'alerts',
   'pcap-analysis',
+  'security-lab',
   'audit-logs',
   'notifications',
   'reports',
@@ -1232,6 +1234,7 @@ const AdminConsolePage: React.FC = () => {
     { id: 'users' as SectionType, label: 'Users & Roles', icon: Users },
     { id: 'alerts' as SectionType, label: 'Threat Management', icon: AlertTriangle },
     { id: 'pcap-analysis' as SectionType, label: 'PCAP Analysis', icon: FileSearch },
+    { id: 'security-lab' as SectionType, label: 'Validation Lab', icon: ShieldCheck },
     { id: 'audit-logs' as SectionType, label: 'Admin Audit Trail', icon: FileSearch },
     { id: 'notifications' as SectionType, label: 'Notifications', icon: Bell },
     { id: 'reports' as SectionType, label: 'Reports Center', icon: FileText },
@@ -2752,6 +2755,9 @@ const AdminConsolePage: React.FC = () => {
 
             {/* PCAP Analysis Admin Control Section */}
             {activeSection === 'pcap-analysis' && <PcapAnalysisAdminControl />}
+
+            {/* Security Validation Lab Section */}
+            {activeSection === 'security-lab' && <SecurityValidationLabPage />}
 
             {/* Jobs & Scheduling Section */}
             {activeSection === 'jobs' && (

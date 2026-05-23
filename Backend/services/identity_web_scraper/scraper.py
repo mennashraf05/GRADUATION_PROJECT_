@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ipaddress
+import logging
 import os
 import re
+import socket
 from dataclasses import dataclass
 from typing import Iterable
-from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -22,6 +25,7 @@ from .scoring import (
 from .stackexchange_search import run_stackexchange_search
 
 
+LOGGER = logging.getLogger(__name__)
 DUCKDUCKGO_SEARCH_URL = "https://html.duckduckgo.com/html/?q="
 GITHUB_API_URL = "https://api.github.com/search"
 USER_AGENT = "SentinelAIIdentityLeakMonitor/1.0 (+public-web-scan)"
@@ -29,6 +33,8 @@ MAX_RESULTS_PER_QUERY = 4
 MAX_PAGES_TO_OPEN = 12
 MAX_TEXT_CHARS = 140_000
 REQUEST_TIMEOUT = 8
+MAX_REDIRECTS = 3
+BLOCKED_HOSTNAMES = {"localhost", "localhost.localdomain", "0.0.0.0", "127.0.0.1", "::1"}
 
 
 @dataclass(frozen=True)
@@ -342,20 +348,140 @@ def _parse_github_item(search_type: str, item: dict) -> dict:
 
 
 def _fetch_visible_page_text(session: requests.Session, url: str) -> str:
+    response, _reason = _fetch_public_url(session, url)
+    if response is None:
+        return ""
+
     try:
-        response = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True, stream=True)
         content_type = response.headers.get("Content-Type", "").lower()
         if response.status_code >= 400 or "text/html" not in content_type:
-            response.close()
             return ""
         html = response.raw.read(MAX_TEXT_CHARS, decode_content=True)
-    except requests.RequestException:
+    except (requests.RequestException, OSError):
         return ""
+    finally:
+        response.close()
 
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "form"]):
         tag.decompose()
     return _compact_text(soup.get_text(" ", strip=True), MAX_TEXT_CHARS)
+
+
+def _fetch_public_url(session: requests.Session, url: str) -> tuple[requests.Response | None, str]:
+    current_url = url
+    for redirect_count in range(MAX_REDIRECTS + 1):
+        ok, reason, safe_url = _validate_public_fetch_url(current_url)
+        if not ok:
+            _log_skipped_fetch(current_url, reason)
+            return None, reason
+
+        try:
+            response = session.get(safe_url, timeout=REQUEST_TIMEOUT, allow_redirects=False, stream=True)
+        except requests.Timeout:
+            _log_skipped_fetch(current_url, "fetch_timeout")
+            return None, "fetch_timeout"
+        except requests.RequestException:
+            _log_skipped_fetch(current_url, "fetch_failed")
+            return None, "fetch_failed"
+
+        if response.is_redirect or response.status_code in {301, 302, 303, 307, 308}:
+            if redirect_count >= MAX_REDIRECTS:
+                response.close()
+                _log_skipped_fetch(current_url, "too_many_redirects")
+                return None, "too_many_redirects"
+
+            location = response.headers.get("Location", "").strip()
+            response.close()
+            if not location:
+                _log_skipped_fetch(current_url, "fetch_failed")
+                return None, "fetch_failed"
+
+            next_url = urljoin(safe_url, location)
+            ok, reason, _safe_redirect_url = _validate_public_fetch_url(next_url)
+            if not ok:
+                redirect_reason = (
+                    "blocked_redirect_to_private_ip"
+                    if reason in {"blocked_private_ip", "blocked_unsafe_hostname"}
+                    else reason
+                )
+                _log_skipped_fetch(next_url, redirect_reason)
+                return None, redirect_reason
+            current_url = next_url
+            continue
+
+        return response, ""
+
+    _log_skipped_fetch(current_url, "too_many_redirects")
+    return None, "too_many_redirects"
+
+
+def _validate_public_fetch_url(url: str) -> tuple[bool, str, str]:
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return False, "blocked_unsafe_scheme", ""
+
+    hostname = parsed.hostname
+    if not hostname:
+        return False, "blocked_unsafe_hostname", ""
+
+    normalized_host = hostname.rstrip(".").lower()
+    if normalized_host in BLOCKED_HOSTNAMES or normalized_host.endswith(".local"):
+        return False, "blocked_unsafe_hostname", ""
+
+    try:
+        ip = ipaddress.ip_address(normalized_host)
+    except ValueError:
+        ip = None
+
+    if ip is not None:
+        return (False, "blocked_private_ip", "") if _is_blocked_ip(ip) else (True, "", parsed.geturl())
+
+    try:
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    except ValueError:
+        return False, "blocked_unsafe_hostname", ""
+
+    try:
+        addresses = socket.getaddrinfo(
+            normalized_host,
+            port,
+            type=socket.SOCK_STREAM,
+        )
+    except OSError:
+        return False, "dns_resolution_failed", ""
+
+    resolved_ips = set()
+    for address in addresses:
+        try:
+            resolved_ips.add(ipaddress.ip_address(address[4][0]))
+        except (IndexError, ValueError):
+            return False, "dns_resolution_failed", ""
+
+    if not resolved_ips:
+        return False, "dns_resolution_failed", ""
+
+    if any(_is_blocked_ip(resolved_ip) for resolved_ip in resolved_ips):
+        return False, "blocked_private_ip", ""
+
+    return True, "", parsed.geturl()
+
+
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def _log_skipped_fetch(url: str, reason: str) -> None:
+    parsed = urlparse(url or "")
+    host = parsed.hostname or "missing"
+    LOGGER.info("Identity web scanner skipped URL fetch: reason=%s host=%s", reason, host)
 
 
 def _finding(

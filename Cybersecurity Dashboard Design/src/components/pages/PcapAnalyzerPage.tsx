@@ -345,7 +345,9 @@ type JobHistoryItem = {
   progress?: number;
   message?: string;
   upload_name?: string;
-  upload_path?: string;
+  original_filename?: string;
+  has_upload?: boolean;
+  has_report?: boolean;
   report_available?: boolean;
   evidence_available?: boolean;
   artifact_protection?: ArtifactProtectionMetadata | null;
@@ -2604,7 +2606,7 @@ export function PcapAnalyzerPage() {
             void trackReportAccess(job.job_id);
             syncRecentSecurityAlertCache(rawReport, {
               jobId: job.job_id,
-              uploadName: String(statusPayload.upload_name ?? statusPayload.upload_path ?? ""),
+              uploadName: String(statusPayload.original_filename ?? statusPayload.upload_name ?? ""),
               fallbackCreatedAt: String(
                 statusPayload.finished_at ??
                   statusPayload.started_at ??
@@ -2746,7 +2748,7 @@ export function PcapAnalyzerPage() {
         void trackReportAccess(String(j.job_id ?? job?.job_id ?? ""));
             syncRecentSecurityAlertCache(rawReport, {
               jobId: String(j.job_id ?? job?.job_id ?? ""),
-              uploadName: String(j.upload_name ?? j.upload_path ?? ""),
+              uploadName: String(j.original_filename ?? j.upload_name ?? ""),
               fallbackCreatedAt: String(
                 j.finished_at ?? j.started_at ?? j.created_at ?? ""
               ),
@@ -2849,12 +2851,14 @@ export function PcapAnalyzerPage() {
           finished_at: item.finished_at ? String(item.finished_at) : undefined,
           progress: Number(item.progress ?? 0) || 0,
           message: item.message ? String(item.message) : undefined,
-          upload_name: item.upload_name
+          upload_name: item.original_filename
+            ? String(item.original_filename)
+            : item.upload_name
             ? String(item.upload_name)
-            : item.upload_path
-            ? String(item.upload_path).split(/[\\/]/).pop()
             : undefined,
-          upload_path: item.upload_path ? String(item.upload_path) : undefined,
+          original_filename: item.original_filename ? String(item.original_filename) : undefined,
+          has_upload: Boolean(item.has_upload),
+          has_report: Boolean(item.has_report),
           report_available: Boolean(item.report_available),
           evidence_available: Boolean(item.evidence_available),
           artifact_protection: normalizeArtifactProtection(item.artifact_protection),
@@ -3126,7 +3130,7 @@ export function PcapAnalyzerPage() {
         void trackReportAccess(jobId);
         syncRecentSecurityAlertCache(rawReport, {
           jobId,
-          uploadName: String(payload.upload_name ?? payload.upload_path ?? ""),
+          uploadName: String(payload.original_filename ?? payload.upload_name ?? ""),
           fallbackCreatedAt: String(
             payload.finished_at ?? payload.started_at ?? payload.created_at ?? ""
           ),
@@ -3136,7 +3140,7 @@ export function PcapAnalyzerPage() {
         void trackReportAccess(jobId);
         syncRecentSecurityAlertCache(cachedReport, {
           jobId,
-          uploadName: String(payload.upload_name ?? payload.upload_path ?? ""),
+          uploadName: String(payload.original_filename ?? payload.upload_name ?? ""),
           fallbackCreatedAt: String(
             payload.finished_at ?? payload.started_at ?? payload.created_at ?? ""
           ),

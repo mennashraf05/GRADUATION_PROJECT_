@@ -25,9 +25,9 @@ type RawPcapJobHistoryItem = {
   created_at?: string | null;
   started_at?: string | null;
   finished_at?: string | null;
+  original_filename?: string | null;
   upload_name?: string | null;
-  upload_path?: string | null;
-  report_path?: string | null;
+  has_report?: boolean | null;
   report_available?: boolean | null;
   error?: string | null;
 };
@@ -314,7 +314,7 @@ function isSuccessfulJob(job: RawPcapJobHistoryItem): boolean {
   }
 
   const hasExplicitReportSignal =
-    job.report_available === true || text(job.report_path) !== "";
+    job.report_available === true || job.has_report === true;
 
   // Treat job history as discovery data only. Some archived/completed jobs may
   // omit the report flag, so the job details endpoint remains the final source
@@ -585,10 +585,10 @@ function readCompatiblePcapReportSnapshot(
   }
 
   const expectedUploadName = basename(
-    payload?.upload_name ??
-      payload?.upload_path ??
-      job.upload_name ??
-      job.upload_path
+    payload?.original_filename ??
+      payload?.upload_name ??
+      job.original_filename ??
+      job.upload_name
   );
   const reportUploadName = basename(asRecord(snapshot.report.meta)?.pcap_path);
   if (
@@ -849,10 +849,11 @@ async function fetchJobReport(
               text(job.created_at) ||
               null,
             uploadName:
+              text(payload.original_filename) ||
               text(payload.upload_name) ||
-              text(payload.upload_path) ||
+              text(job.original_filename) ||
               text(job.upload_name) ||
-              text(job.upload_path),
+              "",
             breakdown: scoreResult.breakdown,
           };
         }
@@ -874,7 +875,7 @@ async function fetchJobReport(
     jobId,
     score: scoreResult.score,
     completedAt: text(job.finished_at) || text(job.created_at) || null,
-    uploadName: text(job.upload_name) || text(job.upload_path),
+    uploadName: text(job.original_filename) || text(job.upload_name),
     breakdown: scoreResult.breakdown,
   };
 }

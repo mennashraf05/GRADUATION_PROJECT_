@@ -11,7 +11,13 @@ def main() -> None:
         sentinel_app._ensure_pcap_alert_schema_initialized()
         sentinel_app.ensure_gamification_schema_initialized()
 
-    sentinel_app.app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+    sentinel_app.app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=False,
+        use_reloader=False,
+        ssl_context=sentinel_app._build_local_ssl_context(),
+    )
 
 
 if __name__ == "__main__":

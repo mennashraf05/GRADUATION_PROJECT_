@@ -291,7 +291,7 @@ export function normalizePcapJob(value: unknown): AdminPcapJob {
 
   return {
     job_id: text(raw.job_id),
-    filename: text(raw.filename ?? raw.upload_name ?? raw.upload_path, "Not available"),
+    filename: text(raw.filename ?? raw.original_filename ?? raw.upload_name, "Not available"),
     status: text(raw.status, "unknown"),
     score,
     risk_level: riskLevel,

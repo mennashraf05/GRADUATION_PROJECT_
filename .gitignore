@@ -4,6 +4,9 @@
 Backend/.env
 backend/.env
 Cybersecurity Dashboard Design/.env
+Backend/secrets/
+Backend/secrets/google-drive-service-account.json
+Backend/encrypted_file_vault/secret.key
 
 # Python local files
 .venv/
@@ -45,3 +48,8 @@ Cybersecurity Dashboard Design/build/
 *.zip
 *.rar
 *.7z
+
+certs/
+*.pem
+*.key
+*.crt

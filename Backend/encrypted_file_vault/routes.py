@@ -5,12 +5,15 @@ from datetime import datetime
 from pathlib import Path
 from io import BytesIO
 
-from cryptography.fernet import InvalidToken
 from flask import Blueprint, request, jsonify, abort, send_file, current_app
+from cryptography.fernet import InvalidToken
+from werkzeug.exceptions import HTTPException
 
 from .crypto import generate_salt, get_cipher_from_password
 from .models import VaultDocument
 from extensions import db
+from security_utils import ensure_path_within_directory, safe_error_response
+from upload_security import validate_vault_upload
 
 from activity_logs import (
     MODULE_VAULT,
@@ -29,22 +32,31 @@ bp = Blueprint("vault", __name__)
 
 @bp.errorhandler(Exception)
 def handle_vault_error(e):
-    current_app.logger.exception("Vault error")
-    return jsonify({"error": str(e)}), 500
+    if isinstance(e, HTTPException):
+        return jsonify({"error": e.description or "Unable to complete the File Vault request."}), e.code or 500
+    return safe_error_response(
+        public_message="Unable to complete the File Vault request right now.",
+        error_code="vault_error",
+        status_code=500,
+        log_exception=e,
+        log_context={"module": "file_vault"},
+    )
 
 
 UPLOAD_FOLDER_NAME = "upload"
 MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024
 
 ALLOWED_EXTENSIONS = {
-    "pdf", "docx", "txt",
+    "pdf", "doc", "docx", "txt",
+    "xls", "xlsx", "ppt", "pptx",
+    "jpg", "jpeg", "png", "gif", "webp",
+    "csv",
     "py", "js", "ts", "jsx", "tsx",
     "java", "c", "cpp", "h", "hpp",
-    "cs", "php", "go", "rs",
+    "cs", "go", "rs",
     "html", "css", "scss",
     "json", "xml", "yml", "yaml",
-    "md", "sql", "sh", "bat", "ps1",
-    "env", "ini", "cfg", "toml",
+    "md", "ini", "cfg", "toml",
 }
 
 _INVALID_NAME_CHARS = re.compile(r"[^A-Za-z0-9.\- _()]+")
@@ -186,13 +198,33 @@ def upload_document():
     if not file or not file.filename or file.filename.strip() == "":
         return jsonify({"error": "Empty filename"}), 400
 
-    original_name = sanitize_filename(file.filename.strip())
+    raw_filename = file.filename.strip()
+    validation = validate_vault_upload(file, raw_filename, ALLOWED_EXTENSIONS)
+    if not validation.get("ok"):
+        current_app.logger.warning(
+            "Rejected File Vault upload | reason=%s",
+            validation.get("safe_reason") or "invalid_file",
+        )
+        return safe_error_response(
+            public_message=validation.get("public_message") or "This file type is not allowed.",
+            error_code=validation.get("error_code") or "invalid_file_type",
+            status_code=400,
+            log_context={
+                "module": "file_vault",
+                "reason": validation.get("safe_reason") or "invalid_file",
+            },
+        )
+
+    original_name = sanitize_filename(raw_filename)
 
     if not allowed_file(original_name):
-        return jsonify({
-            "error": "File type not allowed",
-            "allowed_extensions": sorted(list(ALLOWED_EXTENSIONS))
-        }), 400
+        current_app.logger.warning("Rejected File Vault upload | reason=invalid_extension")
+        return safe_error_response(
+            public_message="This file type is not allowed.",
+            error_code="invalid_file_type",
+            status_code=400,
+            log_context={"module": "file_vault", "reason": "invalid_extension"},
+        )
 
     raw = file.read()
 
@@ -336,7 +368,16 @@ def download_document(doc_id):
         abort(403)
 
     upload_dir = get_upload_dir()
-    stored_path = upload_dir / doc.stored_filename
+    try:
+        stored_path = ensure_path_within_directory(upload_dir / doc.stored_filename, upload_dir)
+    except ValueError as exc:
+        return safe_error_response(
+            public_message="Unable to access the requested file.",
+            error_code="invalid_file_path",
+            status_code=403,
+            log_exception=exc,
+            log_context={"module": "file_vault", "reason": "path_outside_allowed_directory"},
+        )
 
     if not stored_path.exists():
         return jsonify({"error": "File not found"}), 404
@@ -420,7 +461,16 @@ def delete_document(doc_id):
         abort(403)
 
     upload_dir = get_upload_dir()
-    stored_path = upload_dir / doc.stored_filename
+    try:
+        stored_path = ensure_path_within_directory(upload_dir / doc.stored_filename, upload_dir)
+    except ValueError as exc:
+        return safe_error_response(
+            public_message="Unable to access the requested file.",
+            error_code="invalid_file_path",
+            status_code=403,
+            log_exception=exc,
+            log_context={"module": "file_vault", "reason": "path_outside_allowed_directory"},
+        )
 
     if not stored_path.exists():
         return jsonify({"error": "File not found"}), 404
@@ -459,9 +509,13 @@ def delete_document(doc_id):
     try:
         stored_path.unlink()
     except Exception as e:
-        return jsonify({
-            "error": f"Failed to delete file from disk: {str(e)}"
-        }), 500
+        return safe_error_response(
+            public_message="Unable to delete the file right now.",
+            error_code="vault_delete_failed",
+            status_code=500,
+            log_exception=e,
+            log_context={"module": "file_vault", "document_id": doc_id},
+        )
 
     db.session.delete(doc)
     db.session.commit()

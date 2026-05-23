@@ -53,7 +53,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from flask import Flask, request, jsonify, make_response, send_file, g, has_request_context, session
 from flask_cors import CORS
-from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -78,7 +78,14 @@ import xgboost as xgb
 import re
 from typing import Optional
 from flask_limiter import Limiter
+from flask_limiter.errors import RateLimitExceeded
 from flask_limiter.util import get_remote_address
+from security_utils import (
+    ensure_path_within_directory,
+    safe_error_response,
+    sanitize_csv_row,
+)
+from upload_security import validate_pcap_upload
 from sqlalchemy import inspect, text, func, or_
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
@@ -706,6 +713,12 @@ def _build_allowed_frontend_origins() -> list[str]:
     if raw:
         origins.add(raw.rstrip("/"))
 
+    configured_origins = str(os.getenv("CORS_ALLOWED_ORIGINS") or "").strip()
+    for origin in configured_origins.split(","):
+        origin = origin.strip().rstrip("/")
+        if origin:
+            origins.add(origin)
+
     local_ports = {"3000", "5173", "4173"}
     for scheme in ("http", "https"):
         for host in ("localhost", "127.0.0.1"):
@@ -723,6 +736,28 @@ CORS(
     supports_credentials=True,
     resources={r"/*": {"origins": ALLOWED_FRONTEND_ORIGINS}},
 )
+
+limiter = Limiter(key_func=get_remote_address, default_limits=["20/minute"])
+limiter.init_app(app)
+
+
+@app.errorhandler(RateLimitExceeded)
+def handle_rate_limit_exceeded(_exc):
+    return (
+        jsonify(
+            {
+                "error": "rate_limit_exceeded",
+                "message": "Too many requests. Please try again later.",
+            }
+        ),
+        429,
+    )
+
+
+def _rate_limit_value(env_name: str, default: str) -> str:
+    configured = str(os.getenv(env_name) or "").strip()
+    return configured or default
+
 
 app.register_blueprint(scan_bp)
 app.register_blueprint(gamification_bp)
@@ -751,6 +786,30 @@ def cors_after(response):
     response.headers["Access-Control-Allow-Credentials"] = "true"
     response.headers["Access-Control-Expose-Headers"] = "Content-Disposition"
     response.headers["Vary"] = "Origin"
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault(
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=(), fullscreen=(self)",
+    )
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; "
+        "base-uri 'self'; "
+        "frame-ancestors 'none'; "
+        "object-src 'none'; "
+        "img-src 'self' data: blob:; "
+        "font-src 'self' data:; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; "
+        "connect-src 'self' http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*",
+    )
+    if _env_truthy("SECURITY_HEADERS_HSTS_ENABLED", False):
+        response.headers.setdefault(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+        )
     response = _finalize_staged_auth_refresh(response)
     return response
 
@@ -760,11 +819,60 @@ def handle_request_entity_too_large(_exc):
     return jsonify({"error": "PCAP file is too large. Maximum upload size is 15 GB."}), 413
 
 
+@app.errorhandler(Exception)
+def handle_unexpected_exception(exc):
+    if isinstance(exc, HTTPException):
+        message = "The requested resource was not found." if exc.code == 404 else "Unable to complete the request right now."
+        return safe_error_response(
+            public_message=message,
+            error_code=f"http_{exc.code or 500}",
+            status_code=exc.code or 500,
+            log_exception=exc if (exc.code or 500) >= 500 else None,
+            log_context={"route": request.endpoint, "path": request.path},
+        )
+    return safe_error_response(
+        public_message="Something went wrong. Please try again later.",
+        error_code="internal_error",
+        status_code=500,
+        log_exception=exc,
+        log_context={"route": request.endpoint, "path": request.path},
+    )
+
+
 def _response_allow_origin() -> str:
     request_origin = str(request.headers.get("Origin") or "").rstrip("/")
     if request_origin and request_origin in ALLOWED_FRONTEND_ORIGINS:
         return request_origin
     return FRONTEND_BASE_URL.rstrip("/")
+
+
+def _invalid_file_path_response(route_name: str, **context):
+    logging.warning(
+        "Rejected file path access | route=%s | reason=path_outside_allowed_directory",
+        route_name,
+    )
+    return safe_error_response(
+        public_message="Unable to access the requested file.",
+        error_code="invalid_file_path",
+        status_code=403,
+        log_context={"route": route_name, "reason": "path_outside_allowed_directory", **context},
+    )
+
+
+def _contained_path_or_response(candidate_path, allowed_base_dir, route_name: str, **context):
+    try:
+        return ensure_path_within_directory(candidate_path, allowed_base_dir), None
+    except (OSError, ValueError):
+        return None, _invalid_file_path_response(route_name, **context)
+
+
+def _contained_path_any_or_response(candidate_path, allowed_base_dirs, route_name: str, **context):
+    for allowed_base_dir in allowed_base_dirs:
+        try:
+            return ensure_path_within_directory(candidate_path, allowed_base_dir), None
+        except (OSError, ValueError):
+            continue
+    return None, _invalid_file_path_response(route_name, **context)
 
 
 # Logging
@@ -1025,7 +1133,7 @@ def save_threats_to_storage(threats, run_at=None):
         writer = csv.writer(f)
         if write_header:
             writer.writerow(
-                [
+                sanitize_csv_row([
                     "run_at",
                     "time",
                     "src_ip",
@@ -1036,9 +1144,9 @@ def save_threats_to_storage(threats, run_at=None):
                     "risk",
                     "confidence",
                     "dataset",
-                ]
+                ])
             )
-        writer.writerows(rows)
+        writer.writerows(sanitize_csv_row(row) for row in rows)
 
 
 EXPECTED_CIC65 = [
@@ -3358,48 +3466,60 @@ def _build_job_evidence_bundle(st):
     if not artifacts["zeek_files"]:
         return None
 
-    bundle_path = artifacts["job_dir"] / "evidence_bundle.zip"
+    job_dir = ensure_path_within_directory(artifacts["job_dir"], JOBS_FOLDER)
+    bundle_path = ensure_path_within_directory(job_dir / "evidence_bundle.zip", job_dir)
     with zipfile.ZipFile(
         bundle_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
     ) as zf:
         if artifacts["report_path"] is not None:
-            zf.write(artifacts["report_path"], "report.json")
+            report_path = ensure_path_within_directory(artifacts["report_path"], job_dir)
+            zf.write(report_path, "report.json")
         if artifacts["state_path"] is not None:
-            zf.write(artifacts["state_path"], "state.json")
+            state_path = ensure_path_within_directory(artifacts["state_path"], job_dir)
+            zf.write(state_path, "state.json")
         for name, path in artifacts["zeek_files"]:
-            zf.write(path, f"zeek/{name}")
+            evidence_path = ensure_path_within_directory(path, job_dir)
+            zf.write(evidence_path, f"zeek/{name}")
 
     return bundle_path
 
 
 def _job_history_item(st):
     artifacts = _collect_job_export_artifacts(st)
-    upload_name = ""
-    if st.upload_path:
-        try:
-            upload_name = Path(st.upload_path).name
-        except Exception:
-            upload_name = str(st.upload_path)
+    upload_name = _safe_pcap_upload_name(st)
+    has_upload = bool(getattr(st, "upload_path", None))
+    has_report = artifacts["report_path"] is not None
+    updated_at = st.finished_at or st.started_at or st.created_at
 
     error_summary = _summarize_job_error(getattr(st, "error", None))
     return {
         "job_id": st.job_id,
         "status": st.status,
         "created_at": st.created_at,
+        "updated_at": updated_at,
         "started_at": st.started_at,
         "finished_at": st.finished_at,
         "progress": st.progress,
         "message": st.message,
         "upload_name": upload_name,
-        "upload_path": st.upload_path,
-        "report_path": (
-            str(artifacts["report_path"]) if artifacts["report_path"] else None
-        ),
-        "report_available": artifacts["report_path"] is not None,
+        "original_filename": upload_name,
+        "has_upload": has_upload,
+        "has_report": has_report,
+        "report_available": has_report,
         "evidence_available": bool(artifacts["zeek_files"]),
         "artifact_protection": getattr(st, "artifact_protection", None),
         "error": error_summary,
     }
+
+
+def _safe_pcap_upload_name(job_state) -> str:
+    upload_path = getattr(job_state, "upload_path", None)
+    if not upload_path:
+        return ""
+    try:
+        return Path(str(upload_path)).name
+    except Exception:
+        return "uploaded-pcap"
 
 
 def _get_authorized_job_for_context(job_id: str, ctx: "PcapRequestContext"):
@@ -3762,8 +3882,13 @@ def train_model():
         )
 
     except Exception as e:
-        logging.error(f"Error in train_model: {str(e)}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return safe_error_response(
+            public_message="Unable to train the model right now.",
+            error_code="model_training_failed",
+            status_code=500,
+            log_exception=e,
+            log_context={"route": "train_model"},
+        )
 
 
 @app.route("/predict", methods=["POST"])
@@ -3823,8 +3948,13 @@ def predict():
             }
         )
     except Exception as e:
-        logging.exception("Error in predict")
-        return jsonify({"error": str(e)}), 500
+        return safe_error_response(
+            public_message="Unable to run the prediction right now.",
+            error_code="prediction_failed",
+            status_code=500,
+            log_exception=e,
+            log_context={"route": "predict"},
+        )
 
 
 @app.route("/test", methods=["POST"])
@@ -3879,8 +4009,13 @@ def test_model():
             }
         )
     except Exception as e:
-        logging.exception("Error in test_model")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return safe_error_response(
+            public_message="Unable to test the model right now.",
+            error_code="model_test_failed",
+            status_code=500,
+            log_exception=e,
+            log_context={"route": "test_model"},
+        )
 
 
 @app.route("/threat/run-pipeline", methods=["POST"])
@@ -4124,8 +4259,13 @@ def run_threat_pipeline():
         return jsonify(response)
 
     except Exception as e:
-        logging.exception("Error in run_threat_pipeline")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return safe_error_response(
+            public_message="Unable to run the threat pipeline right now.",
+            error_code="threat_pipeline_failed",
+            status_code=500,
+            log_exception=e,
+            log_context={"route": "run_threat_pipeline"},
+        )
 
 
 @app.route("/threat/report", methods=["GET"])
@@ -4199,8 +4339,13 @@ def threat_report():
         return jsonify(response)
 
     except Exception as e:
-        logging.exception("Error in threat_report")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return safe_error_response(
+            public_message="Unable to generate the threat report right now.",
+            error_code="threat_report_failed",
+            status_code=500,
+            log_exception=e,
+            log_context={"route": "threat_report"},
+        )
 
 
 @app.route("/pcap/analyze", methods=["POST"])
@@ -4221,10 +4366,24 @@ def analyze_pcap():
         if f is None or not str(getattr(f, "filename", "") or "").strip():
             return jsonify({"error": "No PCAP file provided"}), 400
 
-        # 1) Validate file extension
+        # 1) Validate extension and magic bytes before saving the upload.
         filename = (f.filename or "").lower()
-        if not filename.endswith((".pcap", ".pcapng")):
-            return jsonify({"error": "Invalid file type"}), 400
+        validation = validate_pcap_upload(f, filename)
+        if not validation.get("ok"):
+            logging.warning(
+                "Rejected PCAP upload | reason=%s",
+                validation.get("safe_reason") or "invalid_file",
+            )
+            return safe_error_response(
+                public_message=validation.get("public_message")
+                or "Invalid PCAP file. Please upload a valid .pcap or .pcapng file.",
+                error_code=validation.get("error_code") or "invalid_file_type",
+                status_code=400,
+                log_context={
+                    "route": "analyze_pcap",
+                    "reason": validation.get("safe_reason") or "invalid_file",
+                },
+            )
 
         upload_size = _measure_upload_size(f)
         if upload_size is not None and upload_size > MAX_FILE_SIZE:
@@ -4398,7 +4557,13 @@ def analyze_pcap():
         )
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return safe_error_response(
+            public_message="Unable to analyze the PCAP file right now.",
+            error_code="pcap_analyze_failed",
+            status_code=500,
+            log_exception=e,
+            log_context={"route": "analyze_pcap"},
+        )
 
 
 def _normalize_dashboard_alert_severity(raw_severity) -> str:
@@ -5591,21 +5756,25 @@ def get_job(job_id):
         return job_error
 
     artifacts = _collect_job_export_artifacts(st)
+    upload_name = _safe_pcap_upload_name(st)
+    has_upload = bool(getattr(st, "upload_path", None))
+    has_report = artifacts["report_path"] is not None
+    updated_at = st.finished_at or st.started_at or st.created_at
     payload = {
         "job_id": st.job_id,
         "status": st.status,
         "created_at": st.created_at,
+        "updated_at": updated_at,
         "started_at": st.started_at,
         "finished_at": st.finished_at,
         "progress": st.progress,
         "message": st.message,
         "error": _summarize_job_error(st.error),
-        "upload_path": st.upload_path,
-        "upload_name": Path(st.upload_path).name if st.upload_path else "",
-        "report_path": (
-            str(artifacts["report_path"]) if artifacts["report_path"] else None
-        ),
-        "report_available": artifacts["report_path"] is not None,
+        "upload_name": upload_name,
+        "original_filename": upload_name,
+        "has_upload": has_upload,
+        "has_report": has_report,
+        "report_available": has_report,
         "evidence_available": bool(artifacts["zeek_files"]),
         "artifact_protection": getattr(st, "artifact_protection", None),
     }
@@ -5623,7 +5792,8 @@ def get_job(job_id):
                 artifacts["report_path"].read_text(encoding="utf-8")
             )
         except Exception:
-            payload["report_path"] = str(artifacts["report_path"])
+            payload["report_available"] = True
+            payload["has_report"] = True
 
     response = _make_pcap_response(payload, 200, ctx)
     if st.status in {"queued", "running"}:
@@ -5784,9 +5954,27 @@ def export_job_artifact(job_id):
         return jsonify({"error": "Job not completed yet"}), 409
 
     artifacts = _collect_job_export_artifacts(st)
+    job_dir, path_error = _contained_path_or_response(
+        artifacts["job_dir"],
+        JOBS_FOLDER,
+        "export_job_artifact",
+        job_id=job_id,
+    )
+    if path_error:
+        return path_error
+    artifacts["job_dir"] = job_dir
     if export_type == "report":
         if artifacts["report_path"] is None:
             return jsonify({"error": "Report artifact not found"}), 404
+        report_path, path_error = _contained_path_or_response(
+            artifacts["report_path"],
+            artifacts["job_dir"],
+            "export_job_artifact",
+            job_id=job_id,
+            export_type="report",
+        )
+        if path_error:
+            return path_error
 
         try:
             _log_pcap_analysis_activity(
@@ -5814,15 +6002,31 @@ def export_job_artifact(job_id):
             logging.exception("Failed to record report download gamification event for job %s", job_id)
 
         return send_file(
-            artifacts["report_path"],
+            report_path,
             as_attachment=True,
             download_name=f"pcap_report_{job_id}.json",
             mimetype="application/json",
         )
 
-    bundle_path = _build_job_evidence_bundle(st)
+    try:
+        bundle_path = _build_job_evidence_bundle(st)
+    except ValueError:
+        return _invalid_file_path_response(
+            "export_job_artifact",
+            job_id=job_id,
+            export_type=export_type,
+        )
     if bundle_path is None or not bundle_path.exists():
         return jsonify({"error": "Evidence bundle not available"}), 404
+    bundle_path, path_error = _contained_path_or_response(
+        bundle_path,
+        artifacts["job_dir"],
+        "export_job_artifact",
+        job_id=job_id,
+        export_type=export_type,
+    )
+    if path_error:
+        return path_error
 
     try:
         _log_pcap_analysis_activity(
@@ -5874,11 +6078,23 @@ def analyze_local():
         try:
             pcap_path = str(_resolve_analyze_local_path(data["pcap_path"]))
         except PermissionError as exc:
-            return jsonify({"error": str(exc)}), 403
+            return safe_error_response(
+                public_message="The requested PCAP file is not allowed.",
+                error_code="pcap_path_not_allowed",
+                status_code=403,
+                log_exception=exc,
+                log_context={"route": "analyze_local"},
+            )
         except FileNotFoundError:
             return jsonify({"error": "File not found"}), 400
         except ValueError as exc:
-            return jsonify({"error": str(exc)}), 400
+            return safe_error_response(
+                public_message="The PCAP file path is invalid.",
+                error_code="invalid_pcap_path",
+                status_code=400,
+                log_exception=exc,
+                log_context={"route": "analyze_local"},
+            )
 
         include_zeek_raw = data.get("include_zeek", True)
         if isinstance(include_zeek_raw, str):
@@ -6021,7 +6237,13 @@ def analyze_local():
         )
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return safe_error_response(
+            public_message="Unable to analyze the PCAP file right now.",
+            error_code="pcap_analyze_failed",
+            status_code=500,
+            log_exception=e,
+            log_context={"route": "analyze_local"},
+        )
 
 
 # ========================================
@@ -7247,19 +7469,15 @@ def _ensure_contact_message_schema_initialized() -> None:
             for index in inspector.get_indexes(ContactMessage.__tablename__)
         }
         index_statements = []
-        for index_name, column_name in (
-            ("ix_contact_message_email", "email"),
-            ("ix_contact_message_category", "category"),
-            ("ix_contact_message_status", "status"),
-            ("ix_contact_message_created_at", "created_at"),
-        ):
+        contact_index_sql = {
+            "ix_contact_message_email": "CREATE INDEX ix_contact_message_email ON contact_messages (email)",
+            "ix_contact_message_category": "CREATE INDEX ix_contact_message_category ON contact_messages (category)",
+            "ix_contact_message_status": "CREATE INDEX ix_contact_message_status ON contact_messages (status)",
+            "ix_contact_message_created_at": "CREATE INDEX ix_contact_message_created_at ON contact_messages (created_at)",
+        }
+        for index_name, statement_sql in contact_index_sql.items():
             if index_name not in existing_indexes:
-                index_statements.append(
-                    text(
-                        f"CREATE INDEX {index_name} "
-                        f"ON {ContactMessage.__tablename__} ({column_name})"
-                    )
-                )
+                index_statements.append(text(statement_sql))
 
         try:
             for statement in index_statements:
@@ -7295,21 +7513,17 @@ def _ensure_activity_logs_schema_initialized() -> None:
             for index in inspector.get_indexes(UserActivityLog.__tablename__)
         }
         index_statements = []
-        for index_name, column_name in (
-            ("ix_user_activity_logs_user_id", "user_id"),
-            ("ix_user_activity_logs_module", "module"),
-            ("ix_user_activity_logs_action_type", "action_type"),
-            ("ix_user_activity_logs_status", "status"),
-            ("ix_user_activity_logs_severity", "severity"),
-            ("ix_user_activity_logs_created_at", "created_at"),
-        ):
+        activity_index_sql = {
+            "ix_user_activity_logs_user_id": "CREATE INDEX ix_user_activity_logs_user_id ON user_activity_logs (user_id)",
+            "ix_user_activity_logs_module": "CREATE INDEX ix_user_activity_logs_module ON user_activity_logs (module)",
+            "ix_user_activity_logs_action_type": "CREATE INDEX ix_user_activity_logs_action_type ON user_activity_logs (action_type)",
+            "ix_user_activity_logs_status": "CREATE INDEX ix_user_activity_logs_status ON user_activity_logs (status)",
+            "ix_user_activity_logs_severity": "CREATE INDEX ix_user_activity_logs_severity ON user_activity_logs (severity)",
+            "ix_user_activity_logs_created_at": "CREATE INDEX ix_user_activity_logs_created_at ON user_activity_logs (created_at)",
+        }
+        for index_name, statement_sql in activity_index_sql.items():
             if index_name not in existing_indexes:
-                index_statements.append(
-                    text(
-                        f"CREATE INDEX {index_name} "
-                        f"ON {UserActivityLog.__tablename__} ({column_name})"
-                    )
-                )
+                index_statements.append(text(statement_sql))
 
         try:
             for statement in index_statements:
@@ -10618,8 +10832,293 @@ def admin_console_me():
                 "email": email,
                 "role": "Admin",
             },
+            }
+        )
+
+
+SECURITY_SIMULATION_TIMEOUT_SECONDS = 8
+SECURITY_SIMULATION_MAX_BRUTE_FORCE_ATTEMPTS = 12
+
+
+def _security_simulation_definitions() -> dict[str, dict[str, object]]:
+    return {
+        "sqli_login": {
+            "test_id": "sqli_login",
+            "attack_name": "SQL Injection",
+            "method": "POST",
+            "path": "/api/auth/login",
+            "expected_status": 403,
+            "control": "WAF Rule 1001",
+            "result": "Blocked by WAF",
+            "purpose": "Verifies that login SQL injection patterns are blocked before reaching authentication logic.",
+            "expected_behavior": "The WAF should reject the request with HTTP 403.",
+            "description": "Login SQL injection signature check",
+            "body": {"email": "validation@example.invalid", "password": "' OR '1'='1' --"},
+        },
+        "xss_contact": {
+            "test_id": "xss_contact",
+            "attack_name": "Cross-Site Scripting XSS",
+            "method": "POST",
+            "path": "/api/contact/support",
+            "expected_status": 403,
+            "control": "WAF Rule 1002",
+            "result": "Blocked by WAF",
+            "purpose": "Verifies that common script injection markers are blocked by the WAF.",
+            "expected_behavior": "The WAF should reject the request with HTTP 403.",
+            "description": "Support/contact XSS signature check",
+            "body": {"name": "Validation", "email": "validation@example.invalid", "message": "<script>alert(1)</script>"},
+        },
+        "path_traversal": {
+            "test_id": "path_traversal",
+            "attack_name": "Path Traversal",
+            "method": "GET",
+            "path": "/download?file=../../../../etc/passwd",
+            "expected_status": 403,
+            "control": "WAF Rule 1003",
+            "result": "Blocked by WAF",
+            "purpose": "Verifies that traversal attempts against download endpoints are blocked.",
+            "expected_behavior": "The WAF should reject the request with HTTP 403.",
+            "description": "Download traversal signature check",
+        },
+        "cors_bad_origin": {
+            "test_id": "cors_bad_origin",
+            "attack_name": "CORS Misconfiguration",
+            "method": "GET",
+            "path": "/api/auth/me",
+            "expected_status": 403,
+            "control": "WAF Rule 1004",
+            "result": "Blocked suspicious origin",
+            "purpose": "Verifies that sensitive account endpoints reject untrusted origins at the WAF.",
+            "expected_behavior": "The WAF should reject the request with HTTP 403.",
+            "description": "Suspicious Origin header check",
+            "headers": {"Origin": "http://localhost:4000"},
+        },
+        "cors_allowed_origin": {
+            "test_id": "cors_allowed_origin",
+            "attack_name": "Allowed CORS Origin",
+            "method": "GET",
+            "path": "/api/auth/me",
+            "expected_status": 401,
+            "control": "WAF allow + backend authentication",
+            "result": "Allowed through WAF, rejected by backend authentication",
+            "purpose": "Verifies that the trusted local frontend origin passes the WAF and backend auth still rejects unauthenticated access.",
+            "expected_behavior": "The request should pass the WAF and receive HTTP 401 from backend authentication.",
+            "description": "Trusted Origin control check",
+            "headers": {"Origin": "https://localhost:5173"},
+        },
+        "idor_profile": {
+            "test_id": "idor_profile",
+            "attack_name": "IDOR Pattern",
+            "method": "GET",
+            "path": "/api/profile?id=102",
+            "expected_status": 403,
+            "control": "WAF Rule 1008",
+            "result": "Blocked suspicious object access pattern",
+            "purpose": "Verifies that obvious profile id manipulation patterns are blocked at the WAF.",
+            "expected_behavior": "The WAF should reject the request with HTTP 403.",
+            "description": "Profile object id manipulation check",
+        },
+        "brute_force_login": {
+            "test_id": "brute_force_login",
+            "attack_name": "Brute Force Login",
+            "method": "POST",
+            "path": "/api/auth/login",
+            "expected_status": 429,
+            "control": "WAF / backend rate limiting",
+            "result": "Rate limited",
+            "purpose": "Verifies that repeated login attempts are throttled.",
+            "expected_behavior": "Repeated requests should eventually receive HTTP 429.",
+            "description": "Repeated invalid login rate-limit check",
+            "body": {"email": "validation@example.invalid", "password": "invalid-password"},
+        },
+    }
+
+
+def _public_security_simulation_test(definition: dict[str, object]) -> dict[str, object]:
+    return {
+        "test_id": definition["test_id"],
+        "attack_name": definition["attack_name"],
+        "method": definition["method"],
+        "target": definition["path"],
+        "expected_status": definition["expected_status"],
+        "control": definition["control"],
+        "result": definition["result"],
+        "purpose": definition["purpose"],
+        "expected_behavior": definition["expected_behavior"],
+        "description": definition["description"],
+    }
+
+
+def _security_simulation_key() -> str:
+    admin = getattr(g, "current_admin", None) or get_current_admin() or {}
+    admin_identity = admin.get("user_id") or admin.get("email")
+    if admin_identity:
+        return f"admin-simulation:{admin_identity}"
+    return f"admin-simulation-ip:{get_remote_address()}"
+
+
+def _waf_base_url() -> str:
+    return str(os.getenv("WAF_BASE_URL") or "").strip().rstrip("/")
+
+
+def _run_security_simulation(definition: dict[str, object]) -> dict[str, object]:
+    base_url = _waf_base_url()
+    if not base_url:
+        raise RuntimeError("waf_not_configured")
+
+    parsed = urlparse(base_url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise RuntimeError("waf_not_configured")
+
+    method = str(definition["method"]).upper()
+    path = str(definition["path"])
+    url = f"{base_url}{path}"
+    headers = {"User-Agent": "Sentinel-Security-Validation-Lab/1.0"}
+    headers.update(definition.get("headers") or {})
+    body = definition.get("body")
+    expected_status = int(definition["expected_status"])
+    actual_status = None
+
+    if definition["test_id"] == "brute_force_login":
+        attempts = []
+        for _ in range(SECURITY_SIMULATION_MAX_BRUTE_FORCE_ATTEMPTS):
+            response = requests.request(
+                method,
+                url,
+                headers=headers,
+                json=body,
+                timeout=SECURITY_SIMULATION_TIMEOUT_SECONDS,
+                verify=False,
+            )
+            attempts.append(int(response.status_code))
+            actual_status = int(response.status_code)
+            if actual_status == expected_status:
+                break
+        extra = {"attempts": len(attempts)}
+    else:
+        response = requests.request(
+            method,
+            url,
+            headers=headers,
+            json=body if method in {"POST", "PUT", "PATCH"} else None,
+            timeout=SECURITY_SIMULATION_TIMEOUT_SECONDS,
+            verify=False,
+        )
+        actual_status = int(response.status_code)
+        extra = {}
+
+    passed = actual_status == expected_status
+    return {
+        "success": True,
+        "test_id": definition["test_id"],
+        "attack_name": definition["attack_name"],
+        "target": definition["path"],
+        "method": method,
+        "expected_status": expected_status,
+        "actual_status": actual_status,
+        "passed": passed,
+        "result": definition["result"],
+        "control": definition["control"],
+        "purpose": definition["purpose"],
+        "expected_behavior": definition["expected_behavior"],
+        "explanation": (
+            "The observed status matched the expected protected behavior."
+            if passed
+            else "The observed status did not match the expected protected behavior."
+        ),
+        "timestamp": datetime.now(UTC).isoformat(),
+        **extra,
+    }
+
+
+@app.route("/api/admin/security-simulation/tests", methods=["GET"])
+@admin_auth_required
+def admin_security_simulation_tests():
+    definitions = _security_simulation_definitions()
+    return jsonify(
+        {
+            "success": True,
+            "tests": [
+                _public_security_simulation_test(definitions[test_id])
+                for test_id in definitions
+            ],
         }
     )
+
+
+@app.route("/api/admin/security-simulation/run", methods=["POST"])
+@admin_auth_required
+@limiter.limit("20 per hour", key_func=_security_simulation_key)
+def admin_security_simulation_run():
+    base_url = _waf_base_url()
+    if not base_url:
+        return safe_error_response(
+            public_message="Security validation is not configured.",
+            error_code="waf_not_configured",
+            status_code=503,
+        )
+
+    payload = request.get_json(silent=True) or {}
+    definitions = _security_simulation_definitions()
+    run_all = bool(payload.get("run_all"))
+    test_id = str(payload.get("test_id") or "").strip()
+
+    if run_all:
+        selected = list(definitions.values())
+    elif test_id in definitions:
+        selected = [definitions[test_id]]
+    else:
+        return safe_error_response(
+            public_message="Unknown security validation test.",
+            error_code="invalid_test_id",
+            status_code=400,
+        )
+
+    try:
+        results = [_run_security_simulation(definition) for definition in selected]
+    except RuntimeError as exc:
+        if str(exc) == "waf_not_configured":
+            return safe_error_response(
+                public_message="Security validation is not configured.",
+                error_code="waf_not_configured",
+                status_code=503,
+            )
+        return safe_error_response(
+            public_message="Security validation service is unavailable. Please make sure the WAF is running.",
+            error_code="security_simulation_failed",
+            status_code=503,
+            log_exception=exc,
+            log_context={"route": "admin_security_simulation_run"},
+        )
+    except requests.RequestException as exc:
+        return safe_error_response(
+            public_message="Security validation service is unavailable. Please make sure the WAF is running.",
+            error_code="security_simulation_unavailable",
+            status_code=503,
+            log_exception=exc,
+            log_context={"route": "admin_security_simulation_run"},
+        )
+    except Exception as exc:
+        return safe_error_response(
+            public_message="Unable to complete security validation right now.",
+            error_code="security_simulation_failed",
+            status_code=500,
+            log_exception=exc,
+            log_context={"route": "admin_security_simulation_run"},
+        )
+
+    if run_all:
+        return jsonify(
+            {
+                "success": True,
+                "run_all": True,
+                "results": results,
+                "passed": all(result.get("passed") for result in results),
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+        )
+
+    return jsonify(results[0])
 
 
 @app.route("/api/admin/auth/logout", methods=["POST"])
@@ -11926,7 +12425,8 @@ def _admin_threats_csv_response(alerts: list[dict[str, object]]):
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(
-        [
+        sanitize_csv_row(
+            [
             "Alert ID",
             "Title",
             "Description",
@@ -11937,11 +12437,13 @@ def _admin_threats_csv_response(alerts: list[dict[str, object]]):
             "Timestamp",
             "Device Context",
             "Investigation Summary",
-        ]
+            ]
+        )
     )
     for alert in alerts:
         writer.writerow(
-            [
+            sanitize_csv_row(
+                [
                 _safe_str(alert.get("id")),
                 _safe_str(alert.get("title")),
                 _safe_str(alert.get("description")),
@@ -11952,7 +12454,8 @@ def _admin_threats_csv_response(alerts: list[dict[str, object]]):
                 _safe_str(alert.get("timestamp")),
                 _safe_str(alert.get("device_context")),
                 _safe_str(alert.get("investigation_summary")),
-            ]
+                ]
+            )
         )
 
     csv_bytes = output.getvalue().encode("utf-8-sig")
@@ -12108,19 +12611,17 @@ def _ensure_admin_console_schema_initialized() -> None:
                 for index in inspector.get_indexes(AdminAuditLog.__tablename__)
             }
             audit_index_statements = []
-            audit_indexes = {
-                "ix_admin_audit_log_actor_email": "actor_email",
-                "ix_admin_audit_log_action_type": "action_type",
-                "ix_admin_audit_log_module": "module",
-                "ix_admin_audit_log_status": "status",
-                "ix_admin_audit_log_severity": "severity",
-                "ix_admin_audit_log_created_at": "created_at",
+            audit_index_sql = {
+                "ix_admin_audit_log_actor_email": "CREATE INDEX ix_admin_audit_log_actor_email ON admin_audit_log (actor_email)",
+                "ix_admin_audit_log_action_type": "CREATE INDEX ix_admin_audit_log_action_type ON admin_audit_log (action_type)",
+                "ix_admin_audit_log_module": "CREATE INDEX ix_admin_audit_log_module ON admin_audit_log (module)",
+                "ix_admin_audit_log_status": "CREATE INDEX ix_admin_audit_log_status ON admin_audit_log (status)",
+                "ix_admin_audit_log_severity": "CREATE INDEX ix_admin_audit_log_severity ON admin_audit_log (severity)",
+                "ix_admin_audit_log_created_at": "CREATE INDEX ix_admin_audit_log_created_at ON admin_audit_log (created_at)",
             }
-            for index_name, column_name in audit_indexes.items():
+            for index_name, statement_sql in audit_index_sql.items():
                 if index_name not in existing_indexes:
-                    audit_index_statements.append(
-                        text(f"CREATE INDEX {index_name} ON admin_audit_log ({column_name})")
-                    )
+                    audit_index_statements.append(text(statement_sql))
             try:
                 for statement in audit_index_statements:
                     db.session.execute(statement)
@@ -13459,8 +13960,8 @@ def _friendly_smtp_error(exc: Exception) -> str:
     if isinstance(exc, smtplib.SMTPConnectError):
         return "SMTP connection failed. Check MAIL_SERVER, MAIL_PORT, TLS/SSL settings, and network access."
     if isinstance(exc, smtplib.SMTPException):
-        return f"SMTP delivery failed: {str(exc)[:180]}"
-    return f"Email delivery failed: {str(exc)[:180]}"
+        return "SMTP delivery failed. Check server settings and try again."
+    return "Email delivery failed. Please try again later."
 
 
 def _telegram_default_chat_id(settings: dict | None = None) -> str:
@@ -13487,7 +13988,7 @@ def _send_telegram_notification_result(message: str, chat_id_override: str | Non
     normalized_message = str(message or "").strip()
 
     if not bot_token:
-        return {"success": False, "error": "TELEGRAM_BOT_TOKEN is not configured."}
+        return {"success": False, "error": "Telegram notifications are not configured."}
     if not chat_id:
         return {"success": False, "error": "Telegram chat ID is not configured."}
     if not normalized_message:
@@ -15351,6 +15852,7 @@ def _complete_flask_login_session_after_2fa(user):
 
 
 @app.route("/api/auth/signup", methods=["POST"])
+@limiter.limit(lambda: _rate_limit_value("RATELIMIT_SIGNUP", "3 per minute;10 per hour"), key_func=get_remote_address)
 def signup():
     data = request.get_json() or {}
 
@@ -15413,6 +15915,7 @@ def signup():
 
 
 @app.route("/api/auth/login", methods=["POST"])
+@limiter.limit(lambda: _rate_limit_value("RATELIMIT_LOGIN", "5 per minute;20 per hour"), key_func=get_remote_address)
 def login():
     data = request.get_json() or {}
 
@@ -17204,7 +17707,7 @@ def admin_test_telegram_notification():
     telegram_chat_id = recipient_chat_id or _telegram_default_chat_id(notification_settings)
 
     if not _telegram_has_bot_token():
-        return jsonify({"success": False, "message": "TELEGRAM_BOT_TOKEN is not configured."}), 503
+        return jsonify({"success": False, "message": "Telegram notifications are not configured."}), 503
     
     if not bool(notification_settings.get("telegramEnabled", True)):
         return (
@@ -17222,7 +17725,7 @@ def admin_test_telegram_notification():
             jsonify(
                 {
                     "success": False,
-                    "message": "Telegram chat ID is not configured for the selected admin recipient or ADMIN_TELEGRAM_CHAT_ID fallback.",
+                    "message": "Telegram destination is not configured.",
                 }
             ),
             400,
@@ -17471,13 +17974,13 @@ def admin_notification_control_test():
                 else _telegram_default_chat_id(notification_settings)
             )
             if not _telegram_has_bot_token():
-                return jsonify({"success": False, "message": "TELEGRAM_BOT_TOKEN is not configured."}), 503
+                return jsonify({"success": False, "message": "Telegram notifications are not configured."}), 503
             if not destination_chat_id:
                 return (
                     jsonify(
                         {
                             "success": False,
-                            "message": "Telegram chat ID is not configured for the selected admin recipient or ADMIN_TELEGRAM_CHAT_ID fallback.",
+                            "message": "Telegram destination is not configured.",
                         }
                     ),
                     400,
@@ -17520,15 +18023,12 @@ def admin_notification_control_test():
             }
         )
     except Exception as exc:
-        logging.exception("Admin notification control test failed")
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "message": f"{channel.title()} test notification failed: {_friendly_smtp_error(exc) if channel == 'email' else str(exc)[:180]}",
-                }
-            ),
-            500,
+        return safe_error_response(
+            public_message=f"{channel.title()} test notification failed. Please try again later.",
+            error_code="notification_test_failed",
+            status_code=500,
+            log_exception=exc,
+            log_context={"route": "admin_notification_control_test", "channel": channel},
         )
 
 
@@ -18063,7 +18563,8 @@ def export_my_activity_logs():
     csv_buffer = io.StringIO()
     writer = csv.writer(csv_buffer)
     writer.writerow(
-        [
+        sanitize_csv_row(
+            [
             "event_id",
             "module",
             "action_type",
@@ -18080,13 +18581,15 @@ def export_my_activity_logs():
             "is_sensitive",
             "is_suspicious",
             "created_at",
-        ]
+            ]
+        )
     )
 
     for record in records:
         item = _serialize_user_activity_log(record, include_metadata=False)
         writer.writerow(
-            [
+            sanitize_csv_row(
+                [
                 item.get("event_id"),
                 item.get("module"),
                 item.get("action_type"),
@@ -18103,7 +18606,8 @@ def export_my_activity_logs():
                 item.get("is_sensitive"),
                 item.get("is_suspicious"),
                 item.get("created_at"),
-            ]
+                ]
+            )
         )
 
     csv_bytes = io.BytesIO(csv_buffer.getvalue().encode("utf-8"))
@@ -19037,6 +19541,7 @@ def _get_google_drive_service():
 
 
 def _upload_file_to_google_drive(*, file_path: Path, filename: str, description: str = "") -> dict:
+    file_path = ensure_path_within_directory(file_path, BASE_DIR / "reports")
     if not file_path.exists() or not file_path.is_file():
         raise FileNotFoundError("Report PDF file was not found.")
 
@@ -19214,6 +19719,14 @@ def upload_monthly_report_to_drive(report_month):
 
         if pdf_path is None or not pdf_path.exists():
             return jsonify({"error": "Report PDF is not available. Generate or download the PDF first."}), 404
+        pdf_path, path_error = _contained_path_or_response(
+            pdf_path,
+            BASE_DIR / "reports",
+            "upload_monthly_report_to_drive",
+            report_month=normalized.month_key,
+        )
+        if path_error:
+            return path_error
 
         filename = f"sentinel-monthly-security-report-{normalized.month_key}.pdf"
         uploaded = _upload_file_to_google_drive(
@@ -19231,12 +19744,17 @@ def upload_monthly_report_to_drive(report_month):
             }
         )
     except Exception as exc:
-        logging.exception(
-            "Failed to upload monthly report to Google Drive | user_id=%s | report_month=%s",
-            getattr(user, "id", None),
-            normalized.month_key,
+        return safe_error_response(
+            public_message="Unable to upload the report to Google Drive right now.",
+            error_code="google_drive_upload_failed",
+            status_code=500,
+            log_exception=exc,
+            log_context={
+                "route": "upload_monthly_report_to_drive",
+                "user_id": getattr(user, "id", None),
+                "report_month": normalized.month_key,
+            },
         )
-        return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/api/reports/monthly/<report_month>/download", methods=["GET"])
@@ -19256,6 +19774,14 @@ def download_monthly_security_report(report_month):
         return jsonify({"error": "Monthly report PDF not found"}), 404
 
     pdf_path = Path(str(report_record.pdf_path)).resolve()
+    pdf_path, path_error = _contained_path_or_response(
+        pdf_path,
+        BASE_DIR / "reports",
+        "download_monthly_security_report",
+        report_month=normalized.month_key,
+    )
+    if path_error:
+        return path_error
     if not pdf_path.exists():
         return jsonify({"error": "Monthly report PDF not found"}), 404
 
@@ -19284,7 +19810,13 @@ def generate_monthly_security_report():
             generation_mode,
         )
     except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+        return safe_error_response(
+            public_message="Invalid report generation request.",
+            error_code="invalid_report_request",
+            status_code=400,
+            log_exception=exc,
+            log_context={"route": "generate_monthly_security_report", "user_id": user.id},
+        )
     except Exception:
         logging.exception(
             "Failed to generate monthly report | user_id=%s | report_month=%s",
@@ -19387,10 +19919,32 @@ def verify_2fa_setup():
     return resp
 
 
-# -------------------------------------------------------------------
-# ---------------- Flask App ----------------
-limiter = Limiter(key_func=get_remote_address, default_limits=["20/minute"])
-limiter.init_app(app)
+def _rate_limit_user_or_ip() -> str:
+    try:
+        user = get_current_user()
+        user_id = _safe_int(getattr(user, "id", None), 0) if user is not None else 0
+        if user_id > 0:
+            return f"user:{user_id}"
+    except Exception:
+        pass
+    return f"ip:{get_remote_address()}"
+
+
+def _rate_limit_admin_or_ip() -> str:
+    try:
+        admin = get_current_admin()
+        if isinstance(admin, dict):
+            user_id = _safe_int(admin.get("user_id"), 0)
+            if user_id > 0:
+                return f"admin-user:{user_id}"
+            email = _safe_str(admin.get("email")).strip().lower()
+            if email:
+                return f"admin-email:{email}"
+    except Exception:
+        pass
+    return f"ip:{get_remote_address()}"
+
+
 for notification_view in (
     list_pcap_alerts,
     list_notifications,
@@ -19728,7 +20282,7 @@ def scan_asset(asset_id):
             return jsonify({"error": "Asset not found"}), 404
         asset_row = {"id": row[0], "asset": row[1], "asset_type": row[2]}
         status, matches = perform_scan_for_asset(asset_row, user.id)
-        save_scan_result(asset_row["id"], status, matches)
+        save_scan_result(asset_row["id"], status, matches, user.id)
         return jsonify({"status": status, "matches": matches})
     finally:
         cursor.close()
@@ -19809,7 +20363,7 @@ def check_asset():
     asset_row = {"id": asset_id, "user_id": user.id, "asset": q, "asset_type": q_type}
 
     status, matches = perform_scan_for_asset(asset_row, user.id)
-    save_scan_result(asset_row["id"], status, matches)
+    save_scan_result(asset_row["id"], status, matches, user.id)
     # save_scan_result(user.id, q, q_type, status, matches)
 
     return (
@@ -19835,17 +20389,19 @@ def _identity_validate_asset(asset_type: str, asset_value: str) -> tuple[str | N
     normalized_value = str(asset_value or "").strip()
     if normalized_type not in {"email", "username", "domain"}:
         return None, "asset_type must be one of email, username, or domain"
+    if len(normalized_value) > 254:
+        return None, "asset_value is too long"
     if normalized_type == "email":
         normalized_value = normalized_value.lower()
-        if "@" not in normalized_value or normalized_value.startswith("@") or normalized_value.endswith("@"):
+        if not re.fullmatch(r"[^@\s]{1,64}@[^@\s]{1,253}\.[^@\s]{2,}", normalized_value):
             return None, "email asset_value must contain a valid @ address"
     elif normalized_type == "domain":
         if normalized_value.lower().startswith(("http://", "https://")):
             return None, "domain asset_value must not include http:// or https://"
         normalized_value = normalized_value.lower().removeprefix("www.").strip("/")
-        if not normalized_value or "/" in normalized_value or "." not in normalized_value:
+        if not re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}", normalized_value):
             return None, "domain asset_value must be a bare domain like example.com"
-    elif not normalized_value:
+    elif not normalized_value or len(normalized_value) > 80:
         return None, "username asset_value is required"
     return normalized_value, None
 
@@ -20137,7 +20693,14 @@ def identity_web_scan():
         return jsonify(result), 200
     except ValueError as exc:
         fail_identity_web_scan(scan_id, str(exc), _identity_web_now(), user_id)
-        return jsonify({"error": str(exc), "scan_id": scan_id}), 400
+        return safe_error_response(
+            public_message="Unable to complete the identity scan request.",
+            error_code="identity_scan_invalid_request",
+            status_code=400,
+            log_exception=exc,
+            log_context={"route": "identity_web_scan", "user_id": user_id, "scan_id": scan_id},
+            extra_fields={"scan_id": scan_id},
+        )
     except Exception:
         logging.exception("Identity Leak Monitor public web scan failed")
         fail_identity_web_scan(scan_id, "Public web scan failed. Please try again later.", _identity_web_now(), user_id)
@@ -20235,6 +20798,7 @@ def identity_assets():
 
 
 @app.route("/api/identity/assets", methods=["POST"])
+@limiter.limit(lambda: _rate_limit_value("RATELIMIT_IDENTITY_ASSET_CREATE", "20 per hour"), key_func=_rate_limit_user_or_ip)
 def identity_create_asset():
     user_id, auth_error = _identity_current_user_id_response()
     if auth_error:
@@ -20244,11 +20808,39 @@ def identity_create_asset():
     asset_value, error = _identity_validate_asset(asset_type, str(data.get("asset_value") or ""))
     if error:
         return jsonify({"error": error}), 400
+    label = str(data.get("label") or "").strip()[:120] or None
+    existing_asset = next(
+        (
+            asset
+            for asset in list_identity_assets(user_id)
+            if str(asset.get("asset_type") or "").lower() == asset_type
+            and str(asset.get("asset_value") or "") == str(asset_value or "")
+        ),
+        None,
+    )
+    if existing_asset:
+        return (
+            jsonify(
+                {
+                    "success": True,
+                    "already_exists": True,
+                    "message": "Asset is already monitored.",
+                    "asset": {
+                        "id": existing_asset.get("id"),
+                        "asset_type": existing_asset.get("asset_type"),
+                        "asset_value": existing_asset.get("asset_value"),
+                        "label": existing_asset.get("label") or "",
+                        "already_exists": True,
+                    },
+                }
+            ),
+            200,
+        )
     try:
         asset = create_identity_asset(
             asset_type,
             asset_value or "",
-            str(data.get("label") or "").strip() or None,
+            label,
             _identity_web_now(),
             user_id,
         )
@@ -20268,9 +20860,26 @@ def identity_create_asset():
                 "label": asset.get("label"),
             },
         )
-        return jsonify({"asset": asset}), 201
+        return jsonify(
+            {
+                "success": True,
+                "asset": {
+                    **asset,
+                    "label": asset.get("label") or "",
+                    "already_exists": False,
+                },
+            }
+        ), 201
     except sqlite3.IntegrityError:
-        return jsonify({"error": "Asset already exists"}), 409
+        return jsonify({"success": True, "already_exists": True, "message": "Asset is already monitored."}), 200
+    except Exception as exc:
+        return safe_error_response(
+            public_message="Could not add asset. Please try again.",
+            error_code="identity_asset_create_failed",
+            status_code=500,
+            log_exception=exc,
+            log_context={"route": "identity_create_asset", "user_id": user_id},
+        )
 
 
 @app.route("/api/identity/assets/<int:asset_id>", methods=["DELETE"])
@@ -23364,7 +23973,7 @@ def pcap_chatbot():
                 "analysis_id": analysis_id,
                 "context_used": False,
                 "error": "PCAP chatbot could not build analysis context.",
-                "message": str(exc)[:300],
+                "message": "Unable to complete the request right now.",
             }
         ), 200
 
@@ -23445,7 +24054,7 @@ def identity_chatbot():
                 "scan_id": scan_id,
                 "context_used": False,
                 "error": "Identity chatbot could not build scan context.",
-                "message": str(exc)[:300],
+                "message": "Unable to complete the request right now.",
             }
         ), 200
 
@@ -23456,6 +24065,7 @@ def identity_chatbot():
 
 
 @app.route("/api/admin/auth/login", methods=["POST"])
+@limiter.limit(lambda: _rate_limit_value("RATELIMIT_ADMIN_LOGIN", "3 per minute;10 per hour"), key_func=get_remote_address)
 def admin_console_login():
     data = request.get_json(silent=True) or {}
     email = _normalize_linked_account_email(data.get("email", ""))
@@ -24172,12 +24782,12 @@ def admin_identity_report_export():
     report = _identity_admin_report_payload(request.args)
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["scan_id", "masked_identifier", "risk_level", "risk_score", "findings_count", "sources", "generated_at", "status"])
+    writer.writerow(sanitize_csv_row(["scan_id", "masked_identifier", "risk_level", "risk_score", "findings_count", "sources", "generated_at", "status"]))
     for item in report.get("recent_reports", []):
         if not isinstance(item, dict):
             continue
         writer.writerow(
-            [
+            sanitize_csv_row([
                 _safe_str(item.get("scan_id")),
                 _safe_str(item.get("masked_identifier")),
                 _safe_str(item.get("risk_level")),
@@ -24186,7 +24796,7 @@ def admin_identity_report_export():
                 "; ".join(_safe_str(source) for source in item.get("sources", []) if _safe_str(source)),
                 _safe_str(item.get("generated_at")),
                 _safe_str(item.get("status")),
-            ]
+            ])
         )
     response = make_response(output.getvalue().encode("utf-8-sig"))
     response.headers["Content-Type"] = "text/csv; charset=utf-8"
@@ -24419,24 +25029,24 @@ def admin_password_risk_report_export():
     breach_summary = report.get("breach_summary") if isinstance(report.get("breach_summary"), dict) else {}
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["metric", "value"])
-    writer.writerow(["report_name", _safe_str(report.get("report_name"))])
-    writer.writerow(["generated_at", _safe_str(report.get("generated_at"))])
-    writer.writerow(["data_source", _safe_str(report.get("data_source"))])
+    writer.writerow(sanitize_csv_row(["metric", "value"]))
+    writer.writerow(sanitize_csv_row(["report_name", _safe_str(report.get("report_name"))]))
+    writer.writerow(sanitize_csv_row(["generated_at", _safe_str(report.get("generated_at"))]))
+    writer.writerow(sanitize_csv_row(["data_source", _safe_str(report.get("data_source"))]))
     for key in ("total_checks", "breached_findings", "weak_findings", "strong_safe_checks", "latest_check_at"):
-        writer.writerow([key, summary.get(key)])
+        writer.writerow(sanitize_csv_row([key, summary.get(key)]))
     for key in ("total_breached_results", "total_exposure_count", "average_breach_count"):
-        writer.writerow([key, breach_summary.get(key)])
+        writer.writerow(sanitize_csv_row([key, breach_summary.get(key)]))
     writer.writerow([])
-    writer.writerow(["risk_level", "count"])
+    writer.writerow(sanitize_csv_row(["risk_level", "count"]))
     risk_distribution = report.get("risk_distribution") if isinstance(report.get("risk_distribution"), dict) else {}
     for key, value in risk_distribution.items():
-        writer.writerow([key, value])
+        writer.writerow(sanitize_csv_row([key, value]))
     writer.writerow([])
-    writer.writerow(["strength_label", "count"])
+    writer.writerow(sanitize_csv_row(["strength_label", "count"]))
     strength_distribution = report.get("strength_distribution") if isinstance(report.get("strength_distribution"), dict) else {}
     for key, value in strength_distribution.items():
-        writer.writerow([key, value])
+        writer.writerow(sanitize_csv_row([key, value]))
 
     response = make_response(output.getvalue().encode("utf-8-sig"))
     response.headers["Content-Type"] = "text/csv; charset=utf-8"
@@ -26772,10 +27382,28 @@ def admin_export_pcap_job_artifact(job_id):
         return jsonify({"success": False, "message": "PCAP job is not completed yet."}), 409
 
     artifacts = _collect_job_export_artifacts(job_state)
+    job_dir, path_error = _contained_path_or_response(
+        artifacts["job_dir"],
+        JOBS_FOLDER,
+        "admin_export_pcap_job_artifact",
+        job_id=job_id,
+    )
+    if path_error:
+        return path_error
+    artifacts["job_dir"] = job_dir
     if export_type == "report":
         report_path = artifacts.get("report_path")
         if report_path is None or not report_path.exists():
             return jsonify({"success": False, "message": "Report artifact not found."}), 404
+        report_path, path_error = _contained_path_or_response(
+            report_path,
+            job_dir,
+            "admin_export_pcap_job_artifact",
+            job_id=job_id,
+            export_type="report",
+        )
+        if path_error:
+            return path_error
 
         log_admin_action(
             getattr(g, "current_admin", None),
@@ -26797,9 +27425,25 @@ def admin_export_pcap_job_artifact(job_id):
             mimetype="application/json",
         )
 
-    bundle_path = _build_job_evidence_bundle(job_state)
+    try:
+        bundle_path = _build_job_evidence_bundle(job_state)
+    except ValueError:
+        return _invalid_file_path_response(
+            "admin_export_pcap_job_artifact",
+            job_id=job_id,
+            export_type=export_type,
+        )
     if bundle_path is None or not bundle_path.exists():
         return jsonify({"success": False, "message": "Evidence bundle not available."}), 404
+    bundle_path, path_error = _contained_path_or_response(
+        bundle_path,
+        job_dir,
+        "admin_export_pcap_job_artifact",
+        job_id=job_id,
+        export_type=export_type,
+    )
+    if path_error:
+        return path_error
 
     log_admin_action(
         getattr(g, "current_admin", None),
@@ -27295,11 +27939,11 @@ def admin_audit_logs_export():
     )
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Date", "Actor", "Email", "Role", "Action", "Module", "Event Scope", "Status", "Severity", "IP Address"])
+    writer.writerow(sanitize_csv_row(["Date", "Actor", "Email", "Role", "Action", "Module", "Event Scope", "Status", "Severity", "IP Address"]))
     for item in items:
         created_at = _as_utc_datetime(getattr(item, "created_at", None))
         writer.writerow(
-            [
+            sanitize_csv_row([
                 created_at.isoformat() if created_at else "",
                 item.actor_name or "",
                 item.actor_email or "",
@@ -27310,7 +27954,7 @@ def admin_audit_logs_export():
                 item.status or "",
                 item.severity or "",
                 item.ip_address or "",
-            ]
+            ])
         )
     log_admin_action(
         getattr(g, "current_admin", None),
@@ -27724,6 +28368,120 @@ def admin_ai_governance_retrain():
     )
 
 
+def _apply_rate_limit(endpoint: str, limit_env: str, default_limit: str, *, key_func=None) -> None:
+    view = app.view_functions.get(endpoint)
+    if view is None:
+        return
+    app.view_functions[endpoint] = limiter.limit(
+        _rate_limit_value(limit_env, default_limit),
+        key_func=key_func or get_remote_address,
+    )(view)
+
+
+def _apply_route_specific_rate_limits() -> None:
+    ip = get_remote_address
+    user = _rate_limit_user_or_ip
+    admin = _rate_limit_admin_or_ip
+
+    for endpoint, env_name, default_limit, key_func in [
+        # Authentication
+        ("refresh", "RATELIMIT_REFRESH", "30 per minute", user),
+        ("logout", "RATELIMIT_LOGOUT", "30 per minute", user),
+        ("verify_email", "RATELIMIT_EMAIL_VERIFY", "3 per minute;10 per hour", ip),
+        ("verify_2fa_login", "RATELIMIT_AUTH_2FA", "5 per minute;20 per hour", ip),
+        ("verify_2fa", "RATELIMIT_AUTH_2FA", "5 per minute;20 per hour", ip),
+        ("setup_2fa", "RATELIMIT_AUTH_2FA", "5 per minute;20 per hour", ip),
+        ("verify_2fa_setup", "RATELIMIT_AUTH_2FA", "5 per minute;20 per hour", ip),
+        # Admin authentication and sensitive actions
+        ("admin_console_verify_2fa", "RATELIMIT_ADMIN_LOGIN", "3 per minute;10 per hour", ip),
+        ("admin_test_telegram_notification", "RATELIMIT_ADMIN_NOTIFICATION_TEST", "3 per minute", admin),
+        ("admin_notification_control_test", "RATELIMIT_ADMIN_NOTIFICATION_TEST", "3 per minute", admin),
+        ("admin_export_threats", "RATELIMIT_ADMIN_EXPORT", "10 per hour", admin),
+        ("admin_export_pcap_job_artifact", "RATELIMIT_ADMIN_EXPORT", "10 per hour", admin),
+        ("admin_audit_logs_export", "RATELIMIT_ADMIN_EXPORT", "10 per hour", admin),
+        ("admin_identity_report_export_early", "RATELIMIT_ADMIN_EXPORT", "10 per hour", admin),
+        ("admin_password_risk_report_export_early", "RATELIMIT_ADMIN_EXPORT", "10 per hour", admin),
+        ("admin_create_user", "RATELIMIT_ADMIN_DESTRUCTIVE", "20 per hour", admin),
+        ("admin_update_user_status", "RATELIMIT_ADMIN_DESTRUCTIVE", "20 per hour", admin),
+        ("admin_delete_user", "RATELIMIT_ADMIN_DESTRUCTIVE", "20 per hour", admin),
+        ("admin_audit_threat_action", "RATELIMIT_ADMIN_DESTRUCTIVE", "20 per hour", admin),
+        ("admin_ai_governance_update_confidence_thresholds", "RATELIMIT_ADMIN_DESTRUCTIVE", "20 per hour", admin),
+        ("admin_ai_governance_retrain", "RATELIMIT_ADMIN_DESTRUCTIVE", "20 per hour", admin),
+        # Password Checker
+        ("password_checker.check_password", "RATELIMIT_PASSWORD_CHECK", "20 per minute", user),
+        ("password_checker.clear_user_password_history", "RATELIMIT_PASSWORD_CLEAR", "5 per hour", user),
+        # File Vault
+        ("vault.upload_document", "RATELIMIT_VAULT_UPLOAD", "10 per hour", user),
+        ("vault.upload_alias", "RATELIMIT_VAULT_UPLOAD", "10 per hour", user),
+        ("vault.download_document", "RATELIMIT_VAULT_DOWNLOAD", "30 per minute", user),
+        ("vault.delete_document", "RATELIMIT_VAULT_DELETE", "20 per hour", user),
+        # Phishing Scanner
+        ("scan_bp.scan_url", "RATELIMIT_PHISHING_SCAN", "15 per minute", user),
+        ("scan_bp.delete_scan_route", "RATELIMIT_PHISHING_DELETE", "20 per hour", user),
+        # Identity Leak / OSINT
+        ("identity_web_scan", "RATELIMIT_IDENTITY_SCAN", "5 per minute;30 per hour", user),
+        ("identity_full_scan_assets", "RATELIMIT_IDENTITY_PROVIDER_SCAN", "10 per hour", user),
+        ("check_asset", "RATELIMIT_IDENTITY_SCAN", "5 per minute;30 per hour", user),
+        ("scan_asset", "RATELIMIT_IDENTITY_PROVIDER_SCAN", "10 per hour", user),
+        ("scan_all_assets", "RATELIMIT_IDENTITY_PROVIDER_SCAN", "10 per hour", user),
+        ("identity_clear_scan_history", "RATELIMIT_IDENTITY_DELETE", "20 per hour", user),
+        ("identity_delete_asset", "RATELIMIT_IDENTITY_DELETE", "20 per hour", user),
+        ("identity_web_scan_pdf_report", "RATELIMIT_REPORT_EXPORT", "20 per hour", user),
+        # PCAP Analyzer
+        ("analyze_pcap", "RATELIMIT_PCAP_ANALYZE", "5 per hour", user),
+        ("analyze_local", "RATELIMIT_PCAP_ANALYZE_LOCAL", "5 per hour", user),
+        ("list_jobs", "RATELIMIT_PCAP_POLL", "120 per minute", user),
+        ("get_job", "RATELIMIT_PCAP_POLL", "120 per minute", user),
+        ("export_job_artifact", "RATELIMIT_PCAP_EXPORT", "20 per hour", user),
+        ("cancel_pcap_job", "RATELIMIT_PCAP_CANCEL", "20 per hour", user),
+        # Reports & Export Center
+        ("generate_monthly_security_report", "RATELIMIT_REPORT_GENERATE", "5 per hour", user),
+        ("download_monthly_security_report", "RATELIMIT_REPORT_EXPORT", "20 per hour", user),
+        ("upload_monthly_report_to_drive", "RATELIMIT_GOOGLE_DRIVE_UPLOAD", "5 per hour", user),
+        ("export_my_activity_logs", "RATELIMIT_REPORT_EXPORT", "20 per hour", user),
+        # Chatbot / LLM
+        ("chatbot_llm", "RATELIMIT_CHATBOT_LLM", "20 per hour", user),
+        ("pcap_chatbot", "RATELIMIT_CHATBOT_LLM", "20 per hour", user),
+        ("identity_chatbot", "RATELIMIT_CHATBOT_LLM", "20 per hour", user),
+        ("chatbot_debug_context", "RATELIMIT_CHATBOT_DEBUG", "30 per minute", user),
+        ("chatbot_debug_provider", "RATELIMIT_CHATBOT_DEBUG", "30 per minute", user),
+        # Contact/support keeps the existing 5/minute decorator and adds an hourly cap.
+        ("submit_contact_support", "RATELIMIT_CONTACT_SUPPORT_HOURLY", "20 per hour", ip),
+    ]:
+        _apply_rate_limit(endpoint, env_name, default_limit, key_func=key_func)
+
+
+_apply_route_specific_rate_limits()
+
+
+def _resolve_project_path(path_value: str) -> Path:
+    path = Path(str(path_value or "").strip()).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT_DIR / path
+    return path.resolve()
+
+
+def _build_local_ssl_context() -> tuple[str, str] | None:
+    if not _env_truthy("HTTPS_ENABLED", False):
+        return None
+
+    cert_file = _resolve_project_path(os.getenv("SSL_CERT_FILE", "certs/localhost.pem"))
+    key_file = _resolve_project_path(os.getenv("SSL_KEY_FILE", "certs/localhost-key.pem"))
+
+    missing = [
+        str(path)
+        for path in (cert_file, key_file)
+        if not path.is_file()
+    ]
+    if missing:
+        raise SystemExit(
+            "HTTPS_ENABLED=true but SSL certificate files were not found: "
+            + ", ".join(missing)
+        )
+
+    return str(cert_file), str(key_file)
+
+
 # ========================================
 # 6) BOOTSTRAP
 # ========================================
@@ -27741,9 +28499,13 @@ if __name__ == "__main__":
         _ensure_monthly_report_schema_initialized()
         _ensure_contact_message_schema_initialized()
         ensure_gamification_schema_initialized()
+    ssl_context = _build_local_ssl_context()
+    scheme = "https" if ssl_context else "http"
+    print(f"Starting Sentinel AI backend at {scheme}://localhost:5000")
     app.run(
         host="0.0.0.0",
         port=5000,
         debug=FLASK_DEBUG_MODE,
         use_reloader=FLASK_DEBUG_MODE,
+        ssl_context=ssl_context,
     )

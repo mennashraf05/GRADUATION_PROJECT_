@@ -1,11 +1,30 @@
 
-  import { defineConfig } from 'vite';
+  import { defineConfig, loadEnv } from 'vite';
   import react from '@vitejs/plugin-react-swc';
   import path from 'path';
+  import fs from 'fs';
 
-  const BACKEND_PROXY_TARGET = 'http://127.0.0.1:5000';
+  const localCertFile = path.resolve(__dirname, '../certs/localhost.pem');
+  const localKeyFile = path.resolve(__dirname, '../certs/localhost-key.pem');
 
-  export default defineConfig({
+  export default defineConfig(({ mode }) => {
+  const env = { ...process.env, ...loadEnv(mode, process.cwd(), '') };
+  const backendProxyTarget = env.VITE_API_BASE_URL || 'http://localhost:5000';
+  const useHttps = String(env.VITE_HTTPS_ENABLED || '').toLowerCase() === 'true';
+  const httpsConfig =
+    useHttps && fs.existsSync(localCertFile) && fs.existsSync(localKeyFile)
+      ? {
+          cert: fs.readFileSync(localCertFile),
+          key: fs.readFileSync(localKeyFile),
+        }
+      : undefined;
+  const proxyOptions = {
+    target: backendProxyTarget,
+    changeOrigin: true,
+    secure: false,
+  };
+
+  return {
     plugins: [react()],
     resolve: {
       extensions: ['.js', '.jsx', '.ts', '.tsx', '.json'],
@@ -56,18 +75,20 @@
       outDir: 'build',
     },
     server: {
-      host: '127.0.0.1',
+      host: 'localhost',
       port: 5173,
       open: true,
+      https: httpsConfig,
       proxy: {
-        '/api': { target: BACKEND_PROXY_TARGET, changeOrigin: true },
-        '/pcap': { target: BACKEND_PROXY_TARGET, changeOrigin: true },
-        '/download': { target: BACKEND_PROXY_TARGET, changeOrigin: true },
-        '/analyze-pcap': { target: BACKEND_PROXY_TARGET, changeOrigin: true },
-        '/analyze-local': { target: BACKEND_PROXY_TARGET, changeOrigin: true },
-        '/notifications': { target: BACKEND_PROXY_TARGET, changeOrigin: true },
-        '/jobs': { target: BACKEND_PROXY_TARGET, changeOrigin: true },
-        '/job': { target: BACKEND_PROXY_TARGET, changeOrigin: true },
+        '/api': proxyOptions,
+        '/pcap': proxyOptions,
+        '/download': proxyOptions,
+        '/analyze-pcap': proxyOptions,
+        '/analyze-local': proxyOptions,
+        '/notifications': proxyOptions,
+        '/jobs': proxyOptions,
+        '/job': proxyOptions,
       },
     },
+  };
   });

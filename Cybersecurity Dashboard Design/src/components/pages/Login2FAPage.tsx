@@ -79,7 +79,6 @@ export const Login2FAPage: React.FC = () => {
           localStorage.setItem("sentinel_refresh_token", data.refresh_token);
         }
       } else {
-        console.warn("No token in response body, trying cookies");
         localStorage.setItem("sentinel_auth_token", "cookie_based");
       }
 

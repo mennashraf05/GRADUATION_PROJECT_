@@ -115,6 +115,19 @@ interface IdentityAsset {
   created_at?: string;
 }
 
+interface AddAssetResponse {
+  success?: boolean;
+  already_exists?: boolean;
+  message?: string;
+  asset?: IdentityAsset & { already_exists?: boolean };
+}
+
+interface AssetCandidate {
+  assetType: AssetType;
+  assetValue: string;
+  label?: string;
+}
+
 interface FullScanSummary {
   status: 'completed' | 'empty' | string;
   message?: string;
@@ -218,6 +231,47 @@ function compactTarget(scan: IdentityScan): string {
   return [scan.email, scan.username, scan.domain].filter(Boolean).join(' / ') || 'No target';
 }
 
+function detectAssetType(value: string, hintedType?: string): AssetType {
+  const normalizedHint = String(hintedType || '').toLowerCase();
+  if (normalizedHint === 'email' || normalizedHint === 'username' || normalizedHint === 'domain') {
+    return normalizedHint;
+  }
+  const trimmed = value.trim();
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) return 'email';
+  if (/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(trimmed.replace(/^www\./i, ''))) return 'domain';
+  return 'username';
+}
+
+function normalizeAssetValue(assetType: AssetType, value: string): string {
+  const trimmed = value.trim();
+  if (assetType === 'email') return trimmed.toLowerCase();
+  if (assetType === 'domain') return trimmed.toLowerCase().replace(/^www\./, '').replace(/\/+$/, '');
+  return trimmed;
+}
+
+function assetKey(assetType: AssetType, value: string): string {
+  return `${assetType}:${normalizeAssetValue(assetType, value).toLowerCase()}`;
+}
+
+function scanAssetCandidates(scan: IdentityScan): AssetCandidate[] {
+  return [
+    scan.email ? { assetType: 'email' as const, assetValue: scan.email, label: 'Scan email' } : null,
+    scan.username ? { assetType: 'username' as const, assetValue: scan.username, label: 'Scan username' } : null,
+    scan.domain ? { assetType: 'domain' as const, assetValue: scan.domain, label: 'Scan domain' } : null,
+  ].filter(Boolean) as AssetCandidate[];
+}
+
+function findingAssetCandidate(finding: IdentityFinding): AssetCandidate | null {
+  const rawValue = String(finding.matched_value || '').trim();
+  if (!rawValue) return null;
+  const assetType = detectAssetType(rawValue, finding.matched_field);
+  return {
+    assetType,
+    assetValue: normalizeAssetValue(assetType, rawValue),
+    label: finding.title ? `Finding: ${finding.title}` : 'Identity finding',
+  };
+}
+
 function safeNumber(value: unknown): number {
   const parsed = Number(value || 0);
   return Number.isFinite(parsed) ? parsed : 0;
@@ -317,6 +371,7 @@ export function IdentityLeakMonitorPage() {
   const [loadedNotificationScanId, setLoadedNotificationScanId] = useState<number | null>(null);
   const [gamification, setGamification] = useState<GamificationOverview | null>(null);
   const [gamificationLoading, setGamificationLoading] = useState(false);
+  const [addingAssetKey, setAddingAssetKey] = useState<string | null>(null);
 
   const requestJson = async <T,>(path: string, init?: RequestInit): Promise<T> => {
     const headers = new Headers(init?.headers || undefined);
@@ -422,9 +477,64 @@ export function IdentityLeakMonitorPage() {
     return { totalScans, breachedAssets, safeAssets, totalBreaches, protectionRate };
   }, [assets, history]);
 
+  const monitoredAssetKeys = useMemo(
+    () => new Set(assets.map((asset) => assetKey(asset.asset_type, asset.asset_value))),
+    [assets]
+  );
+
   const setState = (message: string, isError = false) => {
     setStatusMessage(message);
     setStatusError(isError);
+  };
+
+  const addCandidateToAssets = async (candidate: AssetCandidate) => {
+    const normalizedValue = normalizeAssetValue(candidate.assetType, candidate.assetValue);
+    const key = assetKey(candidate.assetType, normalizedValue);
+    if (!normalizedValue || monitoredAssetKeys.has(key)) return;
+
+    setAddingAssetKey(key);
+    try {
+      const payload = await requestJson<AddAssetResponse>('/assets', {
+        method: 'POST',
+        body: JSON.stringify({
+          asset_type: candidate.assetType,
+          asset_value: normalizedValue,
+          label: candidate.label || '',
+        }),
+      });
+      setState(payload.already_exists ? 'Asset is already monitored.' : 'Asset added successfully.');
+      await loadAssets();
+    } catch {
+      setState('Could not add asset. Please try again.', true);
+    } finally {
+      setAddingAssetKey(null);
+    }
+  };
+
+  const renderAddAssetButton = (candidate: AssetCandidate | null) => {
+    if (!candidate) return null;
+    const normalizedValue = normalizeAssetValue(candidate.assetType, candidate.assetValue);
+    if (!normalizedValue) return null;
+    const key = assetKey(candidate.assetType, normalizedValue);
+    const alreadyMonitored = monitoredAssetKeys.has(key);
+    const isAdding = addingAssetKey === key;
+
+    return (
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        className={alreadyMonitored ? 'border-green-500/30 text-green-300' : 'border-cyan-500/30 text-cyan-300 hover:bg-cyan-500/10'}
+        disabled={alreadyMonitored || Boolean(addingAssetKey)}
+        onClick={(event) => {
+          event.stopPropagation();
+          void addCandidateToAssets(candidate);
+        }}
+      >
+        {isAdding ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : alreadyMonitored ? <Shield className="mr-2 h-4 w-4" /> : <Plus className="mr-2 h-4 w-4" />}
+        {alreadyMonitored ? 'Already Monitored' : '+ Add to Assets'}
+      </Button>
+    );
   };
 
   const startScan = async () => {
@@ -528,7 +638,7 @@ export function IdentityLeakMonitorPage() {
       return;
     }
     try {
-      await requestJson<{ asset: IdentityAsset }>('/assets', {
+      const payload = await requestJson<AddAssetResponse>('/assets', {
         method: 'POST',
         body: JSON.stringify({
           asset_type: assetType,
@@ -538,10 +648,10 @@ export function IdentityLeakMonitorPage() {
       });
       setAssetValue('');
       setAssetLabel('');
-      setState('Monitored asset added.');
+      setState(payload.already_exists ? 'Asset is already monitored.' : 'Asset added successfully.');
       await loadAssets();
     } catch (error) {
-      setState(error instanceof Error ? error.message : 'Could not add monitored asset.', true);
+      setState(error instanceof Error ? error.message : 'Could not add asset. Please try again.', true);
     }
   };
 
@@ -1138,6 +1248,14 @@ export function IdentityLeakMonitorPage() {
                   </Badge>
                 ))}
               </div>
+              <div className="flex flex-wrap items-center gap-2 border-t border-white/10 pt-4">
+                <span className="text-sm text-gray-400">Monitor this scan:</span>
+                {scanAssetCandidates(report).map((candidate) => (
+                  <div key={assetKey(candidate.assetType, candidate.assetValue)}>
+                    {renderAddAssetButton(candidate)}
+                  </div>
+                ))}
+              </div>
             </CardContent>
           </Card>
 
@@ -1188,7 +1306,7 @@ export function IdentityLeakMonitorPage() {
                 </div>
               ) : (
                 <div className="overflow-x-auto">
-                  <Table className="min-w-[1320px]">
+                  <Table className="min-w-[1460px]">
                     <TableHeader>
                       <TableRow>
                         <TableHead>Source</TableHead>
@@ -1199,6 +1317,7 @@ export function IdentityLeakMonitorPage() {
                         <TableHead>Found In Page</TableHead>
                         <TableHead>Confidence</TableHead>
                         <TableHead>Link</TableHead>
+                        <TableHead>Asset</TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
@@ -1237,6 +1356,7 @@ export function IdentityLeakMonitorPage() {
                               <span className="text-gray-500">-</span>
                             )}
                           </TableCell>
+                          <TableCell>{renderAddAssetButton(findingAssetCandidate(finding))}</TableCell>
                         </TableRow>
                       ))}
                     </TableBody>
@@ -1279,10 +1399,17 @@ export function IdentityLeakMonitorPage() {
               history.map((scan) => {
                 const scanId = normalizeScanId(scan);
                 return (
-                  <button
+                  <div
                     key={scanId || scan.created_at}
-                    type="button"
+                    role="button"
+                    tabIndex={0}
                     onClick={() => scanId && void loadScan(scanId)}
+                    onKeyDown={(event) => {
+                      if ((event.key === 'Enter' || event.key === ' ') && scanId) {
+                        event.preventDefault();
+                        void loadScan(scanId);
+                      }
+                    }}
                     className={`w-full rounded-xl border p-4 text-left transition ${
                       selectedScanId === scanId
                         ? 'border-cyan-400/60 bg-cyan-500/10'
@@ -1296,7 +1423,14 @@ export function IdentityLeakMonitorPage() {
                     <div className="mt-2 text-sm text-gray-400">
                       {scan.created_at ? formatDateTime(scan.created_at) : '-'} - {formatNumber(scan.total_findings || 0)} finding(s)
                     </div>
-                  </button>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {scanAssetCandidates(scan).map((candidate) => (
+                        <div key={assetKey(candidate.assetType, candidate.assetValue)}>
+                          {renderAddAssetButton(candidate)}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
                 );
               })
             )}
@@ -1318,27 +1452,46 @@ export function IdentityLeakMonitorPage() {
                 {alertsLoading ? 'Loading alerts...' : 'No alerts yet.'}
               </div>
             ) : (
-              alerts.map((alert) => (
-                <button
-                  key={alert.id}
-                  type="button"
-                  onClick={() => alert.scan_id && void loadScan(alert.scan_id)}
-                  className="w-full rounded-xl border border-white/10 bg-gray-900/40 p-4 text-left transition hover:border-red-400/40 hover:bg-gray-800/60"
-                >
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="font-semibold text-white">{alert.title}</span>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <Badge className={emailStatusTone(alert.email_status)}>{emailStatusLabel(alert.email_status)}</Badge>
-                      <Badge className={riskTone(alert.severity)}>{alert.severity}</Badge>
+              alerts.map((alert) => {
+                const alertScan = history.find((scan) => Number(normalizeScanId(scan)) === Number(alert.scan_id));
+                return (
+                  <div
+                    key={alert.id}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => alert.scan_id && void loadScan(alert.scan_id)}
+                    onKeyDown={(event) => {
+                      if ((event.key === 'Enter' || event.key === ' ') && alert.scan_id) {
+                        event.preventDefault();
+                        void loadScan(alert.scan_id);
+                      }
+                    }}
+                    className="w-full rounded-xl border border-white/10 bg-gray-900/40 p-4 text-left transition hover:border-red-400/40 hover:bg-gray-800/60"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-semibold text-white">{alert.title}</span>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Badge className={emailStatusTone(alert.email_status)}>{emailStatusLabel(alert.email_status)}</Badge>
+                        <Badge className={riskTone(alert.severity)}>{alert.severity}</Badge>
+                      </div>
                     </div>
+                    <p className="mt-2 text-sm leading-6 text-gray-400">{alert.message}</p>
+                    <p className="mt-2 text-xs text-gray-500">
+                      {alert.created_at ? formatDateTime(alert.created_at) : '-'}
+                      {alert.email_status === 'failed' && alert.email_error ? ` - ${alert.email_error}` : ''}
+                    </p>
+                    {alertScan ? (
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {scanAssetCandidates(alertScan).map((candidate) => (
+                          <div key={assetKey(candidate.assetType, candidate.assetValue)}>
+                            {renderAddAssetButton(candidate)}
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
                   </div>
-                  <p className="mt-2 text-sm leading-6 text-gray-400">{alert.message}</p>
-                  <p className="mt-2 text-xs text-gray-500">
-                    {alert.created_at ? formatDateTime(alert.created_at) : '-'}
-                    {alert.email_status === 'failed' && alert.email_error ? ` - ${alert.email_error}` : ''}
-                  </p>
-                </button>
-              ))
+                );
+              })
             )}
           </CardContent>
         </Card>

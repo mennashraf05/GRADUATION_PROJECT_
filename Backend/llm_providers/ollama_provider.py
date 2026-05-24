@@ -1,7 +1,8 @@
 import json
+import logging
 import os
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
@@ -20,6 +21,17 @@ def _positive_int_env(name: str, default: int) -> int:
 
 def _ollama_base_url() -> str:
     return str(os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434").strip().rstrip("/")
+
+
+def _ollama_endpoint(api_path: str) -> str:
+    base_url = _ollama_base_url()
+    clean_path = str(api_path or "").strip().lstrip("/")
+    parts = urlsplit(base_url)
+    base_path = parts.path.rstrip("/")
+    if base_path.endswith("/api"):
+        base_path = base_path[:-4].rstrip("/")
+    final_path = f"{base_path}/{clean_path}".replace("//", "/")
+    return urlunsplit((parts.scheme, parts.netloc, final_path, parts.query, parts.fragment))
 
 
 def _ollama_model() -> str:
@@ -66,7 +78,7 @@ def check_ollama_status() -> dict[str, Any]:
     reachable = False
     model_available = False
     try:
-        response = requests.get(urljoin(f"{base_url}/", "api/tags"), timeout=timeout)
+        response = requests.get(_ollama_endpoint("api/tags"), timeout=timeout)
         reachable = response.status_code < 500
         if response.ok:
             data = response.json()
@@ -91,7 +103,7 @@ def call_ollama_llm(user_message: str, module: str, safe_context: dict[str, Any]
     base_url = _ollama_base_url()
     model = _ollama_model()
     timeout_seconds = _timeout_seconds()
-    endpoint = urljoin(f"{base_url}/", "api/chat")
+    endpoint = _ollama_endpoint("api/generate")
 
     context_json = json.dumps(safe_context, ensure_ascii=False, indent=2, default=str)
     detected_intent = str(safe_context.get("detected_intent") or "general").strip()
@@ -136,20 +148,25 @@ def call_ollama_llm(user_message: str, module: str, safe_context: dict[str, Any]
     )
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": OLLAMA_SYSTEM_INSTRUCTION},
-            {"role": "user", "content": prompt},
-        ],
+        "system": OLLAMA_SYSTEM_INSTRUCTION,
+        "prompt": prompt,
         "stream": False,
         "options": {"temperature": 0.2},
     }
+
+    logging.info(
+        "Ollama chatbot call starting | provider=ollama | base_url=%s | model=%s | timeout_seconds=%s",
+        base_url,
+        model,
+        timeout_seconds,
+    )
 
     try:
         response = requests.post(endpoint, json=payload, timeout=timeout_seconds)
     except requests.Timeout:
         return _error_result("ollama_timeout", model=model)
     except requests.ConnectionError:
-        return _error_result("ollama_not_running", model=model)
+        return _error_result("ollama_connection_error", model=model)
     except requests.RequestException:
         return _error_result("ollama_error", model=model)
 
@@ -159,12 +176,11 @@ def call_ollama_llm(user_message: str, module: str, safe_context: dict[str, Any]
     try:
         data = response.json()
     except ValueError:
-        return _error_result("invalid_ollama_response", model=model)
+        return _error_result("ollama_invalid_response", model=model)
 
-    message = data.get("message") if isinstance(data, dict) else None
-    reply = str((message or {}).get("content") or "").strip() if isinstance(message, dict) else ""
+    reply = str(data.get("response") or "").strip() if isinstance(data, dict) else ""
     if not reply:
-        return _error_result("invalid_ollama_response", model=model)
+        return _error_result("ollama_invalid_response", model=model)
 
     return {
         "ok": True,

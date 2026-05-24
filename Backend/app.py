@@ -882,6 +882,21 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
+
+def _log_llm_startup_config() -> None:
+    ollama_config = get_ollama_provider_config()
+    logging.info(
+        "LLM startup config | provider=%s | ollama_enabled=%s | ollama_base_url=%s | ollama_model=%s | timeout_seconds=%s",
+        str(os.getenv("LLM_DEFAULT_PROVIDER") or os.getenv("LLM_PROVIDER") or "auto").strip().lower() or "auto",
+        _env_truthy("OLLAMA_ENABLED", True),
+        ollama_config.get("base_url"),
+        ollama_config.get("model"),
+        ollama_config.get("timeout_seconds"),
+    )
+
+
+_log_llm_startup_config()
+
 _pcap_log_throttle_lock = threading.Lock()
 _pcap_log_throttle_state: dict[str, float] = {}
 
@@ -23052,11 +23067,11 @@ def _ollama_fallback_reason(exc: Exception) -> str:
     if "timed out" in message or "timeout" in message:
         return "ollama_timeout"
     if "not running" in message or "connection" in message or "refused" in message:
-        return "ollama_not_running"
+        return "ollama_connection_error"
     if "model" in message and ("missing" in message or "not found" in message):
         return "ollama_model_missing"
     if "invalid" in message or "empty response" in message:
-        return "invalid_ollama_response"
+        return "ollama_invalid_response"
     return "ollama_error"
 
 

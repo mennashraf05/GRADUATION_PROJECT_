@@ -33,7 +33,10 @@ bp = Blueprint("vault", __name__)
 @bp.errorhandler(Exception)
 def handle_vault_error(e):
     if isinstance(e, HTTPException):
-        return jsonify({"error": e.description or "Unable to complete the File Vault request."}), e.code or 500
+        return jsonify({
+            "error": e.description or "Unable to complete the File Vault request."
+        }), e.code or 500
+
     return safe_error_response(
         public_message="Unable to complete the File Vault request right now.",
         error_code="vault_error",
@@ -88,6 +91,72 @@ def log_vault_event(
         ))
     except Exception:
         current_app.logger.exception("Failed to write vault activity log")
+
+
+def record_vault_gamification_event(event_type: str, user, doc: VaultDocument):
+    """
+    Best-effort bridge from Encrypted File Vault actions to Gamification.
+    If gamification fails, the Vault action itself should not fail.
+    """
+    try:
+        gamification_service = current_app.extensions.get("gamification_service")
+
+        if gamification_service is None:
+            current_app.logger.warning(
+                "Vault gamification skipped because gamification_service is not registered | event_type=%s",
+                event_type,
+            )
+            return None
+
+        method_map = {
+            "vault_file_uploaded": "record_vault_file_uploaded",
+            "vault_file_downloaded": "record_vault_file_downloaded",
+            "vault_integrity_verified": "record_vault_integrity_verified",
+            "vault_offline_enabled": "record_vault_offline_enabled",
+            "vault_offline_disabled": "record_vault_offline_disabled",
+        }
+
+        method_name = method_map.get(event_type)
+        method = getattr(gamification_service, method_name, None) if method_name else None
+
+        if callable(method):
+            result = method(
+                int(user.id),
+                str(doc.id),
+                doc.file_hash,
+                doc.filename,
+            )
+        else:
+            result = gamification_service.process_event(
+                int(user.id),
+                event_type,
+                {
+                    "document_id": str(doc.id),
+                    "file_hash": doc.file_hash,
+                    "filename": doc.filename,
+                },
+            )
+
+        current_app.logger.info(
+            "Vault gamification event recorded | event_type=%s | user_id=%s | doc_id=%s | result=%s",
+            event_type,
+            user.id,
+            doc.id,
+            result,
+        )
+
+        return result
+
+    except Exception:
+        current_app.logger.exception(
+            "Failed to record vault gamification event | event_type=%s",
+            event_type,
+        )
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        return None
 
 
 def validate_password_strength(password: str):
@@ -199,6 +268,7 @@ def upload_document():
         return jsonify({"error": "Empty filename"}), 400
 
     raw_filename = file.filename.strip()
+
     validation = validate_vault_upload(file, raw_filename, ALLOWED_EXTENSIONS)
     if not validation.get("ok"):
         current_app.logger.warning(
@@ -234,7 +304,7 @@ def upload_document():
     if len(raw) > MAX_FILE_SIZE_BYTES:
         return jsonify({
             "error": "File is too large",
-            "max_size_mb": MAX_FILE_SIZE_BYTES // (1024 * 1024)
+            "max_size_mb": MAX_FILE_SIZE_BYTES // (1024 * 1024),
         }), 400
 
     file_hash = calculate_file_hash(raw)
@@ -289,6 +359,12 @@ def upload_document():
         },
     )
 
+    gamification_result = record_vault_gamification_event(
+        "vault_file_uploaded",
+        user,
+        doc,
+    )
+
     return jsonify({
         "message": "File uploaded successfully",
         "document": {
@@ -298,7 +374,8 @@ def upload_document():
             "size_bytes": size,
             "status": "Encrypted",
             "offline_enabled": bool(doc.offline_enabled),
-        }
+        },
+        "gamification": gamification_result,
     }), 201
 
 
@@ -320,13 +397,16 @@ def toggle_offline_access(doc_id):
 
     data = request.get_json(silent=True) or {}
     enabled = bool(data.get("offline_enabled", False))
+    previous_enabled = bool(doc.offline_enabled)
 
     doc.offline_enabled = enabled
     db.session.commit()
 
+    action_type = "vault_offline_enabled" if enabled else "vault_offline_disabled"
+
     log_vault_event(
         user_id=user.id,
-        action_type="vault_offline_enabled" if enabled else "vault_offline_disabled",
+        action_type=action_type,
         title="Vault offline access enabled" if enabled else "Vault offline access disabled",
         description=(
             f"Enabled offline access for: {doc.filename}"
@@ -338,14 +418,137 @@ def toggle_offline_access(doc_id):
         doc=doc,
         metadata={
             "filename": doc.filename,
+            "file_hash": doc.file_hash,
             "offline_enabled": bool(doc.offline_enabled),
+            "previous_offline_enabled": previous_enabled,
         },
+    )
+
+    gamification_result = record_vault_gamification_event(
+        action_type,
+        user,
+        doc,
     )
 
     return jsonify({
         "message": "Offline access updated",
         "id": doc.id,
-        "offline_enabled": bool(doc.offline_enabled)
+        "offline_enabled": bool(doc.offline_enabled),
+        "previous_offline_enabled": previous_enabled,
+        "gamification": gamification_result,
+    }), 200
+
+
+@bp.route("/api/documents/<int:doc_id>/verify", methods=["POST"])
+def verify_document_integrity(doc_id):
+    user = get_current_user_via_app()
+    if not user:
+        return jsonify({"error": "Not authenticated"}), 401
+
+    data = request.get_json(silent=True) or {}
+    password = (data.get("password") or "").strip()
+
+    password_error = validate_password_strength(password)
+    if password_error:
+        return jsonify({"error": password_error}), 400
+
+    doc = VaultDocument.query.get_or_404(doc_id)
+
+    if doc.user_id != user.id:
+        abort(403)
+
+    upload_dir = get_upload_dir()
+
+    try:
+        stored_path = ensure_path_within_directory(
+            upload_dir / doc.stored_filename,
+            upload_dir,
+        )
+    except ValueError as exc:
+        return safe_error_response(
+            public_message="Unable to access the requested file.",
+            error_code="invalid_file_path",
+            status_code=403,
+            log_exception=exc,
+            log_context={
+                "module": "file_vault",
+                "reason": "path_outside_allowed_directory",
+            },
+        )
+
+    if not stored_path.exists():
+        return jsonify({"error": "File not found"}), 404
+
+    with open(stored_path, "rb") as f:
+        encrypted_data = f.read()
+
+    try:
+        salt = bytes.fromhex(doc.salt)
+        cipher = get_cipher_from_password(password, salt)
+        decrypted = cipher.decrypt(encrypted_data)
+    except InvalidToken:
+        log_vault_event(
+            user_id=user.id,
+            action_type="vault_wrong_password",
+            title="Wrong vault password attempt",
+            description=f"Wrong password while verifying integrity: {doc.filename}",
+            status=STATUS_FAILED,
+            severity=SEVERITY_MEDIUM,
+            doc=doc,
+            metadata={
+                "operation": "verify_integrity",
+                "filename": doc.filename,
+            },
+        )
+        return jsonify({"error": "Wrong encryption password"}), 403
+
+    current_hash = calculate_file_hash(decrypted)
+
+    if current_hash != doc.file_hash:
+        log_vault_event(
+            user_id=user.id,
+            action_type="vault_integrity_failed",
+            title="Vault integrity check failed",
+            description=f"Integrity check failed for: {doc.filename}",
+            status=STATUS_FAILED,
+            severity=SEVERITY_MEDIUM,
+            doc=doc,
+            metadata={
+                "filename": doc.filename,
+                "stored_hash": doc.file_hash,
+                "calculated_hash": current_hash,
+            },
+        )
+        return jsonify({"error": "Integrity check failed"}), 409
+
+    log_vault_event(
+        user_id=user.id,
+        action_type="vault_integrity_verified",
+        title="Vault file integrity verified",
+        description=f"Verified encrypted file integrity: {doc.filename}",
+        status=STATUS_SUCCESS,
+        severity=SEVERITY_LOW,
+        doc=doc,
+        metadata={
+            "filename": doc.filename,
+            "size_bytes": len(decrypted),
+            "file_hash": doc.file_hash,
+            "offline_enabled": bool(doc.offline_enabled),
+        },
+    )
+
+    gamification_result = record_vault_gamification_event(
+        "vault_integrity_verified",
+        user,
+        doc,
+    )
+
+    return jsonify({
+        "message": "Integrity verified successfully",
+        "document_id": doc.id,
+        "filename": doc.filename,
+        "integrity_ok": True,
+        "gamification": gamification_result,
     }), 200
 
 
@@ -368,15 +571,22 @@ def download_document(doc_id):
         abort(403)
 
     upload_dir = get_upload_dir()
+
     try:
-        stored_path = ensure_path_within_directory(upload_dir / doc.stored_filename, upload_dir)
+        stored_path = ensure_path_within_directory(
+            upload_dir / doc.stored_filename,
+            upload_dir,
+        )
     except ValueError as exc:
         return safe_error_response(
             public_message="Unable to access the requested file.",
             error_code="invalid_file_path",
             status_code=403,
             log_exception=exc,
-            log_context={"module": "file_vault", "reason": "path_outside_allowed_directory"},
+            log_context={
+                "module": "file_vault",
+                "reason": "path_outside_allowed_directory",
+            },
         )
 
     if not stored_path.exists():
@@ -423,6 +633,20 @@ def download_document(doc_id):
         },
     )
 
+    record_vault_gamification_event(
+        "vault_file_downloaded",
+        user,
+        doc,
+    )
+
+    # Download already verifies integrity successfully before sending the file.
+    # This also completes the "Verify 1 vault file" challenge.
+    record_vault_gamification_event(
+        "vault_integrity_verified",
+        user,
+        doc,
+    )
+
     bio = BytesIO(decrypted)
     bio.seek(0)
 
@@ -431,7 +655,7 @@ def download_document(doc_id):
         as_attachment=True,
         download_name=doc.filename,
         mimetype="application/octet-stream",
-        max_age=0
+        max_age=0,
     )
 
 
@@ -461,15 +685,22 @@ def delete_document(doc_id):
         abort(403)
 
     upload_dir = get_upload_dir()
+
     try:
-        stored_path = ensure_path_within_directory(upload_dir / doc.stored_filename, upload_dir)
+        stored_path = ensure_path_within_directory(
+            upload_dir / doc.stored_filename,
+            upload_dir,
+        )
     except ValueError as exc:
         return safe_error_response(
             public_message="Unable to access the requested file.",
             error_code="invalid_file_path",
             status_code=403,
             log_exception=exc,
-            log_context={"module": "file_vault", "reason": "path_outside_allowed_directory"},
+            log_context={
+                "module": "file_vault",
+                "reason": "path_outside_allowed_directory",
+            },
         )
 
     if not stored_path.exists():
@@ -540,5 +771,5 @@ def delete_document(doc_id):
 
     return jsonify({
         "message": "File deleted successfully",
-        "id": doc_id
+        "id": doc_id,
     }), 200

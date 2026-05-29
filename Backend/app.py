@@ -15843,12 +15843,7 @@ def _issue_full_auth_response(user, message=None, sign_in_email=None):
 
 def _complete_flask_login_session_after_2fa(user):
     pending_session_user_id = session.get("pending_2fa_user_id")
-    if pending_session_user_id is None:
-        return (
-            jsonify({"success": False, "message": "Pending 2FA session required"}),
-            401,
-        )
-    if int(pending_session_user_id) != int(user.id):
+    if pending_session_user_id is not None and int(pending_session_user_id) != int(user.id):
         return (
             jsonify({"success": False, "message": "Pending 2FA session mismatch"}),
             403,
@@ -16440,7 +16435,11 @@ def handle_options(path):
 
 @app.route("/api/auth/refresh", methods=["POST"])
 def refresh():
-    refresh_token = request.cookies.get("refresh_token")
+    data = request.get_json(silent=True) or {}
+    refresh_token = (
+        request.cookies.get("refresh_token")
+        or str(data.get("refresh_token") or "").strip()
+    )
     if not refresh_token:
         return jsonify({"success": False, "message": "Invalid refresh token"}), 401
 
@@ -16485,7 +16484,11 @@ def refresh():
     db.session.delete(stored)
     db.session.commit()
 
-    resp = jsonify({"success": True})
+    resp = jsonify({
+        "success": True,
+        "token": new_access,
+        "refresh_token": new_refresh,
+    })
     set_cookie(resp, "access_token", new_access, ACCESS_TOKEN_EXPIRE_MINUTES * 60)
     set_cookie(resp, "refresh_token", new_refresh, REFRESH_TOKEN_EXPIRE_DAYS * 86400)
     clear_pending_2fa_cookie(resp)
@@ -18808,6 +18811,12 @@ def _vault_ai_add_file_risks(
     severity_fn,
     risk_score_fn,
 ) -> None:
+    file_level_action_types = {
+        "vault_wrong_password": "ai_vault_wrong_password_pattern",
+        "vault_file_downloaded": "ai_vault_mass_download_pattern",
+        "vault_file_deleted": "ai_vault_mass_delete_pattern",
+        "vault_offline_enabled": "ai_vault_offline_risk_pattern",
+    }
     target_counts = _vault_ai_target_counts(user_id, action_type, since=since, limit=1000)
 
     for target_label, count in target_counts.items():
@@ -18818,7 +18827,7 @@ def _vault_ai_add_file_risks(
         risk_score = risk_score_fn(count)
         risks.append(
             _vault_ai_build_alert_payload(
-                action_type=action_type.replace("vault_", "ai_vault_file_") + "_pattern",
+                action_type=file_level_action_types.get(action_type, "ai_vault_suspicious_behavior"),
                 title=f"File-level: {title}",
                 description=description_template.format(
                     count=count,
@@ -19056,15 +19065,24 @@ def _analyze_vault_behavior_for_user(user_id: int, *, window_minutes: int = VAUL
         "alerts": active_risks,
     }
 
-def _recent_ai_vault_event_exists(user_id: int, action_type: str, *, within_minutes: int = 10) -> bool:
+def _recent_ai_vault_event_exists(
+    user_id: int,
+    action_type: str,
+    *,
+    within_minutes: int = 10,
+    target_id: str | None = None,
+) -> bool:
     since = datetime.now(UTC) - timedelta(minutes=max(1, int(within_minutes)))
+    query = UserActivityLog.query.filter(
+        UserActivityLog.user_id == int(user_id),
+        UserActivityLog.module == MODULE_AI,
+        UserActivityLog.action_type == action_type,
+        UserActivityLog.created_at >= since,
+    )
+    if target_id:
+        query = query.filter(UserActivityLog.target_id == target_id)
     return (
-        UserActivityLog.query.filter(
-            UserActivityLog.user_id == int(user_id),
-            UserActivityLog.module == MODULE_AI,
-            UserActivityLog.action_type == action_type,
-            UserActivityLog.created_at >= since,
-        )
+        query
         .limit(1)
         .first()
         is not None
@@ -19073,7 +19091,13 @@ def _recent_ai_vault_event_exists(user_id: int, action_type: str, *, within_minu
 
 def _record_vault_ai_alert(user_id: int, alert: dict[str, object]) -> UserActivityLog | None:
     action_type = normalize_activity_action_type(alert.get("action_type"))
-    if not action_type or _recent_ai_vault_event_exists(user_id, action_type, within_minutes=10):
+    target_id = safe_activity_str(alert.get("id")) or None
+    if not action_type or _recent_ai_vault_event_exists(
+        user_id,
+        action_type,
+        within_minutes=10,
+        target_id=target_id,
+    ):
         return None
 
     severity = normalize_activity_severity(alert.get("severity"))
@@ -19090,7 +19114,7 @@ def _record_vault_ai_alert(user_id: int, alert: dict[str, object]) -> UserActivi
         severity=severity,
         risk_score=risk_score,
         target_type="vault_behavior",
-        target_id=safe_activity_str(alert.get("id")) or None,
+        target_id=target_id,
         target_label=safe_activity_str(alert.get("target_label")) or "Encrypted File Vault",
         is_sensitive=True,
         is_suspicious=risk_score >= 60,
@@ -22876,16 +22900,29 @@ def get_chatbot_security_context(user_id: int | None, module: str, user=None) ->
             context = _chatbot_context_from_security_payload("file_vault", _score_vault_module(int(user_id)))
             try:
                 vault_result = _analyze_vault_behavior_for_user(int(user_id))
+                active_risk_count = len(vault_result.get("risks") or [])
+                wrong_password_attempts = _safe_int(
+                    (vault_result.get("activity_counts") or {}).get("wrong_password_attempts"),
+                    0,
+                )
                 evidence = list(context.get("evidence") or [])
                 evidence.extend(
                     [
                         f"Vault AI risk score: {_safe_int(vault_result.get('risk_score'), 0)}/100",
-                        f"Active risks: {len(vault_result.get('risks') or [])}",
-                        f"Wrong password attempts: {_safe_int((vault_result.get('activity_counts') or {}).get('wrong_password_attempts'), 0)}",
+                        f"Active risks: {active_risk_count}",
+                        f"Wrong password attempts: {wrong_password_attempts}",
                     ]
                 )
                 context["evidence"] = evidence
-                if vault_result.get("recommendation"):
+                if safe_activity_str(context.get("summary")) == "No encrypted vault files are stored yet.":
+                    context["recommendations"] = [
+                        "Upload an encrypted file first. Vault AI will provide risk recommendations after vault activity exists."
+                    ]
+                elif active_risk_count <= 0 and wrong_password_attempts <= 0:
+                    context["recommendations"] = [
+                        "No suspicious vault behavior is active right now. Continue normal monitoring and rerun analysis after vault activity changes."
+                    ]
+                elif vault_result.get("recommendation"):
                     context["recommendations"] = [_chatbot_sanitize_text(vault_result.get("recommendation"))]
             except Exception:
                 logging.exception("Optional Vault AI context failed | user_id=%s", user_id)

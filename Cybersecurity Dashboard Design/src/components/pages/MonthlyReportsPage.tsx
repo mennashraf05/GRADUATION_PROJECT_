@@ -262,6 +262,53 @@ function buildCookieOnlyFetchInit(init: RequestInit = {}): RequestInit {
   return { ...init, credentials: "include", headers };
 }
 
+async function parseJsonResponse(response: Response) {
+  const text = await response.text();
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch {
+    return {};
+  }
+}
+
+async function refreshMonthlyReportSession(): Promise<boolean> {
+  const refreshToken = localStorage.getItem("sentinel_refresh_token");
+
+  for (const base of MONTHLY_REPORT_API_BASE_CANDIDATES) {
+    try {
+      const response = await fetch(buildMonthlyReportUrl("/api/auth/refresh", base), {
+        method: "POST",
+        credentials: "include",
+        headers: refreshToken ? { "Content-Type": "application/json" } : undefined,
+        body: refreshToken ? JSON.stringify({ refresh_token: refreshToken }) : undefined,
+      });
+      const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+
+      if (contentType.includes("text/html")) {
+        continue;
+      }
+
+      const data = await parseJsonResponse(response);
+      if (!response.ok || data?.success === false) {
+        continue;
+      }
+
+      if (typeof data?.token === "string" && data.token) {
+        localStorage.setItem("sentinel_auth_token", data.token);
+      }
+      if (typeof data?.refresh_token === "string" && data.refresh_token) {
+        localStorage.setItem("sentinel_refresh_token", data.refresh_token);
+      }
+
+      return true;
+    } catch {
+      continue;
+    }
+  }
+
+  return false;
+}
+
 async function fetchWithMonthlyReportAuth(
   input: RequestInfo | URL,
   init: RequestInit = {}
@@ -274,6 +321,21 @@ async function fetchWithMonthlyReportAuth(
 
   const token = localStorage.getItem("sentinel_auth_token");
   if (token && token !== "cookie_based") {
+    const tokenResponse = await fetch(input, buildAuthedFetchInit(init));
+    if (tokenResponse.status !== 401 && tokenResponse.status !== 403) {
+      return tokenResponse;
+    }
+
+    const refreshed = await refreshMonthlyReportSession().catch(() => false);
+    if (refreshed) {
+      return fetch(input, buildAuthedFetchInit(init));
+    }
+
+    return tokenResponse;
+  }
+
+  const refreshed = await refreshMonthlyReportSession().catch(() => false);
+  if (refreshed) {
     return fetch(input, buildAuthedFetchInit(init));
   }
 
@@ -992,8 +1054,8 @@ export function MonthlyReportsPage() {
                       <div className="mr-report-cell">
                         <p className="mr-cell-label">Sections</p>
                         <div className="mr-section-wrap">
-                          {report.available_sections.length > 0 ? (
-                            report.available_sections.map((section) => (
+                          {(report.available_sections || []).length > 0 ? (
+                            (report.available_sections || []).map((section) => (
                               <SectionBadge key={section} label={section} />
                             ))
                           ) : (

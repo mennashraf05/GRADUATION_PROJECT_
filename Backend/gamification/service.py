@@ -408,6 +408,7 @@ class GamificationService:
                 int(item.scans_completed or 0)
                 + int(item.alerts_reviewed or 0)
                 + int(item.reports_opened or 0)
+                + int(item.evidence_opened or 0)
                 + int(item.notes_added or 0)
             )
             > 0
@@ -754,6 +755,97 @@ class GamificationService:
                 "job_id": safe_str(job_id),
                 "file_hash": safe_str(file_hash) or None,
                 "upload_name": safe_str(upload_name),
+            },
+        )
+
+    def record_vault_file_uploaded(
+        self,
+        user_id: int,
+        document_id: int,
+        file_hash: str | None = None,
+        filename: str | None = None,
+        size_bytes: int | None = None,
+    ) -> dict[str, Any]:
+        return self.process_event(
+            int(user_id),
+            "vault_file_uploaded",
+            {
+                "vault_document_id": int(document_id),
+                "file_hash": safe_str(file_hash) or None,
+                "filename": safe_str(filename),
+                "size_bytes": safe_int(size_bytes, 0),
+            },
+        )
+
+    def record_vault_file_downloaded(
+        self,
+        user_id: int,
+        document_id: int,
+        file_hash: str | None = None,
+        filename: str | None = None,
+        size_bytes: int | None = None,
+    ) -> dict[str, Any]:
+        return self.process_event(
+            int(user_id),
+            "vault_file_downloaded",
+            {
+                "vault_document_id": int(document_id),
+                "file_hash": safe_str(file_hash) or None,
+                "filename": safe_str(filename),
+                "size_bytes": safe_int(size_bytes, 0),
+            },
+        )
+
+    def record_vault_integrity_verified(
+        self,
+        user_id: int,
+        document_id: int,
+        file_hash: str | None = None,
+        filename: str | None = None,
+        size_bytes: int | None = None,
+    ) -> dict[str, Any]:
+        return self.process_event(
+            int(user_id),
+            "vault_integrity_verified",
+            {
+                "vault_document_id": int(document_id),
+                "file_hash": safe_str(file_hash) or None,
+                "filename": safe_str(filename),
+                "size_bytes": safe_int(size_bytes, 0),
+            },
+        )
+
+    def record_vault_offline_enabled(
+        self,
+        user_id: int,
+        document_id: int,
+        file_hash: str | None = None,
+        filename: str | None = None,
+    ) -> dict[str, Any]:
+        return self.process_event(
+            int(user_id),
+            "vault_offline_enabled",
+            {
+                "vault_document_id": int(document_id),
+                "file_hash": safe_str(file_hash) or None,
+                "filename": safe_str(filename),
+            },
+        )
+
+    def record_vault_offline_disabled(
+        self,
+        user_id: int,
+        document_id: int,
+        file_hash: str | None = None,
+        filename: str | None = None,
+    ) -> dict[str, Any]:
+        return self.process_event(
+            int(user_id),
+            "vault_offline_disabled",
+            {
+                "vault_document_id": int(document_id),
+                "file_hash": safe_str(file_hash) or None,
+                "filename": safe_str(filename),
             },
         )
 
@@ -1182,6 +1274,38 @@ class GamificationService:
                 event_type=event_type,
             )
 
+        if event_type in {
+            "vault_file_uploaded",
+            "vault_file_downloaded",
+            "vault_integrity_verified",
+            "vault_offline_enabled",
+            "vault_offline_disabled",
+        }:
+            document_id = safe_int(context.get("vault_document_id"), 0)
+            if document_id <= 0:
+                return PreparedEvent(False, "missing_context", None, 0, metadata, event_type=event_type)
+
+            filename = safe_str(context.get("filename"))
+            size_bytes = safe_int(context.get("size_bytes"), 0)
+            metadata.update(
+                {
+                    "vault_document_id": document_id,
+                    "filename": filename,
+                    "size_bytes": size_bytes,
+                    "category": "VAULT",
+                }
+            )
+
+            return PreparedEvent(
+                accepted=True,
+                reason=None,
+                event_key=build_event_key(event_type, f"user{user_id}", f"doc{document_id}"),
+                points=int(POINTS[event_type]),
+                metadata=metadata,
+                file_hash=file_hash,
+                event_type=event_type,
+            )
+
         if event_type == "analysis_failed":
             key_source = job_id or file_hash
             if not key_source:
@@ -1527,6 +1651,14 @@ class GamificationService:
             today_stat.reports_opened = int(today_stat.reports_opened or 0) + 1
         elif event.event_type == "evidence_accessed":
             today_stat.evidence_opened = int(today_stat.evidence_opened or 0) + 1
+        elif event.event_type in {
+            "vault_file_uploaded",
+            "vault_file_downloaded",
+            "vault_integrity_verified",
+            "vault_offline_enabled",
+            "vault_offline_disabled",
+        }:
+            today_stat.evidence_opened = int(today_stat.evidence_opened or 0) + 1
         elif event.event_type == "investigation_note_added":
             today_stat.notes_added = int(today_stat.notes_added or 0) + 1
 
@@ -1567,6 +1699,7 @@ class GamificationService:
             int(stat.scans_completed or 0)
             + int(stat.alerts_reviewed or 0)
             + int(stat.reports_opened or 0)
+            + int(stat.evidence_opened or 0)
             + int(stat.notes_added or 0)
         )
         return meaningful > 0
@@ -1590,6 +1723,7 @@ class GamificationService:
                     GamificationDailyStat.scans_completed
                     + GamificationDailyStat.alerts_reviewed
                     + GamificationDailyStat.reports_opened
+                    + GamificationDailyStat.evidence_opened
                     + GamificationDailyStat.notes_added
                 )
                 > 0,
@@ -1869,6 +2003,13 @@ class GamificationService:
             },
             "security_champion": {"current": score_85_count, "target": 3},
             "elite_guardian": {"current": int(profile.current_level or 1), "target": 7},
+            "vault_first_upload": {"current": event_counts["vault_file_uploaded"], "target": 1},
+            "vault_integrity_checker": {"current": event_counts["vault_integrity_verified"], "target": 1},
+            "vault_keeper": {"current": event_counts["vault_file_uploaded"], "target": 10},
+            "vault_safe_access": {"current": event_counts["vault_file_downloaded"], "target": 5},
+            "vault_guardian": {"current": event_counts["vault_integrity_verified"], "target": 10},
+            "vault_offline_ready": {"current": event_counts["vault_offline_enabled"], "target": 1},
+            "vault_offline_manager": {"current": event_counts["vault_offline_disabled"], "target": 1},
         }
 
     def _serialize_challenges(self, challenges: list[UserChallenge]) -> list[dict[str, Any]]:

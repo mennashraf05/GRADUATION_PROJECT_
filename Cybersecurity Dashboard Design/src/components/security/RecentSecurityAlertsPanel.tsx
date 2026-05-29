@@ -984,6 +984,11 @@ async function fetchVaultAiAlerts(limit: number): Promise<DashboardAlertWithSour
       headers: {
         "Content-Type": "application/json",
       },
+      body: JSON.stringify({
+        create_event: false,
+        send_email_alert: false,
+        source: "recent_security_alerts",
+      }),
     }
   );
 

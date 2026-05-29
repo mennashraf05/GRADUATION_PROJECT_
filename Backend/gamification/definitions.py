@@ -45,6 +45,11 @@ EVENT_TYPES = {
     "challenge_completed",
     "level_up",
     "first_scan_completed",
+    "vault_file_uploaded",
+    "vault_file_downloaded",
+    "vault_integrity_verified",
+    "vault_offline_enabled",
+    "vault_offline_disabled",
 }
 
 UI_EVENT_TYPES = {
@@ -65,6 +70,11 @@ MEANINGFUL_ACTIVITY_EVENT_TYPES = {
     "report_accessed",
     "alert_reviewed",
     "investigation_note_added",
+    "vault_file_uploaded",
+    "vault_file_downloaded",
+    "vault_integrity_verified",
+    "vault_offline_enabled",
+    "vault_offline_disabled",
 }
 
 POINTS = {
@@ -89,6 +99,11 @@ POINTS = {
     "weekly_goal_completed": 15,
     "level_up": 0,
     "first_scan_completed": 0,
+    "vault_file_uploaded": 5,
+    "vault_file_downloaded": 2,
+    "vault_integrity_verified": 4,
+    "vault_offline_enabled": 1,
+    "vault_offline_disabled": 2,
 }
 
 HISTORY_REASON_TEMPLATES = {
@@ -116,6 +131,11 @@ HISTORY_REASON_TEMPLATES = {
     "challenge_completed": "You earned +{points} points for completing a challenge.",
     "level_up": "Level up unlocked.",
     "first_scan_completed": "You completed your first eligible scan.",
+    "vault_file_uploaded": "You earned +{points} points for uploading an encrypted vault file.",
+    "vault_file_downloaded": "You earned +{points} points for downloading your encrypted vault file.",
+    "vault_integrity_verified": "You earned +{points} points for verifying encrypted file integrity.",
+    "vault_offline_enabled": "You earned +{points} point for enabling offline vault access.",
+    "vault_offline_disabled": "You earned +{points} points for disabling offline vault access.",
 }
 
 
@@ -255,6 +275,55 @@ BADGE_DEFINITIONS = {
         "rarity": "legendary",
         "progress_target": 7,
     },
+    "vault_first_upload": {
+        "badge_code": "vault_first_upload",
+        "badge_title": "First Secure Upload",
+        "badge_description": "Uploaded your first encrypted vault file",
+        "rarity": "common",
+        "progress_target": 1,
+    },
+    "vault_integrity_checker": {
+        "badge_code": "vault_integrity_checker",
+        "badge_title": "Integrity Checker",
+        "badge_description": "Verified encrypted file integrity for the first time",
+        "rarity": "common",
+        "progress_target": 1,
+    },
+    "vault_keeper": {
+        "badge_code": "vault_keeper",
+        "badge_title": "Vault Keeper",
+        "badge_description": "Uploaded 10 encrypted vault files",
+        "rarity": "rare",
+        "progress_target": 10,
+    },
+    "vault_safe_access": {
+        "badge_code": "vault_safe_access",
+        "badge_title": "Safe Vault Access",
+        "badge_description": "Downloaded 5 encrypted vault files successfully",
+        "rarity": "rare",
+        "progress_target": 5,
+    },
+    "vault_guardian": {
+        "badge_code": "vault_guardian",
+        "badge_title": "Vault Guardian",
+        "badge_description": "Completed 10 vault integrity checks",
+        "rarity": "epic",
+        "progress_target": 10,
+    },
+    "vault_offline_ready": {
+        "badge_code": "vault_offline_ready",
+        "badge_title": "Offline Ready",
+        "badge_description": "Enabled offline access for an encrypted vault file",
+        "rarity": "common",
+        "progress_target": 1,
+    },
+    "vault_offline_manager": {
+        "badge_code": "vault_offline_manager",
+        "badge_title": "Offline Access Manager",
+        "badge_description": "Disabled offline access after enabling it",
+        "rarity": "rare",
+        "progress_target": 1,
+    },
 }
 
 DAILY_CHALLENGE_DEFINITIONS = {
@@ -285,6 +354,33 @@ DAILY_CHALLENGE_DEFINITIONS = {
         "reward_points": 6,
         "tracked_event_types": {"evidence_accessed"},
     },
+    "vault_upload_one_file": {
+        "challenge_code": "vault_upload_one_file",
+        "challenge_type": "daily",
+        "title": "Upload 1 encrypted file",
+        "description": "Upload one file to the encrypted vault today.",
+        "target_value": 1,
+        "reward_points": 5,
+        "tracked_event_types": {"vault_file_uploaded"},
+    },
+    "vault_verify_one_file": {
+        "challenge_code": "vault_verify_one_file",
+        "challenge_type": "daily",
+        "title": "Verify 1 vault file",
+        "description": "Verify encrypted file integrity today.",
+        "target_value": 1,
+        "reward_points": 6,
+        "tracked_event_types": {"vault_integrity_verified"},
+    },
+    "vault_enable_offline_once": {
+        "challenge_code": "vault_enable_offline_once",
+        "challenge_type": "daily",
+        "title": "Enable offline access once",
+        "description": "Enable offline access for one encrypted vault file today.",
+        "target_value": 1,
+        "reward_points": 3,
+        "tracked_event_types": {"vault_offline_enabled"},
+    },
 }
 
 WEEKLY_CHALLENGE_DEFINITIONS = {
@@ -314,6 +410,33 @@ WEEKLY_CHALLENGE_DEFINITIONS = {
         "target_value": 10,
         "reward_points": 18,
         "tracked_event_types": {"alert_reviewed"},
+    },
+    "vault_upload_three_files": {
+        "challenge_code": "vault_upload_three_files",
+        "challenge_type": "weekly",
+        "title": "Upload 3 encrypted files this week",
+        "description": "Upload three files to the encrypted vault this week.",
+        "target_value": 3,
+        "reward_points": 15,
+        "tracked_event_types": {"vault_file_uploaded"},
+    },
+    "vault_verify_three_files": {
+        "challenge_code": "vault_verify_three_files",
+        "challenge_type": "weekly",
+        "title": "Verify 3 vault files this week",
+        "description": "Verify integrity for three encrypted vault files this week.",
+        "target_value": 3,
+        "reward_points": 18,
+        "tracked_event_types": {"vault_integrity_verified"},
+    },
+    "vault_manage_offline_access": {
+        "challenge_code": "vault_manage_offline_access",
+        "challenge_type": "weekly",
+        "title": "Manage offline vault access",
+        "description": "Disable offline access for one encrypted vault file this week.",
+        "target_value": 1,
+        "reward_points": 8,
+        "tracked_event_types": {"vault_offline_disabled"},
     },
 }
 

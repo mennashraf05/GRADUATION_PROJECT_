@@ -1970,6 +1970,12 @@ export function ChatbotWorkspacePage() {
     let fallbackReason: string | null | undefined;
     if (shouldRunLiveVaultAnalysis(content, targetModuleId)) {
       assistantContent = await fetchLiveVaultAiResponse();
+    } else if (targetModuleId === "vault") {
+      assistantContent = getResponse(content, targetModuleId);
+      providerUsed = "fallback";
+      selectedProvider = providerPreference;
+      fallbackUsed = true;
+      fallbackReason = null;
     } else {
       const assistantResponse = await fetchLlmChatbotResponse(content, targetModuleId, providerPreference);
       assistantContent = assistantResponse.content;

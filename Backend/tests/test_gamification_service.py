@@ -434,6 +434,55 @@ class GamificationServiceTests(unittest.TestCase):
             self.assertEqual(len(access_history), 1)
             self.assertIn("accessing an analysis report", access_history[0]["human_readable_reason"])
 
+    def test_vault_upload_unlocks_badge_and_daily_challenge(self):
+        with backend_app.app.app_context():
+            result = self.service.record_vault_file_uploaded(
+                self.user_id,
+                101,
+                file_hash="vault-hash-101",
+                filename="evidence.pdf",
+                size_bytes=2048,
+            )
+
+            self.assertTrue(result["accepted"])
+            self.assertGreaterEqual(int(result["points_gained"]), 5)
+
+            profile = UserGamificationProfile.query.filter_by(user_id=self.user_id).first()
+            badge = UserBadge.query.filter_by(
+                user_id=self.user_id,
+                badge_code="vault_first_upload",
+            ).first()
+            challenge = UserChallenge.query.filter_by(
+                user_id=self.user_id,
+                challenge_code="vault_upload_one_file",
+            ).first()
+
+            self.assertIsNotNone(profile)
+            self.assertIsNotNone(badge)
+            self.assertIsNotNone(challenge)
+            self.assertEqual(challenge.status, "completed")
+
+    def test_vault_integrity_verification_is_not_double_counted(self):
+        with backend_app.app.app_context():
+            first = self.service.record_vault_integrity_verified(
+                self.user_id,
+                202,
+                file_hash="vault-hash-202",
+                filename="report.docx",
+                size_bytes=4096,
+            )
+            second = self.service.record_vault_integrity_verified(
+                self.user_id,
+                202,
+                file_hash="vault-hash-202",
+                filename="report.docx",
+                size_bytes=4096,
+            )
+
+            self.assertTrue(first["accepted"])
+            self.assertFalse(second["accepted"])
+            self.assertEqual(second["reason"], "duplicate_event")
+
 
 if __name__ == "__main__":
     unittest.main()

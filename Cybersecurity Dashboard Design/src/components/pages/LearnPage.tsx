@@ -23,6 +23,7 @@ import {
 } from 'lucide-react';
 import { Button } from '../ui/button';
 import { useLanguage } from '../../contexts/LanguageContext';
+import { useAppSettings } from '../../contexts/AppSettingsContext';
 
 type Category = 'All' | 'Phishing' | 'Passwords' | 'Network Security' | 'Identity' | 'Encryption';
 type Difficulty = 'Beginner' | 'Intermediate';
@@ -204,6 +205,7 @@ function matchesSearch(card: LearningCard, query: string) {
 
 export function LearnPage() {
   const { isRtl } = useLanguage();
+  const { applicationName } = useAppSettings();
   const navigate = useNavigate();
   const [activeCategory, setActiveCategory] = useState<Category>('All');
   const [searchTerm, setSearchTerm] = useState('');
@@ -272,12 +274,12 @@ export function LearnPage() {
 
       <nav className="sticky top-0 z-50 border-b border-white/10 bg-[#07111F]/88 backdrop-blur-xl">
         <div className="learn-container learn-navbar py-3">
-          <button onClick={() => navigate('/')} className="learn-brand rounded-xl focus:outline-none focus:ring-2 focus:ring-cyan-300/70" aria-label="Go to Sentinel AI home">
+          <button onClick={() => navigate('/')} className="learn-brand rounded-xl focus:outline-none focus:ring-2 focus:ring-cyan-300/70" aria-label={`Go to ${applicationName} home`}>
             <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-cyan-500 to-blue-600 shadow-lg shadow-cyan-500/20">
               <Shield className="h-6 w-6" />
             </span>
             <span className="bg-gradient-to-r from-cyan-300 to-blue-300 bg-clip-text text-xl font-semibold text-transparent">
-              Sentinel AI
+              {applicationName}
             </span>
           </button>
 
@@ -311,7 +313,7 @@ export function LearnPage() {
               ))}
             </div>
             <h1 className="max-w-3xl text-4xl font-semibold leading-tight tracking-normal sm:text-5xl lg:text-[3.2rem]">
-              Learn Cyber Safety with Sentinel AI
+              Learn Cyber Safety with {applicationName}
             </h1>
             <p className="mt-4 max-w-2xl text-lg leading-8 text-slate-300">
               Short lessons, safe practice, and quick checks to build stronger everyday security habits.
@@ -420,7 +422,7 @@ export function LearnPage() {
         <section className="learn-container learn-section">
           <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
             <div>
-              <p className="text-sm font-medium text-emerald-300">Practice with Sentinel AI Tools</p>
+              <p className="text-sm font-medium text-emerald-300">Practice with {applicationName} Tools</p>
               <h2 className="mt-1 text-3xl font-semibold">Turn lessons into action</h2>
             </div>
             <span className="text-xs text-slate-500">Existing routes only</span>
@@ -437,7 +439,7 @@ export function LearnPage() {
             <ShieldCheck className="mx-auto h-9 w-9 text-cyan-200" />
             <h2 className="mt-4 text-3xl font-semibold">Keep building safer habits</h2>
             <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-slate-300">
-              Watch a lesson, practice with a real Sentinel AI tool, then come back for another quick check.
+              Watch a lesson, practice with a real {applicationName} tool, then come back for another quick check.
             </p>
             <div className="mt-6 flex flex-col justify-center gap-3 sm:flex-row">
               <Button onClick={() => document.getElementById('learning-content')?.scrollIntoView({ behavior: 'smooth', block: 'start' })} className="learn-primary-button px-5 text-white">

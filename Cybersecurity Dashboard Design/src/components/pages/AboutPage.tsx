@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { Button } from "../ui/button";
 import { useLanguage } from "../../contexts/LanguageContext";
+import { useAppSettings } from "../../contexts/AppSettingsContext";
 
 type Badge = "Active" | "Protected" | "Review" | "Reports";
 
@@ -135,6 +136,7 @@ const values = [
 
 export function AboutPage() {
   const { isRtl } = useLanguage();
+  const { applicationName } = useAppSettings();
   const navigate = useNavigate();
 
   const navItems = [
@@ -152,12 +154,12 @@ export function AboutPage() {
 
       <nav className="sticky top-0 z-50 border-b border-white/10 bg-[#07111F]/88 backdrop-blur-xl">
         <div className="about-container about-navbar py-3">
-          <button onClick={() => navigate("/")} className="about-brand rounded-xl focus:outline-none focus:ring-2 focus:ring-cyan-300/70" aria-label="Go to Sentinel AI home">
+          <button onClick={() => navigate("/")} className="about-brand rounded-xl focus:outline-none focus:ring-2 focus:ring-cyan-300/70" aria-label={`Go to ${applicationName} home`}>
             <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-cyan-500 to-blue-600 shadow-lg shadow-cyan-500/20">
               <Shield className="h-6 w-6" />
             </span>
             <span className="bg-gradient-to-r from-cyan-300 to-blue-300 bg-clip-text text-xl font-semibold text-transparent">
-              Sentinel AI
+              {applicationName}
             </span>
           </button>
 
@@ -185,13 +187,13 @@ export function AboutPage() {
           <div className="about-reveal">
             <div className="about-badge">
               <ShieldCheck className="h-4 w-4" />
-              About Sentinel AI
+              About {applicationName}
             </div>
             <h1 className="mt-5 max-w-3xl text-4xl font-semibold leading-tight tracking-normal sm:text-5xl lg:text-[3.35rem]">
               Protecting Your Digital World
             </h1>
             <p className="mt-4 max-w-2xl text-lg leading-8 text-slate-300">
-              Sentinel AI brings password security, identity monitoring, network analysis, and privacy-safe reporting into one intelligent cybersecurity platform.
+              {applicationName} brings password security, identity monitoring, network analysis, and privacy-safe reporting into one intelligent cybersecurity platform.
             </p>
             <div className="mt-6 flex flex-col gap-3 sm:flex-row">
               <Button onClick={() => navigate("/features")} className="about-primary-button h-11 px-5 text-white">
@@ -232,7 +234,7 @@ export function AboutPage() {
               </span>
               <h2 className="mt-5 text-3xl font-semibold">Privacy-first security reporting</h2>
               <p className="mt-3 max-w-xl text-sm leading-6 text-slate-300">
-                Sentinel AI focuses on safe summaries, labels, timestamps, counts, and recommendations instead of exposing sensitive evidence.
+                {applicationName} focuses on safe summaries, labels, timestamps, counts, and recommendations instead of exposing sensitive evidence.
               </p>
             </div>
             <div className="about-privacy-grid">
@@ -267,7 +269,7 @@ export function AboutPage() {
         <section className="about-container py-12 sm:py-14">
           <div className="about-final-cta">
             <ShieldCheck className="mx-auto h-9 w-9 text-cyan-200" />
-            <h2 className="mt-4 text-3xl font-semibold">Ready to explore Sentinel AI?</h2>
+            <h2 className="mt-4 text-3xl font-semibold">Ready to explore {applicationName}?</h2>
             <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-slate-300">
               Start with the dashboard or build practical cyber safety habits.
             </p>

@@ -73,6 +73,52 @@ const DESCRIPTIONS: Record<string, string> = {
   brute_force_login: 'Runs repeated local login attempts until throttled.',
 };
 
+const STORAGE_KEY = 'sentinel_admin_security_validation_lab_results_v1';
+const MAX_TIMELINE_ITEMS = 12;
+
+function loadStoredValidationState(): {
+  results: Record<string, ValidationResult>;
+  timeline: ValidationResult[];
+} {
+  if (typeof window === 'undefined') {
+    return { results: {}, timeline: [] };
+  }
+
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(STORAGE_KEY) || '{}');
+    const rawResults = parsed?.results && typeof parsed.results === 'object' ? parsed.results : {};
+    const rawTimeline = Array.isArray(parsed?.timeline) ? parsed.timeline : [];
+    const results = Object.fromEntries(
+      Object.entries(rawResults).filter(([, value]) => Boolean(value && typeof value === 'object')),
+    ) as Record<string, ValidationResult>;
+    const timeline = rawTimeline
+      .filter((item: unknown) => Boolean(item && typeof item === 'object'))
+      .slice(0, MAX_TIMELINE_ITEMS) as ValidationResult[];
+    return { results, timeline };
+  } catch {
+    return { results: {}, timeline: [] };
+  }
+}
+
+function saveStoredValidationState(
+  results: Record<string, ValidationResult>,
+  timeline: ValidationResult[],
+) {
+  if (typeof window === 'undefined') return;
+  window.localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify({
+      results,
+      timeline: timeline.slice(0, MAX_TIMELINE_ITEMS),
+    }),
+  );
+}
+
+function clearStoredValidationState() {
+  if (typeof window === 'undefined') return;
+  window.localStorage.removeItem(STORAGE_KEY);
+}
+
 function authHeaders(): Headers {
   const headers = new Headers({ 'Content-Type': 'application/json' });
   const token = window.localStorage.getItem('sentinel_admin_token');
@@ -106,9 +152,10 @@ function resultTone(result?: ValidationResult) {
 }
 
 export default function SecurityValidationLabPage() {
+  const storedState = useMemo(loadStoredValidationState, []);
   const [tests, setTests] = useState<ValidationTest[]>([]);
-  const [results, setResults] = useState<Record<string, ValidationResult>>({});
-  const [timeline, setTimeline] = useState<ValidationResult[]>([]);
+  const [results, setResults] = useState<Record<string, ValidationResult>>(storedState.results);
+  const [timeline, setTimeline] = useState<ValidationResult[]>(storedState.timeline);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState<string | null>(null);
   const [selected, setSelected] = useState<ValidationResult | ValidationTest | null>(null);
@@ -150,17 +197,39 @@ export default function SecurityValidationLabPage() {
     if (toastState.type === 'error') toast.error(toastState.message);
   }, [toastState]);
 
+  useEffect(() => {
+    saveStoredValidationState(results, timeline);
+  }, [results, timeline]);
+
   const summary = useMemo(() => {
     const resultList = Object.values(results);
     const passed = resultList.filter((item) => item.passed).length;
     const blocked = resultList.filter((item) => item.passed && item.actual_status === 403).length;
-    const backendAuth = Boolean(results.cors_allowed_origin?.passed);
-    const total = tests.length || 7;
+    const backendAuth = resultList.filter((item) => item.passed && item.actual_status === 401).length;
+    const rateLimited = resultList.filter((item) => {
+      const searchable = [
+        item.test_id,
+        item.attack_name,
+        item.control,
+        item.result,
+        item.purpose,
+        item.description,
+      ].join(' ').toLowerCase();
+      return (
+        item.passed &&
+        (item.actual_status === 429 ||
+          item.expected_status === 429 ||
+          searchable.includes('rate limit') ||
+          searchable.includes('brute force') ||
+          searchable.includes('brute-force'))
+      );
+    }).length;
+    const total = tests.length;
     let status: OverallStatus = 'Protected';
     if (resultList.length === 0) status = 'Ready';
     else if (passed === 0) status = 'Failed';
     else if (passed < total) status = 'Partial';
-    return { total, passed, blocked, backendAuth, status };
+    return { total, passed, blocked, backendAuth, rateLimited, status };
   }, [results, tests.length]);
 
   async function runSimulation(testId: string) {
@@ -178,7 +247,7 @@ export default function SecurityValidationLabPage() {
       }
       const result = payload as ValidationResult;
       setResults((current) => ({ ...current, [result.test_id]: result }));
-      setTimeline((current) => [result, ...current].slice(0, 12));
+      setTimeline((current) => [result, ...current].slice(0, MAX_TIMELINE_ITEMS));
       setToastState({
         type: result.passed ? 'success' : 'warning',
         message: result.passed ? 'Simulation completed successfully.' : 'Some protections did not return the expected result.',
@@ -209,7 +278,7 @@ export default function SecurityValidationLabPage() {
         nextResults[result.test_id] = result;
       });
       setResults(nextResults);
-      setTimeline((current) => [...[...payload.results].reverse(), ...current].slice(0, 12));
+      setTimeline((current) => [...[...payload.results].reverse(), ...current].slice(0, MAX_TIMELINE_ITEMS));
       setToastState({
         type: payload.passed ? 'success' : 'warning',
         message: payload.passed ? 'Simulation completed successfully.' : 'Some protections did not return the expected result.',
@@ -226,6 +295,7 @@ export default function SecurityValidationLabPage() {
     setResults({});
     setTimeline([]);
     setSafeError('');
+    clearStoredValidationState();
   }
 
   const selectedResult = selected && 'passed' in selected ? selected : null;
@@ -297,7 +367,8 @@ export default function SecurityValidationLabPage() {
             { label: 'Total Tests', value: summary.total, detail: 'Predefined local checks', icon: Activity, tone: 'cyan' },
             { label: 'Passed Tests', value: summary.passed, detail: 'Controls matched expectations', icon: CheckCircle, tone: 'green' },
             { label: 'Blocked by WAF', value: summary.blocked, detail: 'Edge protections returned 403', icon: ShieldCheck, tone: 'blue' },
-            { label: 'Backend Auth Verified', value: summary.backendAuth ? 1 : 0, detail: 'Trusted origin auth behavior', icon: Lock, tone: 'violet' },
+            { label: 'Backend Auth Verified', value: summary.backendAuth, detail: 'Trusted origin passed WAF and backend returned 401', icon: Lock, tone: 'violet' },
+            { label: 'Rate Limited', value: summary.rateLimited, detail: 'Brute-force protection returned 429', icon: Zap, tone: 'orange' },
           ].map((item) => (
             <motion.div key={item.label} whileHover={{ y: -4 }} className={`svl-metric svl-metric-${item.tone}`}>
               <div>

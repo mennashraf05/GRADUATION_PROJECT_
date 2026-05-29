@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "motion/react";
+import { useAppSettings } from "../../contexts/AppSettingsContext";
 import {
   ShieldCheck,
   Send,
@@ -1160,7 +1161,7 @@ const MODULE_CONTEXT: Record<
   },
 };
 
-function createInitialMessage(module: (typeof MODULE_OPTIONS)[number]): Message {
+function createInitialMessage(module: (typeof MODULE_OPTIONS)[number], applicationName = "Sentinel AI"): Message {
   const moduleIntros: Record<string, string> = {
     password: `You are now in Password Checker mode.
 
@@ -1214,7 +1215,7 @@ function createInitialMessage(module: (typeof MODULE_OPTIONS)[number]): Message 
     return {
       id: `init-${module.id}`,
       role: "assistant",
-      content: `Welcome to Sentinel AI Assistant - your project-wide cybersecurity copilot.
+      content: `Welcome to ${applicationName} Assistant - your project-wide cybersecurity copilot.
 
 You are now in Password Checker mode.
 
@@ -1231,7 +1232,7 @@ Ask anything about Password Checker, and I will answer in the context of that mo
   return {
     id: `init-${module.id}`,
     role: "assistant",
-    content: `Welcome to **Sentinel AI Assistant** - your project-wide cybersecurity copilot.
+    content: `Welcome to **${applicationName} Assistant** - your project-wide cybersecurity copilot.
 
 ${moduleIntros[module.id]}
 
@@ -1426,7 +1427,7 @@ function QuickActionChip({
   );
 }
 
-function MessageBubble({ message, index }: { message: Message; index: number }) {
+function MessageBubble({ message, index, applicationName }: { message: Message; index: number; applicationName: string }) {
   const isAI = message.role === "assistant";
   return (
     <motion.div
@@ -1475,7 +1476,7 @@ function MessageBubble({ message, index }: { message: Message; index: number }) 
               textTransform: "uppercase",
             }}
           >
-            {isAI ? "Sentinel AI" : "You"}
+            {isAI ? applicationName : "You"}
           </span>
           <span style={{ fontSize: "10px", color: "rgba(148,163,184,0.5)" }}>{formatTime(message.timestamp)}</span>
           {isAI && message.providerUsed && (
@@ -1560,6 +1561,7 @@ function MessageBubble({ message, index }: { message: Message; index: number }) 
 }
 
 function TypingIndicator() {
+  const { applicationName } = useAppSettings();
   return (
     <motion.div
       initial={{ opacity: 0, y: 10 }}
@@ -1586,7 +1588,7 @@ function TypingIndicator() {
       </div>
       <div>
         <div style={{ fontSize: "11px", fontWeight: 600, color: "#0EA5E9", letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: "6px" }}>
-          Sentinel AI
+          {applicationName}
         </div>
         <div
           style={{
@@ -1909,8 +1911,9 @@ function CyberBackground() {
 }
 
 export function ChatbotWorkspacePage() {
+  const { applicationName } = useAppSettings();
   const [activeModule, setActiveModule] = useState(DEFAULT_MODULE);
-  const [messages, setMessages] = useState<Message[]>(() => [createInitialMessage(DEFAULT_MODULE)]);
+  const [messages, setMessages] = useState<Message[]>(() => [createInitialMessage(DEFAULT_MODULE, applicationName)]);
   const [input, setInput] = useState("");
   const [isTyping, setIsTyping] = useState(false);
   const [providerPreference, setProviderPreference] = useState<ChatbotProviderPreference>(() => readChatbotProviderPreference());
@@ -1934,11 +1937,11 @@ export function ChatbotWorkspacePage() {
   }, [messages, isTyping]);
 
   useEffect(() => {
-    setMessages([createInitialMessage(activeModule)]);
+    setMessages([createInitialMessage(activeModule, applicationName)]);
     setInput("");
     setIsTyping(false);
     if (textareaRef.current) textareaRef.current.style.height = "auto";
-  }, [activeModule]);
+  }, [activeModule, applicationName]);
 
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -2015,7 +2018,7 @@ export function ChatbotWorkspacePage() {
   };
 
   const clearChat = () => {
-    setMessages([createInitialMessage(activeModule)]);
+    setMessages([createInitialMessage(activeModule, applicationName)]);
     setIsTyping(false);
   };
 
@@ -2130,7 +2133,7 @@ export function ChatbotWorkspacePage() {
                   fontFamily: "'Space Grotesk','Inter',sans-serif",
                 }}
               >
-                Sentinel AI Assistant
+                {applicationName} Assistant
               </h1>
               <div
                 style={{
@@ -2322,7 +2325,7 @@ export function ChatbotWorkspacePage() {
               }}
             >
               {messages.map((msg, i) => (
-                <MessageBubble key={msg.id} message={msg} index={i} />
+                <MessageBubble key={msg.id} message={msg} index={i} applicationName={applicationName} />
               ))}
               <AnimatePresence>{isTyping && <TypingIndicator />}</AnimatePresence>
               <div ref={messagesEndRef} />

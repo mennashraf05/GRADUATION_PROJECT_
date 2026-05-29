@@ -118,7 +118,9 @@ type NotificationType =
   | "critical_detected"
   | "vault_threat_detected"
   | "identity_leak"
-  | "password_security";
+  | "password_security"
+  | "admin_audit_event"
+  | "user_activity_event";
 
 type NotificationSeverity =
   | "info"
@@ -401,6 +403,37 @@ function getNotificationVisual(item: NotificationItem) {
     };
   }
 
+  if (type === "admin_audit_event" || type === "user_activity_event") {
+    if (severity === "critical" || severity === "error") {
+      return {
+        icon: ShieldAlert,
+        accentClass: "bg-red-400/80",
+        iconWrapClass: "border-red-500/20 bg-red-500/10",
+        iconColor: "text-red-200",
+        badge: severity === "error" ? "Failed" : "Admin",
+        badgeClass: "border-red-500/20 bg-red-500/10 text-red-200",
+      };
+    }
+    if (severity === "warning") {
+      return {
+        icon: Siren,
+        accentClass: "bg-amber-400/80",
+        iconWrapClass: "border-amber-500/20 bg-amber-500/10",
+        iconColor: "text-amber-200",
+        badge: "Admin",
+        badgeClass: "border-amber-500/20 bg-amber-500/10 text-amber-200",
+      };
+    }
+    return {
+      icon: BellRing,
+      accentClass: "bg-cyan-400/80",
+      iconWrapClass: "border-cyan-500/20 bg-cyan-500/10",
+      iconColor: "text-cyan-200",
+      badge: type === "user_activity_event" ? "Activity" : "Admin",
+      badgeClass: "border-cyan-500/20 bg-cyan-500/10 text-cyan-200",
+    };
+  }
+
   if (severity === "critical" || type === "critical_detected") {
     return {
       icon: ShieldAlert,
@@ -482,6 +515,7 @@ function getNotificationActionLabel(item: NotificationItem) {
   if (type === "identity_leak") return "Open Scan";
   if (type === "report_ready") return "Open Report";
   if (type === "evidence_ready") return "Open Artifacts";
+  if (type === "admin_audit_event" || type === "user_activity_event") return "Open Details";
   return "Open Job";
 }
 
@@ -1011,9 +1045,15 @@ export function NotificationCenter() {
 
     const actionUrl = String(item.action_url || item.metadata?.action_url || "").trim();
     const scanId = String(item.scan_id || item.metadata?.scan_id || "").trim();
+    if (actionUrl) {
+      setIsOpen(false);
+      navigate(actionUrl);
+      return;
+    }
+
     if (normalizeNotificationType(String(item.type || ""), item.metadata) === "identity_leak") {
       setIsOpen(false);
-      navigate(actionUrl || `/identityleak-monitor${scanId ? `?scan_id=${encodeURIComponent(scanId)}` : ""}`);
+      navigate(`/identityleak-monitor${scanId ? `?scan_id=${encodeURIComponent(scanId)}` : ""}`);
       return;
     }
 
@@ -1139,8 +1179,9 @@ export function NotificationCenter() {
                       No notifications yet
                     </div>
                     <div className="mt-2 text-sm leading-6 text-slate-300">
-                      Analyzer updates will appear here when jobs start, complete,
-                      fail, or detect notable threat activity.
+                      {isAdminConsoleRoute()
+                        ? "Admin, user, security, report, and system events will appear here when they happen."
+                        : "Analyzer updates will appear here when jobs start, complete, fail, or detect notable threat activity."}
                     </div>
                   </div>
                 ) : (

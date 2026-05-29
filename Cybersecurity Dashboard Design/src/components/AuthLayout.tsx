@@ -3,6 +3,7 @@ import { motion } from 'motion/react';
 import { useNavigate } from 'react-router-dom';
 import { Shield, Lock, Eye, AlertTriangle, Zap, CheckCircle, ArrowLeft } from 'lucide-react';
 import { Button } from './ui/button';
+import { useAppSettings } from '../contexts/AppSettingsContext';
 
 interface AuthLayoutProps {
   children: ReactNode;
@@ -13,6 +14,7 @@ interface AuthLayoutProps {
 
 export function AuthLayout({ children, title, subtitle, showBackButton = true }: AuthLayoutProps) {
   const navigate = useNavigate();
+  const { applicationName } = useAppSettings();
   // Generate animated shield and lock patterns
   const securityIcons = [
     { Icon: Shield, color: 'text-blue-400', size: 'w-4 h-4' },
@@ -113,7 +115,7 @@ export function AuthLayout({ children, title, subtitle, showBackButton = true }:
               animate={{ y: 0, opacity: 1 }}
               transition={{ delay: 0.3 }}
             >
-              Sentinel AI
+              {applicationName}
             </motion.h1>
             
             <motion.p 

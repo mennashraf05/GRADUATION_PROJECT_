@@ -8,6 +8,7 @@ import { Input } from '../../components/ui/input';
 import { Label } from '../../components/ui/label';
 import { useNavigate } from "react-router-dom";
 import { useLanguage } from '../../contexts/LanguageContext';
+import { useAppSettings } from '../../contexts/AppSettingsContext';
 
 interface TwoFactorPageProps {
   email?: string;
@@ -18,6 +19,7 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:5000
 export const TwoFactorPage: React.FC<TwoFactorPageProps> = ({ email }) => {
   const navigate = useNavigate();
   const { language, isRtl } = useLanguage();
+  const { applicationName } = useAppSettings();
   const isArabic = language === 'arabic';
 
   const [code, setCode] = useState('');
@@ -104,7 +106,7 @@ export const TwoFactorPage: React.FC<TwoFactorPageProps> = ({ email }) => {
 
             <h2 className="text-2xl font-bold text-white mb-2">{isArabic ? 'تم التحقق من المصادقة الثنائية' : '2FA Verified'}</h2>
             <p className="text-gray-300 mb-4 text-sm">
-              {isArabic ? 'تم تأكيد هويتك. جارٍ تحويلك إلى Sentinel AI...' : 'Your identity has been confirmed. Redirecting you to Sentinel AI...'}
+              {isArabic ? `تم تأكيد هويتك. جارٍ تحويلك إلى ${applicationName}...` : `Your identity has been confirmed. Redirecting you to ${applicationName}...`}
             </p>
           </div>
         </motion.div>

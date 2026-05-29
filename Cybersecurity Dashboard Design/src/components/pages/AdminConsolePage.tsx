@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { 
   Shield, Users, AlertTriangle, Package, Search, Bell, 
@@ -40,6 +40,7 @@ import {
   getNotificationSettings,
   saveNotificationSettings,
 } from '../../services/adminNotificationsService';
+import { useAppSettings } from '../../contexts/AppSettingsContext';
 
 type SectionType = 'overview' | 'users' | 'alerts' | 'modules' | 'threat-intel' | 'pcap-analysis' | 'security-lab' | 'jobs' | 'system-health' | 'audit-logs' | 'notifications' | 'integrations' | 'reports' | 'settings';
 
@@ -109,10 +110,45 @@ interface InviteUserFormState {
   twoFA: boolean;
 }
 
+interface PendingRoleChange {
+  user: User;
+  oldRole: string;
+  newRole: string;
+}
+
 interface AdminIdentity {
   displayName: string;
   email: string;
   role: string;
+}
+
+interface AdminSystemSettings {
+  general: {
+    applicationName: string;
+  };
+  security: {
+    requireTwoFactorAllUsers: boolean;
+    sessionTimeoutMinutes: number;
+    passwordPolicy: 'basic' | 'strong' | 'very-strong';
+    allowedFileTypes: string;
+  };
+}
+
+interface AdminSystemSettingsUpdate {
+  general?: Partial<AdminSystemSettings['general']>;
+  security?: Partial<AdminSystemSettings['security']>;
+}
+
+interface AdminSettingsProfile {
+  fullName: string;
+  email: string;
+  jobTitle: string;
+  company: string;
+}
+
+interface AdminSettingsNotificationPreferences {
+  emailAlerts: boolean;
+  weeklyReports: boolean;
 }
 
 interface AdminUserSummary {
@@ -126,6 +162,30 @@ interface AdminUserSummary {
 
 const API_BASE_URL =
   import.meta.env.DEV ? '' : (import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000');
+
+const DEFAULT_ADMIN_SYSTEM_SETTINGS: AdminSystemSettings = {
+  general: {
+    applicationName: 'Sentinel AI',
+  },
+  security: {
+    requireTwoFactorAllUsers: true,
+    sessionTimeoutMinutes: 60,
+    passwordPolicy: 'strong',
+    allowedFileTypes: '.pdf, .doc, .docx, .txt, .zip',
+  },
+};
+
+const DEFAULT_ADMIN_SETTINGS_PROFILE: AdminSettingsProfile = {
+  fullName: '',
+  email: '',
+  jobTitle: '',
+  company: '',
+};
+
+const DEFAULT_ADMIN_SETTINGS_NOTIFICATION_PREFERENCES: AdminSettingsNotificationPreferences = {
+  emailAlerts: true,
+  weeklyReports: true,
+};
 
 function formatRelativeAdminTime(value: string | null | undefined): string {
   if (!value) {
@@ -319,6 +379,7 @@ interface RecentAdminActivity {
 const AdminConsolePage: React.FC = () => {
   const navigate = useNavigate();
   const location = useLocation();
+  const { applicationName, refreshApplicationName } = useAppSettings();
   const [activeSection, setActiveSection] = useState<SectionType>(() => sectionFromSearch(location.search));
   const [selectedUser, setSelectedUser] = useState<User | null>(null);
   const [selectedAlert, setSelectedAlert] = useState<Alert | null>(null);
@@ -390,6 +451,23 @@ const AdminConsolePage: React.FC = () => {
   });
   const [notificationPreferences, setNotificationPreferences] = useState<NotificationSettings | null>(null);
   const [notificationPreferencesLoading, setNotificationPreferencesLoading] = useState(false);
+  const [systemSettings, setSystemSettings] = useState<AdminSystemSettings>(DEFAULT_ADMIN_SYSTEM_SETTINGS);
+  const [systemSettingsLoading, setSystemSettingsLoading] = useState(false);
+  const [adminSettingsProfile, setAdminSettingsProfile] = useState<AdminSettingsProfile>(DEFAULT_ADMIN_SETTINGS_PROFILE);
+  const [adminSettingsProfileLoading, setAdminSettingsProfileLoading] = useState(false);
+  const [adminSettingsProfileSaving, setAdminSettingsProfileSaving] = useState(false);
+  const [adminSettingsPassword, setAdminSettingsPassword] = useState({
+    currentPassword: '',
+    newPassword: '',
+    confirmPassword: '',
+  });
+  const [adminSettingsPasswordSaving, setAdminSettingsPasswordSaving] = useState(false);
+  const [adminSettingsNotificationPreferences, setAdminSettingsNotificationPreferences] =
+    useState<AdminSettingsNotificationPreferences>(DEFAULT_ADMIN_SETTINGS_NOTIFICATION_PREFERENCES);
+  const [adminSettingsNotificationPreferencesLoading, setAdminSettingsNotificationPreferencesLoading] = useState(false);
+  const [adminSettingsNotificationPreferencesSaving, setAdminSettingsNotificationPreferencesSaving] = useState(false);
+  const [pendingRoleChange, setPendingRoleChange] = useState<PendingRoleChange | null>(null);
+  const [roleChangeSaving, setRoleChangeSaving] = useState(false);
   const [inviteForm, setInviteForm] = useState<InviteUserFormState>({
     name: '',
     email: '',
@@ -601,6 +679,219 @@ const AdminConsolePage: React.FC = () => {
       });
     } finally {
       setNotificationPreferencesLoading(false);
+    }
+  };
+
+  const normalizeSystemSettings = (payload?: Partial<AdminSystemSettings>): AdminSystemSettings => ({
+    general: {
+      ...DEFAULT_ADMIN_SYSTEM_SETTINGS.general,
+      ...(payload?.general || {}),
+    },
+    security: {
+      ...DEFAULT_ADMIN_SYSTEM_SETTINGS.security,
+      ...(payload?.security || {}),
+      sessionTimeoutMinutes: Number(
+        payload?.security?.sessionTimeoutMinutes
+          ?? DEFAULT_ADMIN_SYSTEM_SETTINGS.security.sessionTimeoutMinutes,
+      ),
+      passwordPolicy: (['basic', 'strong', 'very-strong'].includes(String(payload?.security?.passwordPolicy))
+        ? payload?.security?.passwordPolicy
+        : DEFAULT_ADMIN_SYSTEM_SETTINGS.security.passwordPolicy) as AdminSystemSettings['security']['passwordPolicy'],
+    },
+  });
+
+  const loadSystemSettings = async () => {
+    setSystemSettingsLoading(true);
+    try {
+      const result = await requestAdmin<{ settings?: Partial<AdminSystemSettings> }>('/api/admin/system-settings');
+      setSystemSettings(normalizeSystemSettings(result.settings));
+    } catch (error) {
+      toast.error('System settings could not be loaded', {
+        description: error instanceof Error ? error.message : 'Check admin authentication and backend status.',
+      });
+    } finally {
+      setSystemSettingsLoading(false);
+    }
+  };
+
+  const updateSystemSettings = (updates: AdminSystemSettingsUpdate) => {
+    setSystemSettings((current) => normalizeSystemSettings({
+      general: {
+        ...current.general,
+        ...(updates.general || {}),
+      },
+      security: {
+        ...current.security,
+        ...(updates.security || {}),
+      },
+    }));
+  };
+
+  const saveSystemSettings = async (section: keyof AdminSystemSettings) => {
+    setSystemSettingsLoading(true);
+    try {
+      const result = await requestAdmin<{ settings?: Partial<AdminSystemSettings> }>('/api/admin/system-settings', {
+        method: 'PATCH',
+        body: JSON.stringify({ [section]: systemSettings[section] }),
+      });
+      const normalizedSettings = normalizeSystemSettings(result.settings);
+      setSystemSettings(normalizedSettings);
+      if (section === 'general') {
+        await refreshApplicationName(normalizedSettings.general.applicationName);
+      }
+      toast.success(section === 'general' ? 'Settings saved' : 'Security settings saved');
+    } catch (error) {
+      toast.error(section === 'general' ? 'Settings could not be saved' : 'Security settings could not be saved', {
+        description: error instanceof Error ? error.message : 'Check admin authentication and backend status.',
+      });
+    } finally {
+      setSystemSettingsLoading(false);
+    }
+  };
+
+  const normalizeAdminSettingsProfile = (payload?: Partial<AdminSettingsProfile>): AdminSettingsProfile => ({
+    ...DEFAULT_ADMIN_SETTINGS_PROFILE,
+    ...(payload || {}),
+    fullName: String(payload?.fullName ?? ''),
+    email: String(payload?.email ?? ''),
+    jobTitle: String(payload?.jobTitle ?? ''),
+    company: String(payload?.company ?? ''),
+  });
+
+  const loadAdminSettingsProfile = async () => {
+    setAdminSettingsProfileLoading(true);
+    try {
+      const result = await requestAdmin<{ profile?: Partial<AdminSettingsProfile> }>('/api/admin/settings/profile');
+      const profile = normalizeAdminSettingsProfile(result.profile);
+      setAdminSettingsProfile(profile);
+      if (profile.fullName || profile.email) {
+        const displayName = profile.fullName || profile.email || 'Admin';
+        setAdminIdentity((current) => ({
+          ...current,
+          displayName,
+          email: profile.email || current.email,
+        }));
+        localStorage.setItem('sentinel_admin_name', displayName);
+        if (profile.email) {
+          localStorage.setItem('sentinel_admin_email', profile.email);
+        }
+      }
+    } catch (error) {
+      toast.error('Profile information could not be loaded', {
+        description: error instanceof Error ? error.message : 'Check admin authentication and backend status.',
+      });
+    } finally {
+      setAdminSettingsProfileLoading(false);
+    }
+  };
+
+  const saveAdminSettingsProfile = async () => {
+    setAdminSettingsProfileSaving(true);
+    try {
+      const result = await requestAdmin<{ profile?: Partial<AdminSettingsProfile> }>('/api/admin/settings/profile', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          fullName: adminSettingsProfile.fullName,
+          jobTitle: adminSettingsProfile.jobTitle,
+          company: adminSettingsProfile.company,
+        }),
+      });
+      const profile = normalizeAdminSettingsProfile(result.profile);
+      setAdminSettingsProfile(profile);
+      const displayName = profile.fullName || profile.email || 'Admin';
+      setAdminIdentity((current) => ({
+        ...current,
+        displayName,
+        email: profile.email || current.email,
+      }));
+      localStorage.setItem('sentinel_admin_name', displayName);
+      if (profile.email) {
+        localStorage.setItem('sentinel_admin_email', profile.email);
+      }
+      toast.success('Profile updated');
+    } catch (error) {
+      toast.error('Profile could not be updated', {
+        description: error instanceof Error ? error.message : 'Check admin authentication and backend status.',
+      });
+    } finally {
+      setAdminSettingsProfileSaving(false);
+    }
+  };
+
+  const updateAdminSettingsPassword = (updates: Partial<typeof adminSettingsPassword>) => {
+    setAdminSettingsPassword((current) => ({
+      ...current,
+      ...updates,
+    }));
+  };
+
+  const saveAdminSettingsPassword = async () => {
+    setAdminSettingsPasswordSaving(true);
+    try {
+      await requestAdmin<{ message?: string }>('/api/admin/settings/change-password', {
+        method: 'POST',
+        body: JSON.stringify(adminSettingsPassword),
+      });
+      setAdminSettingsPassword({
+        currentPassword: '',
+        newPassword: '',
+        confirmPassword: '',
+      });
+      toast.success('Password updated');
+    } catch (error) {
+      toast.error('Password could not be updated', {
+        description: error instanceof Error ? error.message : 'Check the entered passwords and try again.',
+      });
+    } finally {
+      setAdminSettingsPasswordSaving(false);
+    }
+  };
+
+  const normalizeAdminSettingsNotificationPreferences = (
+    payload?: Partial<AdminSettingsNotificationPreferences>,
+  ): AdminSettingsNotificationPreferences => ({
+    emailAlerts: Boolean(payload?.emailAlerts ?? DEFAULT_ADMIN_SETTINGS_NOTIFICATION_PREFERENCES.emailAlerts),
+    weeklyReports: Boolean(payload?.weeklyReports ?? DEFAULT_ADMIN_SETTINGS_NOTIFICATION_PREFERENCES.weeklyReports),
+  });
+
+  const loadAdminSettingsNotificationPreferences = async () => {
+    setAdminSettingsNotificationPreferencesLoading(true);
+    try {
+      const result = await requestAdmin<{ preferences?: Partial<AdminSettingsNotificationPreferences> }>(
+        '/api/admin/settings/notification-preferences',
+      );
+      setAdminSettingsNotificationPreferences(
+        normalizeAdminSettingsNotificationPreferences(result.preferences),
+      );
+    } catch (error) {
+      toast.error('Notification preferences could not be loaded', {
+        description: error instanceof Error ? error.message : 'Check admin authentication and backend status.',
+      });
+    } finally {
+      setAdminSettingsNotificationPreferencesLoading(false);
+    }
+  };
+
+  const saveAdminSettingsNotificationPreferences = async () => {
+    setAdminSettingsNotificationPreferencesSaving(true);
+    try {
+      const result = await requestAdmin<{ preferences?: Partial<AdminSettingsNotificationPreferences> }>(
+        '/api/admin/settings/notification-preferences',
+        {
+          method: 'PATCH',
+          body: JSON.stringify(adminSettingsNotificationPreferences),
+        },
+      );
+      setAdminSettingsNotificationPreferences(
+        normalizeAdminSettingsNotificationPreferences(result.preferences),
+      );
+      toast.success('Notification preferences saved');
+    } catch (error) {
+      toast.error('Notification preferences could not be saved', {
+        description: error instanceof Error ? error.message : 'Check admin authentication and backend status.',
+      });
+    } finally {
+      setAdminSettingsNotificationPreferencesSaving(false);
     }
   };
 
@@ -1015,9 +1306,52 @@ const AdminConsolePage: React.FC = () => {
     return initials || source.slice(0, 2).toUpperCase() || 'AD';
   }, [adminIdentity.displayName, adminIdentity.email]);
 
+  const signOutAdmin = useCallback(async (auditLogout = true) => {
+    const adminToken = localStorage.getItem('sentinel_admin_token');
+    if (auditLogout && adminToken) {
+      try {
+        await fetch(`${API_BASE_URL || ''}/api/admin/auth/logout`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${adminToken}` },
+        });
+      } catch {
+        // Local sign-out should still proceed if audit logging is unreachable.
+      }
+    }
+    localStorage.removeItem('sentinel_admin_token');
+    localStorage.removeItem('sentinel_admin_name');
+    localStorage.removeItem('sentinel_admin_email');
+    navigate('/admin/login');
+  }, [navigate]);
+
   useEffect(() => {
     void loadAdminIdentity();
+    void loadSystemSettings();
   }, []);
+
+  useEffect(() => {
+    if (!localStorage.getItem('sentinel_admin_token')) {
+      return;
+    }
+
+    const timeoutMs = Math.max(5, Number(systemSettings.security.sessionTimeoutMinutes) || 60) * 60 * 1000;
+    let timeoutId = window.setTimeout(() => undefined, timeoutMs);
+    const resetTimer = () => {
+      window.clearTimeout(timeoutId);
+      timeoutId = window.setTimeout(() => {
+        toast.info('Admin session timed out');
+        void signOutAdmin(false);
+      }, timeoutMs);
+    };
+    const events = ['mousemove', 'keydown', 'click', 'scroll', 'touchstart'];
+    events.forEach((eventName) => window.addEventListener(eventName, resetTimer, { passive: true }));
+    resetTimer();
+
+    return () => {
+      window.clearTimeout(timeoutId);
+      events.forEach((eventName) => window.removeEventListener(eventName, resetTimer));
+    };
+  }, [signOutAdmin, systemSettings.security.sessionTimeoutMinutes]);
 
   useEffect(() => {
     setActiveSection(sectionFromSearch(location.search));
@@ -1080,7 +1414,9 @@ const AdminConsolePage: React.FC = () => {
     if (activeSection !== 'settings') {
       return;
     }
-    void loadNotificationPreferences();
+    void loadSystemSettings();
+    void loadAdminSettingsProfile();
+    void loadAdminSettingsNotificationPreferences();
   }, [activeSection]);
 
   useEffect(() => {
@@ -1314,7 +1650,7 @@ const AdminConsolePage: React.FC = () => {
 
   const handleEmailUser = (user: User) => {
     window.location.href = `mailto:${encodeURIComponent(user.email)}?subject=${encodeURIComponent(
-      'Sentinel AI account support',
+      `${applicationName} account support`,
     )}`;
   };
 
@@ -1342,6 +1678,43 @@ const AdminConsolePage: React.FC = () => {
       await loadRoles();
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Failed to delete user');
+    }
+  };
+
+  const requestUserRoleChange = (user: User, newRole: string) => {
+    if (!ADMIN_VISIBLE_ROLES.has(newRole) || newRole === user.role) {
+      return;
+    }
+    setPendingRoleChange({
+      user,
+      oldRole: user.role,
+      newRole,
+    });
+  };
+
+  const confirmUserRoleChange = async () => {
+    if (!pendingRoleChange) return;
+    setRoleChangeSaving(true);
+    try {
+      const result = await requestAdmin<{ user: any }>(`/api/admin/users/${pendingRoleChange.user.id}/role`, {
+        method: 'PATCH',
+        body: JSON.stringify({ role: pendingRoleChange.newRole }),
+      });
+      const updatedUser = mapAdminUser(result.user || {});
+      setUsers((current) => current.map((user) => (user.id === updatedUser.id ? updatedUser : user)));
+      setSelectedUser((current) => (current?.id === updatedUser.id ? updatedUser : current));
+      setPendingRoleChange(null);
+      toast.success('User role updated', {
+        description: `${updatedUser.email || updatedUser.name} is now ${updatedUser.role}.`,
+      });
+      await loadRoles();
+      await loadUserSummary();
+    } catch (error) {
+      toast.error('User role could not be changed', {
+        description: error instanceof Error ? error.message : 'The role update was rejected by the server.',
+      });
+    } finally {
+      setRoleChangeSaving(false);
     }
   };
 
@@ -1435,7 +1808,7 @@ const AdminConsolePage: React.FC = () => {
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-2">
             <Shield className="w-6 h-6 text-blue-400" />
-            <span className="font-semibold">Sentinel AI Admin</span>
+            <span className="font-semibold">{applicationName} Admin</span>
           </div>
         </div>
         
@@ -1462,23 +1835,7 @@ const AdminConsolePage: React.FC = () => {
             variant="outline"
             size="sm"
             className="gap-2 border-red-500/30 text-red-400 hover:bg-red-500/10 hover:text-red-300"
-            onClick={async () => {
-              const adminToken = localStorage.getItem('sentinel_admin_token');
-              if (adminToken) {
-                try {
-                  await fetch(`${API_BASE_URL || ''}/api/admin/auth/logout`, {
-                    method: 'POST',
-                    headers: { Authorization: `Bearer ${adminToken}` },
-                  });
-                } catch {
-                  // Local sign-out should still proceed if audit logging is unreachable.
-                }
-              }
-              localStorage.removeItem('sentinel_admin_token');
-              localStorage.removeItem('sentinel_admin_name');
-              localStorage.removeItem('sentinel_admin_email');
-              navigate('/admin/login');
-            }}
+            onClick={() => void signOutAdmin()}
           >
             <LogOut className="w-4 h-4" />
             Logout
@@ -2037,7 +2394,28 @@ const AdminConsolePage: React.FC = () => {
                                   {user.status}
                                 </Badge>
                               </TableCell>
-                              <TableCell>{user.role}</TableCell>
+                              <TableCell>
+                                <div className="flex items-center gap-2" onClick={(event) => event.stopPropagation()}>
+                                  <Badge className={user.role === 'Admin'
+                                    ? 'bg-purple-500/20 text-purple-200 border-purple-500/40'
+                                    : 'bg-slate-500/15 text-slate-200 border-slate-500/30'}
+                                  >
+                                    {user.role}
+                                  </Badge>
+                                  <Select
+                                    value={user.role}
+                                    onValueChange={(nextRole) => requestUserRoleChange(user, nextRole)}
+                                  >
+                                    <SelectTrigger className="h-8 w-[118px] bg-[#0F172A] border-white/10 text-xs">
+                                      <SelectValue placeholder="Change role" />
+                                    </SelectTrigger>
+                                    <SelectContent className="bg-[#1E293B] border-white/10 text-white">
+                                      <SelectItem value="Admin">Admin</SelectItem>
+                                      <SelectItem value="User">User</SelectItem>
+                                    </SelectContent>
+                                  </Select>
+                                </div>
+                              </TableCell>
                               <TableCell>
                                 <Badge className={getRiskLevelColor(user.riskLevel)}>
                                   {user.riskLevel}
@@ -2155,7 +2533,12 @@ const AdminConsolePage: React.FC = () => {
                         <Card key={role.id} className="bg-[#1E293B] border-white/10 p-6 hover:border-blue-500/50 transition-colors cursor-pointer">
                           <div className="flex items-center justify-between mb-4">
                             <h3 className="text-xl">{role.name}</h3>
-                            <Button size="sm" variant="outline">
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              disabled
+                              title="Role membership is changed per user from the Users tab."
+                            >
                               <Edit className="w-4 h-4" />
                             </Button>
                           </div>
@@ -2233,7 +2616,7 @@ const AdminConsolePage: React.FC = () => {
                 <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
                   <div>
                     <h1 className="text-3xl mb-2">Threat Management</h1>
-                    <p className="text-gray-400">Monitor, review, and resolve security alerts across Sentinel AI modules</p>
+                    <p className="text-gray-400">Monitor, review, and resolve security alerts across {applicationName} modules</p>
                   </div>
                   <div className="flex flex-wrap items-center gap-3">
                     <Button variant="outline" className="gap-2" onClick={() => void handleThreatExport()}>
@@ -3284,181 +3667,324 @@ const AdminConsolePage: React.FC = () => {
 
             {/* Settings Section */}
             {activeSection === 'settings' && (
-              <div className="space-y-6">
-                <div>
-                  <h1 className="text-3xl mb-2">Settings</h1>
-                  <p className="text-gray-400">Configure system preferences and security</p>
+              <div className="space-y-5">
+                <div className="flex items-start gap-3">
+                  <div className="mt-1 flex h-9 w-9 items-center justify-center rounded-lg bg-slate-500/20 text-slate-200">
+                    <Settings className="h-5 w-5" />
+                  </div>
+                  <div>
+                    <h1 className="text-3xl font-semibold leading-none text-white">Settings</h1>
+                    <p className="mt-2 text-sm text-slate-400">Manage admin console preferences and system behavior</p>
+                  </div>
                 </div>
 
-                <Tabs defaultValue="general" className="w-full">
-                  <TabsList className="bg-[#1E293B] border-white/10">
-                    <TabsTrigger value="general">General</TabsTrigger>
-                    <TabsTrigger value="notifications">Notifications</TabsTrigger>
-                    <TabsTrigger value="security">Security</TabsTrigger>
-                  </TabsList>
-
-                  <TabsContent value="general" className="space-y-4">
-                    <Card className="bg-[#1E293B] border-white/10 p-6">
-                      <h3 className="mb-4">General Settings</h3>
-                      <div className="space-y-4">
-                        <div className="space-y-2">
-                          <Label>Application Name</Label>
-                          <Input defaultValue="Sentinel AI" className="bg-[#0F172A] border-white/10" />
-                        </div>
-                        <div className="space-y-2">
-                          <Label>Base URL</Label>
-                          <Input defaultValue="https://sentinel-ai.company.com" className="bg-[#0F172A] border-white/10" />
-                        </div>
-                        <div className="space-y-2">
-                          <Label>Support Email</Label>
-                          <Input defaultValue="support@company.com" className="bg-[#0F172A] border-white/10" />
-                        </div>
-                        <Button className="bg-blue-500 hover:bg-blue-600" onClick={() => toast.success('Settings saved')}>
-                          Save Changes
-                        </Button>
+                <div className="grid gap-5">
+                  <div className="space-y-5">
+                    <Card className="border-blue-500/20 bg-gradient-to-br from-[#0B223A] to-[#11172B] p-6 shadow-[0_18px_54px_rgba(2,6,23,0.22)]">
+                      <div className="mb-6 flex items-center gap-3">
+                        <Globe className="h-5 w-5 text-cyan-300" />
+                        <h3 className="text-base font-semibold text-white">General Settings</h3>
                       </div>
-                    </Card>
-                  </TabsContent>
 
-                  <TabsContent value="notifications" className="space-y-4">
-                    <Card className="bg-[#1E293B] border-white/10 p-6">
-                      <h3 className="mb-4">Notification Preferences</h3>
-                      <div className="space-y-6">
-                        <div>
-                          <h4 className="mb-3">Admin Delivery Channels</h4>
-                          <div className="space-y-3">
-                            <div className="flex items-center justify-between">
-                              <div>
-                                <Label>Email</Label>
-                                <p className="text-sm text-gray-400">{adminIdentity.email || 'Admin email from the active session'}</p>
-                              </div>
-                              <Switch
-                                checked={notificationPreferences?.emailEnabled ?? true}
-                                onCheckedChange={(emailEnabled) => void updateNotificationPreferences({ emailEnabled })}
-                              />
-                            </div>
-                            <div className="flex items-center justify-between">
-                              <div>
-                                <Label>Telegram</Label>
-                                <p className="text-sm text-gray-400">Delivered through the configured Telegram bot.</p>
-                              </div>
-                              <Switch
-                                checked={notificationPreferences?.telegramEnabled ?? true}
-                                onCheckedChange={(telegramEnabled) => void updateNotificationPreferences({ telegramEnabled })}
-                              />
-                            </div>
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2">
-                              <div className="space-y-2">
-                                <Label>Telegram Chat ID</Label>
-                                <Input
-                                  value={notificationPreferences?.telegramChatId || ''}
-                                  onChange={(event) => void updateNotificationPreferences({ telegramChatId: event.target.value })}
-                                  placeholder="Admin or security channel chat ID"
-                                  className="bg-[#0F172A] border-white/10"
-                                />
-                                <p className="text-xs text-gray-400">Admin responder or security group/channel destination. Phone numbers are not used for Telegram delivery.</p>
-                              </div>
-                            </div>
+                      <div className="grid gap-4 md:grid-cols-2">
+                        <div className="space-y-2 md:col-span-2">
+                          <Label className="text-sm font-medium text-white">Application Name</Label>
+                          <Input
+                            value={systemSettings.general.applicationName}
+                            onChange={(event) => updateSystemSettings({ general: { applicationName: event.target.value } })}
+                            className="h-11 rounded-xl border-slate-500/70 bg-[#07111F] text-white"
+                          />
+                        </div>
+                      </div>
+
+                      <Button
+                        className="mt-5 bg-gradient-to-r from-blue-500 to-indigo-500 px-5 hover:from-blue-600 hover:to-indigo-600"
+                        disabled={systemSettingsLoading}
+                        onClick={() => void saveSystemSettings('general')}
+                      >
+                        Save Changes
+                      </Button>
+                    </Card>
+
+                    <Card className="border-blue-500/20 bg-gradient-to-br from-[#0B223A] to-[#11172B] p-6">
+                      <div className="mb-6 flex items-center gap-3">
+                        <Shield className="h-5 w-5 text-emerald-300" />
+                        <h3 className="text-base font-semibold text-white">Security Policies</h3>
+                      </div>
+
+                      <div className="space-y-5">
+                        <div className="flex items-center justify-between gap-4">
+                          <div>
+                            <Label className="text-white">Session Timeout</Label>
+                            <p className="text-sm text-slate-400">Automatically sign admins out after inactivity</p>
+                          </div>
+                          <Select
+                            value={String(systemSettings.security.sessionTimeoutMinutes)}
+                            onValueChange={(value) => updateSystemSettings({
+                              security: { sessionTimeoutMinutes: Number(value) },
+                            })}
+                          >
+                            <SelectTrigger className="w-32 rounded-xl border-slate-500/70 bg-[#07111F] text-white">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent className="bg-[#1E293B] border-white/10">
+                              <SelectItem value="15">15 min</SelectItem>
+                              <SelectItem value="30">30 min</SelectItem>
+                              <SelectItem value="60">60 min</SelectItem>
+                              <SelectItem value="120">120 min</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+
+                        <div className="grid gap-4 md:grid-cols-2">
+                          <div className="space-y-2">
+                            <Label className="text-white">Password Policy</Label>
+                            <Select
+                              value={systemSettings.security.passwordPolicy}
+                              onValueChange={(passwordPolicy: AdminSystemSettings['security']['passwordPolicy']) => updateSystemSettings({
+                                security: { passwordPolicy },
+                              })}
+                            >
+                              <SelectTrigger className="rounded-xl border-slate-500/70 bg-[#07111F] text-white">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent className="bg-[#1E293B] border-white/10">
+                                <SelectItem value="basic">Basic (8+ chars)</SelectItem>
+                                <SelectItem value="strong">Strong (12+ chars)</SelectItem>
+                                <SelectItem value="very-strong">Very Strong (16+ chars)</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
+
+                          <div className="space-y-2">
+                            <Label className="text-white">Allowed File Types</Label>
+                            <Textarea
+                              value={systemSettings.security.allowedFileTypes}
+                              onChange={(event) => updateSystemSettings({ security: { allowedFileTypes: event.target.value } })}
+                              className="min-h-11 rounded-xl border-slate-500/70 bg-[#07111F] text-white"
+                            />
                           </div>
                         </div>
-                        <div>
-                          <h4 className="mb-3">Routing Preferences</h4>
-                          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            <div className="space-y-2">
-                              <Label>Severity Filter</Label>
-                              <Select
-                                value={notificationPreferences?.severityFilter || 'medium-above'}
-                                onValueChange={(severityFilter: NotificationSettings['severityFilter']) => void updateNotificationPreferences({ severityFilter })}
-                              >
-                                <SelectTrigger className="bg-[#0F172A] border-white/10">
-                                  <SelectValue />
-                                </SelectTrigger>
-                                <SelectContent className="bg-[#1E293B] border-white/10">
-                                  <SelectItem value="critical">Critical only</SelectItem>
-                                  <SelectItem value="high-critical">High and Critical</SelectItem>
-                                  <SelectItem value="medium-above">Medium and above</SelectItem>
-                                  <SelectItem value="all">All alerts</SelectItem>
-                                </SelectContent>
-                              </Select>
-                            </div>
-                            <div className="space-y-2">
-                              <Label>Alert Frequency</Label>
-                              <Select
-                                value={notificationPreferences?.frequency || 'hourly'}
-                                onValueChange={(frequency: NotificationSettings['frequency']) => void updateNotificationPreferences({ frequency })}
-                              >
-                                <SelectTrigger className="bg-[#0F172A] border-white/10">
-                                  <SelectValue />
-                                </SelectTrigger>
-                                <SelectContent className="bg-[#1E293B] border-white/10">
-                                  <SelectItem value="instant">Instant</SelectItem>
-                                  <SelectItem value="15-minutes">Every 15 minutes</SelectItem>
-                                  <SelectItem value="hourly">Hourly digest</SelectItem>
-                                  <SelectItem value="daily">Daily summary</SelectItem>
-                                  <SelectItem value="weekly">Weekly report</SelectItem>
-                                </SelectContent>
-                              </Select>
-                            </div>
-                          </div>
-                        </div>
+
                         <Button
-                          className="bg-blue-500 hover:bg-blue-600"
-                          disabled={notificationPreferencesLoading || !notificationPreferences}
-                          onClick={saveAdminNotificationPreferences}
+                          className="bg-gradient-to-r from-blue-500 to-indigo-500 px-5 hover:from-blue-600 hover:to-indigo-600"
+                          disabled={systemSettingsLoading}
+                          onClick={() => void saveSystemSettings('security')}
                         >
                           Save Changes
                         </Button>
                       </div>
                     </Card>
-                  </TabsContent>
 
-                  <TabsContent value="security" className="space-y-4">
-                    <Card className="bg-[#1E293B] border-white/10 p-6">
-                      <h3 className="mb-4">Security Policies</h3>
-                      <div className="space-y-4">
-                        <div className="flex items-center justify-between">
-                          <div>
-                            <Label>Require 2FA for All Users</Label>
-                            <p className="text-sm text-gray-400">Enforce two-factor authentication</p>
-                          </div>
-                          <Switch defaultChecked />
-                        </div>
+                    <Card className="border-blue-500/20 bg-gradient-to-br from-[#0B223A] to-[#11172B] p-6">
+                      <div className="mb-6 flex items-center gap-3">
+                        <UserCog className="h-5 w-5 text-sky-300" />
+                        <h3 className="text-base font-semibold text-white">Profile Information</h3>
+                      </div>
+
+                      <div className="grid gap-4 md:grid-cols-2">
                         <div className="space-y-2">
-                          <Label>Session Timeout (minutes)</Label>
-                          <Input type="number" defaultValue="60" className="bg-[#0F172A] border-white/10" />
-                        </div>
-                        <div className="space-y-2">
-                          <Label>Password Policy</Label>
-                          <Select defaultValue="strong">
-                            <SelectTrigger className="bg-[#0F172A] border-white/10">
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent className="bg-[#1E293B] border-white/10">
-                              <SelectItem value="basic">Basic (8+ chars)</SelectItem>
-                              <SelectItem value="strong">Strong (12+ chars, mixed)</SelectItem>
-                              <SelectItem value="very-strong">Very Strong (16+ chars, complex)</SelectItem>
-                            </SelectContent>
-                          </Select>
-                        </div>
-                        <div className="space-y-2">
-                          <Label>Allowed File Types (File Vault)</Label>
-                          <Textarea
-                            defaultValue=".pdf, .doc, .docx, .txt, .zip"
-                            className="bg-[#0F172A] border-white/10"
+                          <Label className="text-sm font-medium text-white">Full Name</Label>
+                          <Input
+                            value={adminSettingsProfile.fullName}
+                            disabled={adminSettingsProfileLoading || adminSettingsProfileSaving}
+                            onChange={(event) => setAdminSettingsProfile((current) => ({
+                              ...current,
+                              fullName: event.target.value,
+                            }))}
+                            className="h-11 rounded-xl border-slate-500/70 bg-[#07111F] text-white"
                           />
                         </div>
-                        <Button className="bg-blue-500 hover:bg-blue-600" onClick={() => toast.success('Security settings saved')}>
-                          Save Changes
+
+                        <div className="space-y-2">
+                          <Label className="text-sm font-medium text-white">Email Address</Label>
+                          <Input
+                            value={adminSettingsProfile.email}
+                            readOnly
+                            disabled={adminSettingsProfileLoading}
+                            className="h-11 rounded-xl border-slate-500/70 bg-[#07111F] text-slate-300"
+                          />
+                        </div>
+
+                        <div className="space-y-2">
+                          <Label className="text-sm font-medium text-white">Job Title</Label>
+                          <Input
+                            value={adminSettingsProfile.jobTitle}
+                            disabled={adminSettingsProfileLoading || adminSettingsProfileSaving}
+                            onChange={(event) => setAdminSettingsProfile((current) => ({
+                              ...current,
+                              jobTitle: event.target.value,
+                            }))}
+                            className="h-11 rounded-xl border-slate-500/70 bg-[#07111F] text-white"
+                          />
+                        </div>
+
+                        <div className="space-y-2">
+                          <Label className="text-sm font-medium text-white">Company</Label>
+                          <Input
+                            value={adminSettingsProfile.company}
+                            disabled={adminSettingsProfileLoading || adminSettingsProfileSaving}
+                            onChange={(event) => setAdminSettingsProfile((current) => ({
+                              ...current,
+                              company: event.target.value,
+                            }))}
+                            className="h-11 rounded-xl border-slate-500/70 bg-[#07111F] text-white"
+                          />
+                        </div>
+                      </div>
+
+                      <Button
+                        className="mt-5 bg-gradient-to-r from-blue-500 to-indigo-500 px-5 hover:from-blue-600 hover:to-indigo-600"
+                        disabled={adminSettingsProfileLoading || adminSettingsProfileSaving}
+                        onClick={() => void saveAdminSettingsProfile()}
+                      >
+                        {adminSettingsProfileSaving ? 'Saving...' : 'Update Profile'}
+                      </Button>
+                    </Card>
+
+                    <Card className="border-blue-500/20 bg-gradient-to-br from-[#0B223A] to-[#11172B] p-6">
+                      <div className="mb-6 flex items-center gap-3">
+                        <Lock className="h-5 w-5 text-white" />
+                        <h3 className="text-base font-semibold text-white">Password Controls</h3>
+                      </div>
+
+                      <div className="space-y-4">
+                        <div className="space-y-2">
+                          <Label className="text-sm font-medium text-white">Current Password</Label>
+                          <Input
+                            type="password"
+                            value={adminSettingsPassword.currentPassword}
+                            disabled={adminSettingsPasswordSaving}
+                            onChange={(event) => updateAdminSettingsPassword({ currentPassword: event.target.value })}
+                            className="h-11 rounded-xl border-slate-500/70 bg-[#07111F] text-white"
+                          />
+                        </div>
+
+                        <div className="space-y-2">
+                          <Label className="text-sm font-medium text-white">New Password</Label>
+                          <Input
+                            type="password"
+                            value={adminSettingsPassword.newPassword}
+                            disabled={adminSettingsPasswordSaving}
+                            onChange={(event) => updateAdminSettingsPassword({ newPassword: event.target.value })}
+                            className="h-11 rounded-xl border-slate-500/70 bg-[#07111F] text-white"
+                          />
+                        </div>
+
+                        <div className="space-y-2">
+                          <Label className="text-sm font-medium text-white">Confirm New Password</Label>
+                          <Input
+                            type="password"
+                            value={adminSettingsPassword.confirmPassword}
+                            disabled={adminSettingsPasswordSaving}
+                            onChange={(event) => updateAdminSettingsPassword({ confirmPassword: event.target.value })}
+                            className="h-11 rounded-xl border-slate-500/70 bg-[#07111F] text-white"
+                          />
+                        </div>
+                      </div>
+
+                      <Button
+                        className="mt-5 bg-gradient-to-r from-blue-500 to-indigo-500 px-5 hover:from-blue-600 hover:to-indigo-600"
+                        disabled={adminSettingsPasswordSaving}
+                        onClick={() => void saveAdminSettingsPassword()}
+                      >
+                        {adminSettingsPasswordSaving ? 'Saving...' : 'Update Password'}
+                      </Button>
+                    </Card>
+
+                    <Card className="border-blue-500/20 bg-gradient-to-br from-[#0B223A] to-[#11172B] p-6">
+                      <div className="mb-6 flex items-center gap-3">
+                        <Bell className="h-5 w-5 text-yellow-300" />
+                        <h3 className="text-base font-semibold text-white">Notification Preferences</h3>
+                      </div>
+
+                      <div className="space-y-5">
+                        <div className="flex items-center justify-between gap-4">
+                          <div>
+                            <Label className="text-white">Email Alerts</Label>
+                            <p className="text-sm text-slate-400">Receive security alerts via email</p>
+                          </div>
+                          <Switch
+                            checked={adminSettingsNotificationPreferences.emailAlerts}
+                            disabled={
+                              adminSettingsNotificationPreferencesLoading
+                              || adminSettingsNotificationPreferencesSaving
+                            }
+                            onCheckedChange={(checked) => setAdminSettingsNotificationPreferences((current) => ({
+                              ...current,
+                              emailAlerts: checked,
+                            }))}
+                          />
+                        </div>
+
+                        <Button
+                          className="bg-gradient-to-r from-blue-500 to-indigo-500 px-5 hover:from-blue-600 hover:to-indigo-600"
+                          disabled={
+                            adminSettingsNotificationPreferencesLoading
+                            || adminSettingsNotificationPreferencesSaving
+                          }
+                          onClick={() => void saveAdminSettingsNotificationPreferences()}
+                        >
+                          {adminSettingsNotificationPreferencesSaving ? 'Saving...' : 'Save Changes'}
                         </Button>
                       </div>
                     </Card>
-                  </TabsContent>
-                </Tabs>
+                  </div>
+                </div>
               </div>
             )}
           </motion.div>
         </AnimatePresence>
       </div>
+
+      <Dialog open={Boolean(pendingRoleChange)} onOpenChange={(open) => {
+        if (!open && !roleChangeSaving) {
+          setPendingRoleChange(null);
+        }
+      }}>
+        <DialogContent className="bg-[#1E293B] border-white/10 text-white">
+          <DialogHeader>
+            <DialogTitle>Confirm role change</DialogTitle>
+            <DialogDescription className="text-gray-400">
+              Review the user and role assignment before saving this access change.
+            </DialogDescription>
+          </DialogHeader>
+          {pendingRoleChange && (
+            <div className="space-y-4">
+              <div className="rounded-xl border border-white/10 bg-[#0F172A] p-4">
+                <p className="text-sm font-medium text-white">{pendingRoleChange.user.name}</p>
+                <p className="mt-1 break-all text-sm text-slate-400">{pendingRoleChange.user.email}</p>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="rounded-xl border border-white/10 bg-black/20 p-4">
+                  <p className="text-xs uppercase tracking-[0.16em] text-slate-500">Current role</p>
+                  <p className="mt-2 text-sm font-semibold text-white">{pendingRoleChange.oldRole}</p>
+                </div>
+                <div className="rounded-xl border border-white/10 bg-black/20 p-4">
+                  <p className="text-xs uppercase tracking-[0.16em] text-slate-500">New role</p>
+                  <p className="mt-2 text-sm font-semibold text-white">{pendingRoleChange.newRole}</p>
+                </div>
+              </div>
+            </div>
+          )}
+          <DialogFooter>
+            <Button
+              variant="outline"
+              disabled={roleChangeSaving}
+              onClick={() => setPendingRoleChange(null)}
+            >
+              Cancel
+            </Button>
+            <Button
+              className="bg-blue-500 hover:bg-blue-600"
+              disabled={roleChangeSaving || !pendingRoleChange}
+              onClick={() => void confirmUserRoleChange()}
+            >
+              {roleChangeSaving ? 'Saving...' : 'Confirm Change'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* User Drawer */}
       <Sheet open={isUserDrawerOpen} onOpenChange={setIsUserDrawerOpen}>

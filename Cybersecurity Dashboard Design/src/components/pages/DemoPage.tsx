@@ -16,10 +16,12 @@ import {
 import { Button } from '../ui/button';
 import { Card } from '../ui/card';
 import { useLanguage } from '../../contexts/LanguageContext';
+import { useAppSettings } from '../../contexts/AppSettingsContext';
 
 export function DemoPage() {
   const navigate = useNavigate();
   const { language, isRtl } = useLanguage();
+  const { applicationName } = useAppSettings();
   const isArabic = language === 'arabic';
   const [isPlaying, setIsPlaying] = useState(false);
 
@@ -59,7 +61,7 @@ export function DemoPage() {
             <div className="flex items-center">
               <Shield className={`w-8 h-8 text-[#00D4FF] ${isRtl ? 'ml-3' : 'mr-3'}`} />
               <span className="text-2xl font-bold bg-gradient-to-r from-[#00D4FF] to-[#00FF94] bg-clip-text text-transparent">
-                Sentinel AI
+                {applicationName}
               </span>
             </div>
             <Button
@@ -94,7 +96,7 @@ export function DemoPage() {
               </div>
 
               <h1 className="text-4xl md:text-6xl font-bold mb-6 bg-gradient-to-r from-white via-[#00D4FF] to-[#00FF94] bg-clip-text text-transparent">
-                {isArabic ? 'شاهد Sentinel AI أثناء العمل' : 'See Sentinel AI in Action'}
+                {isArabic ? `شاهد ${applicationName} أثناء العمل` : `See ${applicationName} in Action`}
               </h1>
               
               <p className="text-xl md:text-2xl text-gray-300 mb-12 max-w-3xl mx-auto leading-relaxed">
@@ -188,8 +190,8 @@ export function DemoPage() {
               </h2>
               <p className="text-xl text-gray-300 max-w-3xl mx-auto">
                 {isArabic
-                  ? 'اطلع على نظرة شاملة لكيفية حماية Sentinel AI لعالمك الرقمي'
-                  : 'Get a comprehensive look at how Sentinel AI protects your digital world'}
+                  ? `اطلع على نظرة شاملة لكيفية حماية ${applicationName} لعالمك الرقمي`
+                  : `Get a comprehensive look at how ${applicationName} protects your digital world`}
               </p>
             </motion.div>
 
@@ -269,8 +271,8 @@ export function DemoPage() {
                       </h3>
                       <p className="text-gray-300">
                         {isArabic
-                          ? 'تعرّف كيف ينسجم Sentinel AI مع منظومة الأمان الحالية لديك'
-                          : 'Learn how Sentinel AI fits into your existing security stack'}
+                          ? `تعرّف كيف ينسجم ${applicationName} مع منظومة الأمان الحالية لديك`
+                          : `Learn how ${applicationName} fits into your existing security stack`}
                       </p>
                     </div>
                   </div>

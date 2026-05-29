@@ -26,6 +26,7 @@ import { NotificationCenter } from './NotificationCenter';
 import { toast } from 'sonner';
 import { initializeAudioContext } from '../utils/soundNotifications';
 import { useLanguage } from '../contexts/LanguageContext';
+import { useAppSettings } from '../contexts/AppSettingsContext';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -68,6 +69,7 @@ export function Layout({ children, hideChrome = false }: LayoutProps) {
   const location = useLocation();
   const isChatbotPage = location.pathname.startsWith('/chatbot');
   const { t, isRtl } = useLanguage();
+  const { applicationName } = useAppSettings();
   const [currentUser, setCurrentUser] = useState<{ full_name?: string; email?: string } | null>(null);
   const [isEmergencyDialogOpen, setIsEmergencyDialogOpen] = useState(false);
   const [isEmergencyActivating, setIsEmergencyActivating] = useState(false);
@@ -499,7 +501,7 @@ export function Layout({ children, hideChrome = false }: LayoutProps) {
                   <Shield className="w-6 h-6 text-white" />
                 </div>
                 <div>
-                  <h1 className="font-bold text-xl">Sentinel AI</h1>
+                  <h1 className="font-bold text-xl">{applicationName}</h1>
                   <p className="text-xs text-gray-400">{t('layout.brandSubtitle')}</p>
                 </div>
               </motion.div>

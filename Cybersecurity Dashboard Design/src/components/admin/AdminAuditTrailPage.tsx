@@ -30,7 +30,74 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '.
 const API_BASE_URL =
   import.meta.env.DEV ? '' : (import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000');
 
-type AuditStatus = 'success' | 'failed' | 'warning';
+function normalizeApiBase(value: string) {
+  return value.trim().replace(/\/+$/, '');
+}
+
+function pushAuditApiCandidate(candidates: string[], value: string) {
+  const normalized = normalizeApiBase(value);
+  if (value === '') {
+    if (!candidates.includes('')) candidates.push('');
+    return;
+  }
+  if (normalized && !candidates.includes(normalized)) {
+    candidates.push(normalized);
+  }
+}
+
+function auditApiCandidates() {
+  const candidates: string[] = [];
+  pushAuditApiCandidate(candidates, API_BASE_URL);
+  pushAuditApiCandidate(candidates, String(import.meta.env.VITE_API_BASE_URL || ''));
+
+  if (typeof window !== 'undefined') {
+    const { protocol, hostname } = window.location;
+    if (hostname) {
+      pushAuditApiCandidate(candidates, `${protocol}//${hostname}:5000`);
+      pushAuditApiCandidate(candidates, `http://${hostname}:5000`);
+    }
+  }
+
+  pushAuditApiCandidate(candidates, 'http://127.0.0.1:5000');
+  pushAuditApiCandidate(candidates, 'http://localhost:5000');
+  return candidates;
+}
+
+async function fetchAuditResponse(queryString: string, token: string | null) {
+  let lastError: unknown = null;
+  const isValidationLabFilter = new URLSearchParams(queryString).get('module') === 'validation_lab';
+
+  for (const base of auditApiCandidates()) {
+    try {
+      const response = await fetch(`${base}/api/admin/audit-logs?${queryString}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+      if (contentType.includes('text/html')) {
+        continue;
+      }
+      const payload = (await response.json().catch(() => ({}))) as Partial<AuditResponse> & {
+        message?: string;
+      };
+      if (!response.ok) {
+        throw new Error(payload.message || 'Audit trail could not be loaded. Please refresh or check the backend connection.');
+      }
+      const total = Number(payload.total ?? 0);
+      if (isValidationLabFilter && total === 0 && base === '' && auditApiCandidates().length > 1) {
+        continue;
+      }
+      return payload;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('Audit trail could not be loaded. Please refresh or check the backend connection.');
+}
+
+type AuditStatus = 'success' | 'failed' | 'warning' | 'skipped';
 type AuditSeverity = 'low' | 'medium' | 'high' | 'critical';
 
 interface AdminAuditItem {
@@ -41,6 +108,7 @@ interface AdminAuditItem {
   action_type: string;
   action_label: string;
   module: string;
+  module_label?: string;
   target_type: string;
   target_id: string;
   target_label: string;
@@ -67,6 +135,15 @@ interface AuditResponse {
   page: number;
   limit: number;
   summary: AuditSummary;
+  filter_options?: {
+    action_types?: AuditFilterOption[];
+    modules?: AuditFilterOption[];
+  };
+}
+
+interface AuditFilterOption {
+  value: string;
+  label: string;
 }
 
 const EMPTY_SUMMARY: AuditSummary = {
@@ -78,99 +155,83 @@ const EMPTY_SUMMARY: AuditSummary = {
   unique_admins: 0,
 };
 
-// Demo fallback only for local/demo sessions when the backend is empty or unavailable.
-const DEMO_AUDIT_ITEMS: AdminAuditItem[] = [
-  {
-    id: 'demo-1',
-    actor_name: 'Sarah Admin',
-    actor_email: 'sarah.admin@sentinel.local',
-    actor_role: 'Admin',
-    action_type: 'model_retrain_requested',
-    action_label: 'Requested model retraining',
-    module: 'AI Governance',
-    target_type: 'model',
-    target_id: '',
-    target_label: '',
-    status: 'warning',
-    severity: 'high',
-    ip_address: '10.10.12.8',
-    user_agent: 'Sentinel Admin Console',
-    metadata: { confidence_window: '30d', approval: 'manual_review' },
-    created_at: new Date(Date.now() - 8 * 60 * 1000).toISOString(),
-  },
-  {
-    id: 'demo-2',
-    actor_name: 'Ahmed Admin',
-    actor_email: 'ahmed.admin@sentinel.local',
-    actor_role: 'Admin',
-    action_type: 'report_exported',
-    action_label: 'Exported PCAP analysis report',
-    module: 'PCAP Analysis',
-    target_type: 'pcap_job',
-    target_id: '',
-    target_label: '',
-    status: 'success',
-    severity: 'high',
-    ip_address: '10.10.12.14',
-    user_agent: 'Sentinel Admin Console',
-    metadata: { export_type: 'report', format: 'json' },
-    created_at: new Date(Date.now() - 32 * 60 * 1000).toISOString(),
-  },
-  {
-    id: 'demo-3',
-    actor_name: 'Security Lead',
-    actor_email: 'lead@sentinel.local',
-    actor_role: 'Admin',
-    action_type: 'emergency_mode_enabled',
-    action_label: 'Enabled emergency mode',
-    module: 'Emergency Controls',
-    target_type: 'account',
-    target_id: '',
-    target_label: '',
-    status: 'success',
-    severity: 'critical',
-    ip_address: '10.10.10.5',
-    user_agent: 'Sentinel Admin Console',
-    metadata: { revoked_sessions: 3, protection_minutes: 30 },
-    created_at: new Date(Date.now() - 71 * 60 * 1000).toISOString(),
-  },
-  {
-    id: 'demo-4',
-    actor_name: 'Operations Admin',
-    actor_email: 'operations.admin@sentinel.local',
-    actor_role: 'Admin',
-    action_type: 'role_changed',
-    action_label: 'Changed user role from user to analyst',
-    module: 'Users & Roles',
-    target_type: 'user',
-    target_id: '',
-    target_label: '',
-    status: 'success',
-    severity: 'medium',
-    ip_address: '10.10.12.22',
-    user_agent: 'Sentinel Admin Console',
-    metadata: { previous_role: 'User', new_role: 'Analyst' },
-    created_at: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
-  },
-  {
-    id: 'demo-5',
-    actor_name: 'Sarah Admin',
-    actor_email: 'sarah.admin@sentinel.local',
-    actor_role: 'Admin',
-    action_type: 'alert_resolved',
-    action_label: 'Resolved high severity alert',
-    module: 'Threat Management',
-    target_type: 'alert',
-    target_id: '',
-    target_label: '',
-    status: 'success',
-    severity: 'high',
-    ip_address: '10.10.12.8',
-    user_agent: 'Sentinel Admin Console',
-    metadata: { resolution: 'false_positive_after_triage' },
-    created_at: new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString(),
-  },
+const REAL_ADMIN_MODULE_OPTIONS: AuditFilterOption[] = [
+  { value: 'admin_authentication', label: 'Admin Authentication' },
+  { value: 'users_roles', label: 'Users & Roles' },
+  { value: 'threat_management', label: 'Threat Management' },
+  { value: 'pcap_analysis', label: 'PCAP Analysis' },
+  { value: 'validation_lab', label: 'Validation Lab' },
+  { value: 'admin_audit', label: 'Admin Audit Trail' },
+  { value: 'notifications', label: 'Notifications' },
+  { value: 'reports_center', label: 'Reports Center' },
+  { value: 'settings', label: 'Settings' },
+  { value: 'password_checker', label: 'Password Checker' },
+  { value: 'file_vault', label: 'File Vault' },
+  { value: 'identity_leak', label: 'Identity Leak Monitor' },
 ];
+
+const MODULE_LABELS_BY_KEY: Record<string, string> = {
+  admin_authentication: 'Admin Authentication',
+  admin_auth: 'Admin Authentication',
+  authentication: 'Admin Authentication',
+  auth: 'Admin Authentication',
+  users_roles: 'Users & Roles',
+  users_and_roles: 'Users & Roles',
+  threat_management: 'Threat Management',
+  threats: 'Threat Management',
+  pcap_analysis: 'PCAP Analysis',
+  pcap_analyzer: 'PCAP Analysis',
+  pcap: 'PCAP Analysis',
+  validation_lab: 'Validation Lab',
+  security_validation_lab: 'Validation Lab',
+  security_lab: 'Validation Lab',
+  admin_audit: 'Admin Audit Trail',
+  admin_audit_trail: 'Admin Audit Trail',
+  audit: 'Admin Audit Trail',
+  notifications: 'Notifications',
+  reports_center: 'Reports Center',
+  reports_exports: 'Reports Center',
+  reports: 'Reports Center',
+  settings: 'Settings',
+  password_checker: 'Password Checker',
+  password: 'Password Checker',
+  file_vault: 'File Vault',
+  vault: 'File Vault',
+  encrypted_file_vault: 'File Vault',
+  identity_leak: 'Identity Leak Monitor',
+  identity: 'Identity Leak Monitor',
+  identity_monitor: 'Identity Leak Monitor',
+  identity_leak_monitor: 'Identity Leak Monitor',
+  osint_monitor: 'Identity Leak Monitor',
+};
+
+function normalizeModuleKey(value: string) {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+}
+
+function cleanReadableLabel(value: string) {
+  const cleaned = value.trim().replace(/[_-]+/g, ' ');
+  return cleaned ? cleaned.replace(/\b\w/g, (letter) => letter.toUpperCase()) : 'Unknown Module';
+}
+
+function getAuditModuleLabel(moduleValue: string, explicitLabel?: string) {
+  if (explicitLabel?.trim()) return explicitLabel.trim();
+  const key = normalizeModuleKey(moduleValue || '');
+  return MODULE_LABELS_BY_KEY[key] || cleanReadableLabel(moduleValue || '');
+}
+
+function normalizeFilterOptions(options: AuditFilterOption[] | undefined) {
+  const seen = new Set<string>();
+  return (options || [])
+    .filter((option) => option?.value?.trim())
+    .map((option) => ({ value: option.value.trim(), label: (option.label || option.value).trim() }))
+    .filter((option) => {
+      const key = option.value.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
 
 function getAdminInitials(name: string, email: string) {
   const source = name || email || 'Admin';
@@ -199,6 +260,7 @@ function formatRelativeTime(value: string | null) {
 function statusClass(status: string) {
   if (status === 'success') return 'border-emerald-400/40 bg-emerald-500/15 text-emerald-200';
   if (status === 'failed') return 'border-rose-400/40 bg-rose-500/15 text-rose-200';
+  if (status === 'skipped') return 'border-slate-400/40 bg-slate-500/15 text-slate-200';
   return 'border-amber-400/40 bg-amber-500/15 text-amber-200';
 }
 
@@ -210,7 +272,6 @@ function severityClass(severity: string) {
 }
 
 function moduleClass(module: string) {
-  if (module.includes('AI')) return 'border-purple-400/30 bg-purple-500/12 text-purple-100';
   if (module.includes('PCAP')) return 'border-cyan-400/30 bg-cyan-500/12 text-cyan-100';
   if (module.includes('Users')) return 'border-blue-400/30 bg-blue-500/12 text-blue-100';
   if (module.includes('Threat')) return 'border-orange-400/30 bg-orange-500/12 text-orange-100';
@@ -230,17 +291,6 @@ function buildSafeAuditEventJson(item: AdminAuditItem) {
   };
 }
 
-function buildSummaryFromItems(items: AdminAuditItem[]): AuditSummary {
-  return {
-    total_events: items.length,
-    successful_events: items.filter((item) => item.status === 'success').length,
-    failed_events: items.filter((item) => item.status === 'failed').length,
-    high_risk_events: items.filter((item) => item.severity === 'high' || item.severity === 'critical').length,
-    critical_events: items.filter((item) => item.severity === 'critical').length,
-    unique_admins: new Set(items.map((item) => item.actor_email || item.actor_name)).size,
-  };
-}
-
 export default function AdminAuditTrailPage() {
   const [items, setItems] = useState<AdminAuditItem[]>([]);
   const [summary, setSummary] = useState<AuditSummary>(EMPTY_SUMMARY);
@@ -249,7 +299,8 @@ export default function AdminAuditTrailPage() {
   const [loading, setLoading] = useState(true);
   const [exporting, setExporting] = useState(false);
   const [error, setError] = useState('');
-  const [isDemoFallback, setIsDemoFallback] = useState(false);
+  const [actionTypeOptions, setActionTypeOptions] = useState<AuditFilterOption[]>([]);
+  const [moduleOptions, setModuleOptions] = useState<AuditFilterOption[]>(REAL_ADMIN_MODULE_OPTIONS);
   const [page, setPage] = useState(1);
   const [total, setTotal] = useState(0);
   const [filters, setFilters] = useState({
@@ -278,39 +329,36 @@ export default function AdminAuditTrailPage() {
     setError('');
     const token = localStorage.getItem('sentinel_admin_token');
     try {
-      const response = await fetch(`${API_BASE_URL || ''}/api/admin/audit-logs?${queryString}`, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-      });
-      const payload = (await response.json().catch(() => ({}))) as Partial<AuditResponse> & {
-        message?: string;
-      };
-      if (!response.ok) {
-        throw new Error(payload.message || 'Audit trail could not be loaded. Please refresh or check the backend connection.');
-      }
+      const payload = await fetchAuditResponse(queryString, token);
       const nextItems = Array.isArray(payload.items) ? payload.items : [];
-      if (nextItems.length === 0 && page === 1) {
-        setItems(DEMO_AUDIT_ITEMS);
-        setSummary(buildSummaryFromItems(DEMO_AUDIT_ITEMS));
-        setTotal(DEMO_AUDIT_ITEMS.length);
-        setSelectedEvent(DEMO_AUDIT_ITEMS[0]);
-        setIsDemoFallback(true);
+      const nextActionOptions = normalizeFilterOptions(payload.filter_options?.action_types);
+      const nextModuleOptions = normalizeFilterOptions(payload.filter_options?.modules);
+      setActionTypeOptions(nextActionOptions.length ? nextActionOptions : normalizeFilterOptions(
+        nextItems.map((item) => ({ value: item.action_type, label: item.action_type.replaceAll('_', ' ') }))
+      ));
+      if (payload.filter_options) {
+        setModuleOptions(nextModuleOptions);
       } else {
-        setItems(nextItems);
-        setSummary(payload.summary || EMPTY_SUMMARY);
-        setTotal(Number(payload.total || nextItems.length));
-        setSelectedEvent((current) => current || nextItems[0] || null);
-        setIsDemoFallback(false);
+        setModuleOptions(REAL_ADMIN_MODULE_OPTIONS);
       }
+      setItems(nextItems);
+      setSummary(payload.summary || EMPTY_SUMMARY);
+      setTotal(Number(payload.total || nextItems.length));
+      setSelectedEvent((current) => nextItems.find((item) => item.id === current?.id) || nextItems[0] || null);
     } catch (loadError) {
       setError('Audit trail could not be loaded. Please refresh or check the backend connection.');
-      setItems(DEMO_AUDIT_ITEMS);
-      setSummary(buildSummaryFromItems(DEMO_AUDIT_ITEMS));
-      setTotal(DEMO_AUDIT_ITEMS.length);
-      setSelectedEvent(DEMO_AUDIT_ITEMS[0]);
-      setIsDemoFallback(true);
+      setItems([]);
+      setSummary(EMPTY_SUMMARY);
+      setTotal(0);
+      setSelectedEvent(null);
     } finally {
       setLoading(false);
     }
+  };
+
+  const refreshAuditLogs = async () => {
+    await loadAuditLogs();
+    toast.success('Audit trail refreshed');
   };
 
   useEffect(() => {
@@ -333,6 +381,24 @@ export default function AdminAuditTrailPage() {
   const pageCount = Math.max(1, Math.ceil(total / limit));
   const showingStart = total === 0 ? 0 : (page - 1) * limit + 1;
   const showingEnd = Math.min(page * limit, total);
+  const filterDefinitions: Array<{
+    key: 'action_type' | 'module' | 'status' | 'severity';
+    label: string;
+    options: AuditFilterOption[];
+  }> = [
+    { key: 'action_type', label: 'Action Type', options: actionTypeOptions },
+    { key: 'module', label: 'Module', options: moduleOptions },
+    {
+      key: 'status',
+      label: 'Status',
+      options: ['success', 'failed', 'warning', 'skipped'].map((value) => ({ value, label: value })),
+    },
+    {
+      key: 'severity',
+      label: 'Severity',
+      options: ['low', 'medium', 'high', 'critical'].map((value) => ({ value, label: value })),
+    },
+  ];
 
   const updateFilter = (key: keyof typeof filters, value: string) => {
     setPage(1);
@@ -397,7 +463,7 @@ export default function AdminAuditTrailPage() {
       </div>
       {[
         ['Action Details', selectedEvent.action_label, selectedEvent.action_type],
-        ['Event Scope', selectedEvent.target_type || selectedEvent.module || 'Admin event', selectedEvent.module || 'Security monitoring event'],
+        ['Event Scope', selectedEvent.target_type || getAuditModuleLabel(selectedEvent.module, selectedEvent.module_label) || 'Admin event', getAuditModuleLabel(selectedEvent.module, selectedEvent.module_label) || 'Security monitoring event'],
         ['Request Context', selectedEvent.ip_address || 'Unknown IP', selectedEvent.user_agent || 'No user agent recorded'],
         ['Timestamp', selectedEvent.created_at ? new Date(selectedEvent.created_at).toLocaleString() : 'Unknown', selectedEvent.actor_role],
       ].map(([label, primary, secondary]) => (
@@ -448,16 +514,28 @@ export default function AdminAuditTrailPage() {
               <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-cyan-200">Audit Command Center</p>
               <h1 className="mt-1 text-2xl font-semibold text-white">Admin Audit Trail</h1>
               <p className="mt-1 max-w-3xl text-sm leading-6 text-slate-300">
-                Track sensitive administrator actions, access changes, exports, emergency controls, and model governance events across the platform.
+                Track sensitive administrator actions, access changes, exports, emergency controls, and system events across the platform.
               </p>
             </div>
           </div>
           <div className="flex shrink-0 flex-wrap gap-2">
-            <Button variant="outline" className="h-10 gap-2 border-white/10 bg-white/5 px-3 text-white hover:bg-white/10" onClick={() => void loadAuditLogs()}>
+            <Button
+              type="button"
+              variant="outline"
+              className="h-10 gap-2 border-white/10 bg-white/5 px-3 text-white hover:bg-white/10"
+              onClick={() => void refreshAuditLogs()}
+              disabled={loading}
+            >
               <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
               Refresh Logs
             </Button>
-            <Button variant="outline" className="h-10 gap-2 border-cyan-400/30 bg-cyan-500/10 px-3 text-cyan-100 hover:bg-cyan-500/15" onClick={exportCsv} disabled={exporting}>
+            <Button
+              type="button"
+              variant="outline"
+              className="h-10 gap-2 border-cyan-400/30 bg-cyan-500/10 px-3 text-cyan-100 hover:bg-cyan-500/15"
+              onClick={exportCsv}
+              disabled={exporting || loading}
+            >
               <Download className="h-4 w-4" />
               Export CSV
             </Button>
@@ -504,7 +582,7 @@ export default function AdminAuditTrailPage() {
               <p className="text-sm text-slate-300">Focus by actor, action, module, severity, or date window.</p>
             </div>
           </div>
-          <Button variant="ghost" className="h-9 w-fit gap-2 text-slate-300 hover:text-white" onClick={clearFilters}>
+          <Button type="button" variant="ghost" className="h-9 w-fit gap-2 text-slate-300 hover:text-white" onClick={clearFilters}>
             <Sliders className="h-4 w-4" />
             Clear Filters
           </Button>
@@ -522,35 +600,43 @@ export default function AdminAuditTrailPage() {
               className="h-11 border-white/10 bg-[#0F172A] pl-10"
             />
           </div>
-          {[
-            ['action_type', 'Action Type', ['all', 'admin_login', 'admin_logout', 'role_changed', 'report_exported', 'settings_updated', 'model_retrain_requested', 'user_locked', 'user_unlocked', 'audit_logs_exported']],
-            ['module', 'Module', ['all', 'Admin Authentication', 'Users & Roles', 'Threat Management', 'PCAP Analysis', 'AI Governance', 'Admin Audit Trail']],
-            ['status', 'Status', ['all', 'success', 'failed', 'warning']],
-            ['severity', 'Severity', ['all', 'low', 'medium', 'high', 'critical']],
-          ].map(([key, label, options]) => (
-            <Select key={key as string} value={filters[key as keyof typeof filters]} onValueChange={(value) => updateFilter(key as keyof typeof filters, value)}>
+          {filterDefinitions.map(({ key, label, options }) => (
+            <Select key={key} value={filters[key]} onValueChange={(value) => updateFilter(key, value)}>
               <SelectTrigger className="h-11 border-white/10 bg-[#0F172A]">
-                <SelectValue placeholder={label as string} />
+                <SelectValue placeholder={label} />
               </SelectTrigger>
               <SelectContent className="border-white/10 bg-[#1E293B]">
-                {(options as string[]).map((option) => (
-                  <SelectItem key={option} value={option}>
-                    {option === 'all' ? `All ${label}` : option.replaceAll('_', ' ')}
+                <SelectItem value="all">{`All ${label}`}</SelectItem>
+                {options.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
           ))}
-          <Input type="date" value={filters.start_date} onChange={(event) => updateFilter('start_date', event.target.value)} className="h-11 border-white/10 bg-[#0F172A]" />
-          <Input type="date" value={filters.end_date} onChange={(event) => updateFilter('end_date', event.target.value)} className="h-11 border-white/10 bg-[#0F172A]" />
+          <div className="space-y-1">
+            <Label className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">Start date</Label>
+            <Input
+              type="date"
+              aria-label="Start date"
+              value={filters.start_date}
+              onChange={(event) => updateFilter('start_date', event.target.value)}
+              className="h-11 border-white/10 bg-[#0F172A]"
+            />
+          </div>
+          <div className="space-y-1">
+            <Label className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">End date</Label>
+            <Input
+              type="date"
+              aria-label="End date"
+              value={filters.end_date}
+              onChange={(event) => updateFilter('end_date', event.target.value)}
+              className="h-11 border-white/10 bg-[#0F172A]"
+            />
+          </div>
         </div>
       </Card>
-
-      {isDemoFallback && (
-        <div className="rounded-2xl border border-amber-400/25 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
-          Showing safe demo fallback audit events until live admin audit data is available.
-        </div>
-      )}
 
       <div className="grid grid-cols-1 gap-6 2xl:grid-cols-[minmax(0,1fr)_380px]">
         <Card className="overflow-hidden border-slate-700/80 bg-[#101827] shadow-[0_24px_70px_rgba(2,6,23,0.28)]">
@@ -563,10 +649,10 @@ export default function AdminAuditTrailPage() {
           </div>
           {loading ? (
             <div className="p-8 text-sm text-slate-300">Loading admin audit trail...</div>
-          ) : error && !isDemoFallback ? (
+          ) : error ? (
             <div className="p-8 text-sm text-rose-200">Audit trail could not be loaded. Please refresh or check the backend connection.</div>
           ) : items.length === 0 ? (
-            <div className="p-8 text-sm text-slate-300">No admin actions found for the selected filters.</div>
+            <div className="p-8 text-sm text-slate-300">No audit activity found for the selected filters.</div>
           ) : (
             <div className="overflow-x-auto px-4">
               <Table className="min-w-[980px] table-fixed">
@@ -613,7 +699,9 @@ export default function AdminAuditTrailPage() {
                         </div>
                       </TableCell>
                       <TableCell className="px-4 py-5 align-top">
-                        <Badge className={moduleClass(item.module)}>{item.module}</Badge>
+                        <Badge className={moduleClass(getAuditModuleLabel(item.module, item.module_label))}>
+                          {getAuditModuleLabel(item.module, item.module_label)}
+                        </Badge>
                       </TableCell>
                       <TableCell className="px-4 py-5 align-top">
                         <Badge className={statusClass(item.status)}>{item.status}</Badge>
@@ -636,13 +724,13 @@ export default function AdminAuditTrailPage() {
               Showing {showingStart} to {showingEnd} of {total} events
             </p>
             <div className="flex items-center gap-2">
-              <Button size="sm" variant="outline" disabled={page <= 1 || isDemoFallback} onClick={() => setPage((current) => Math.max(1, current - 1))}>
+              <Button size="sm" variant="outline" disabled={page <= 1} onClick={() => setPage((current) => Math.max(1, current - 1))}>
                 Previous
               </Button>
               <Badge className="border border-white/10 bg-white/5 text-slate-200">
                 Page {page} of {pageCount}
               </Badge>
-              <Button size="sm" variant="outline" disabled={page >= pageCount || isDemoFallback} onClick={() => setPage((current) => Math.min(pageCount, current + 1))}>
+              <Button size="sm" variant="outline" disabled={page >= pageCount} onClick={() => setPage((current) => Math.min(pageCount, current + 1))}>
                 Next
               </Button>
             </div>

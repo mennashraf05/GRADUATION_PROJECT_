@@ -17,6 +17,7 @@ import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import { Textarea } from '../ui/textarea';
 import { useLanguage } from '../../contexts/LanguageContext';
+import { useAppSettings } from '../../contexts/AppSettingsContext';
 
 const API_BASE_URL =
   import.meta.env.DEV ? '' : (import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000');
@@ -72,6 +73,7 @@ function validateForm(form: ContactForm): ContactErrors {
 
 export function ContactPage() {
   const { language, isRtl } = useLanguage();
+  const { applicationName } = useAppSettings();
   const navigate = useNavigate();
   const [formData, setFormData] = useState<ContactForm>(initialForm);
   const [errors, setErrors] = useState<ContactErrors>({});
@@ -166,12 +168,12 @@ export function ContactPage() {
 
       <nav className="sticky top-0 z-50 border-b border-white/10 bg-[#07111F]/88 backdrop-blur-xl">
         <div className="contact-container contact-navbar py-3">
-          <button onClick={() => navigate('/')} className="contact-brand rounded-xl focus:outline-none focus:ring-2 focus:ring-cyan-300/70" aria-label="Go to Sentinel AI home">
+          <button onClick={() => navigate('/')} className="contact-brand rounded-xl focus:outline-none focus:ring-2 focus:ring-cyan-300/70" aria-label={`Go to ${applicationName} home`}>
             <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-cyan-500 to-blue-600 shadow-lg shadow-cyan-500/20">
               <Shield className="h-6 w-6" />
             </span>
             <span className="bg-gradient-to-r from-cyan-300 to-blue-300 bg-clip-text text-xl font-semibold text-transparent">
-              Sentinel AI
+              {applicationName}
             </span>
           </button>
 
@@ -198,10 +200,10 @@ export function ContactPage() {
         <section className="contact-container contact-hero">
           <div className="contact-badge">
             <ShieldCheck className="h-4 w-4" />
-            Sentinel AI Support
+            {applicationName} Support
           </div>
           <h1 className="mt-5 text-4xl font-semibold leading-tight tracking-normal sm:text-5xl lg:text-[3.35rem]">
-            Contact Sentinel AI Support
+            Contact {applicationName} Support
           </h1>
           <p className="mx-auto mt-4 max-w-2xl text-lg leading-8 text-slate-300">
             Send a safe support request and our team will review it without asking for secrets or sensitive evidence.

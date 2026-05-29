@@ -22,6 +22,7 @@ from activity_logs import (
     STATUS_INFO,
     SEVERITY_LOW,
     SEVERITY_MEDIUM,
+    SEVERITY_HIGH,
     UserEventPayload,
     log_user_activity,
 )
@@ -75,6 +76,14 @@ def log_vault_event(
     doc=None,
     metadata=None,
 ):
+    forwarded_for = str(request.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+    ip_address = forwarded_for or str(request.remote_addr or "").strip()
+    safe_metadata = {}
+    for key, value in (metadata or {}).items():
+        clean_key = str(key or "")
+        if any(fragment in clean_key.lower() for fragment in ("hash", "salt", "key", "stored_filename", "path")):
+            continue
+        safe_metadata[clean_key] = value
     try:
         log_user_activity(UserEventPayload(
             user_id=user_id,
@@ -87,7 +96,8 @@ def log_vault_event(
             target_type="vault_document" if doc else None,
             target_id=str(doc.id) if doc else None,
             target_label=doc.filename if doc else None,
-            metadata_json=metadata or {},
+            ip_address=ip_address[:64] or None,
+            metadata_json=safe_metadata,
         ))
     except Exception:
         current_app.logger.exception("Failed to write vault activity log")
@@ -191,10 +201,27 @@ def sanitize_filename(name: str) -> str:
 
 
 def allowed_file(filename: str) -> bool:
+    allowed_extensions = get_allowed_extensions()
     if "." not in filename:
-        return True
+        return "" in allowed_extensions
     ext = filename.rsplit(".", 1)[1].lower()
-    return ext in ALLOWED_EXTENSIONS
+    return ext in allowed_extensions
+
+
+def get_allowed_extensions() -> set[str]:
+    getter = current_app.extensions.get("get_admin_allowed_file_extensions")
+    if callable(getter):
+        try:
+            configured = {
+                str(item or "").strip().lower().lstrip(".")
+                for item in getter()
+                if str(item or "").strip()
+            }
+            if configured:
+                return configured
+        except Exception:
+            current_app.logger.exception("Failed to load admin File Vault extension policy")
+    return set(ALLOWED_EXTENSIONS)
 
 
 def calculate_file_hash(data: bytes) -> str:
@@ -269,7 +296,8 @@ def upload_document():
 
     raw_filename = file.filename.strip()
 
-    validation = validate_vault_upload(file, raw_filename, ALLOWED_EXTENSIONS)
+    allowed_extensions = get_allowed_extensions()
+    validation = validate_vault_upload(file, raw_filename, allowed_extensions)
     if not validation.get("ok"):
         current_app.logger.warning(
             "Rejected File Vault upload | reason=%s",
@@ -348,13 +376,25 @@ def upload_document():
         title="Vault file uploaded",
         description=f"Uploaded encrypted file: {doc.filename}",
         status=STATUS_SUCCESS,
-        severity=SEVERITY_LOW,
+        severity=SEVERITY_MEDIUM,
         doc=doc,
         metadata={
             "filename": doc.filename,
-            "stored_filename": doc.stored_filename,
             "size_bytes": size,
-            "file_hash": doc.file_hash,
+            "offline_enabled": bool(doc.offline_enabled),
+        },
+    )
+    log_vault_event(
+        user_id=user.id,
+        action_type="vault_file_encrypted",
+        title="Vault file encrypted",
+        description=f"File encryption completed for: {doc.filename}",
+        status=STATUS_SUCCESS,
+        severity=SEVERITY_MEDIUM,
+        doc=doc,
+        metadata={
+            "filename": doc.filename,
+            "size_bytes": size,
             "offline_enabled": bool(doc.offline_enabled),
         },
     )
@@ -393,6 +433,16 @@ def toggle_offline_access(doc_id):
     doc = VaultDocument.query.get_or_404(doc_id)
 
     if doc.user_id != user.id:
+        log_vault_event(
+            user_id=user.id,
+            action_type="vault_access_denied",
+            title="Vault access denied",
+            description="A vault document access request was denied.",
+            status=STATUS_FAILED,
+            severity=SEVERITY_HIGH,
+            doc=doc,
+            metadata={"operation": "toggle_offline", "document_id": doc_id},
+        )
         abort(403)
 
     data = request.get_json(silent=True) or {}
@@ -418,7 +468,6 @@ def toggle_offline_access(doc_id):
         doc=doc,
         metadata={
             "filename": doc.filename,
-            "file_hash": doc.file_hash,
             "offline_enabled": bool(doc.offline_enabled),
             "previous_offline_enabled": previous_enabled,
         },
@@ -455,6 +504,16 @@ def verify_document_integrity(doc_id):
     doc = VaultDocument.query.get_or_404(doc_id)
 
     if doc.user_id != user.id:
+        log_vault_event(
+            user_id=user.id,
+            action_type="vault_access_denied",
+            title="Vault access denied",
+            description="A vault integrity verification request was denied.",
+            status=STATUS_FAILED,
+            severity=SEVERITY_HIGH,
+            doc=doc,
+            metadata={"operation": "verify_integrity", "document_id": doc_id},
+        )
         abort(403)
 
     upload_dir = get_upload_dir()
@@ -514,9 +573,7 @@ def verify_document_integrity(doc_id):
             severity=SEVERITY_MEDIUM,
             doc=doc,
             metadata={
-                "filename": doc.filename,
-                "stored_hash": doc.file_hash,
-                "calculated_hash": current_hash,
+            "filename": doc.filename,
             },
         )
         return jsonify({"error": "Integrity check failed"}), 409
@@ -532,7 +589,6 @@ def verify_document_integrity(doc_id):
         metadata={
             "filename": doc.filename,
             "size_bytes": len(decrypted),
-            "file_hash": doc.file_hash,
             "offline_enabled": bool(doc.offline_enabled),
         },
     )
@@ -568,6 +624,16 @@ def download_document(doc_id):
     doc = VaultDocument.query.get_or_404(doc_id)
 
     if doc.user_id != user.id:
+        log_vault_event(
+            user_id=user.id,
+            action_type="vault_access_denied",
+            title="Vault access denied",
+            description="A vault download request was denied.",
+            status=STATUS_FAILED,
+            severity=SEVERITY_HIGH,
+            doc=doc,
+            metadata={"operation": "download", "document_id": doc_id},
+        )
         abort(403)
 
     upload_dir = get_upload_dir()
@@ -606,7 +672,7 @@ def download_document(doc_id):
             title="Wrong vault password attempt",
             description=f"Wrong password while downloading: {doc.filename}",
             status=STATUS_FAILED,
-            severity=SEVERITY_MEDIUM,
+            severity=SEVERITY_HIGH,
             doc=doc,
             metadata={
                 "operation": "download",
@@ -616,6 +682,16 @@ def download_document(doc_id):
         return jsonify({"error": "Wrong encryption password"}), 403
 
     if calculate_file_hash(decrypted) != doc.file_hash:
+        log_vault_event(
+            user_id=user.id,
+            action_type="vault_integrity_failed",
+            title="Vault integrity check failed",
+            description=f"Integrity check failed while downloading: {doc.filename}",
+            status=STATUS_FAILED,
+            severity=SEVERITY_HIGH,
+            doc=doc,
+            metadata={"operation": "download", "filename": doc.filename},
+        )
         return jsonify({"error": "Integrity check failed"}), 409
 
     log_vault_event(
@@ -682,6 +758,16 @@ def delete_document(doc_id):
     doc = VaultDocument.query.get_or_404(doc_id)
 
     if doc.user_id != user.id:
+        log_vault_event(
+            user_id=user.id,
+            action_type="vault_access_denied",
+            title="Vault access denied",
+            description="A vault delete request was denied.",
+            status=STATUS_FAILED,
+            severity=SEVERITY_HIGH,
+            doc=doc,
+            metadata={"operation": "delete", "document_id": doc_id},
+        )
         abort(403)
 
     upload_dir = get_upload_dir()
@@ -720,7 +806,7 @@ def delete_document(doc_id):
             title="Wrong vault password attempt",
             description=f"Wrong password while deleting: {doc.filename}",
             status=STATUS_FAILED,
-            severity=SEVERITY_MEDIUM,
+            severity=SEVERITY_HIGH,
             doc=doc,
             metadata={
                 "operation": "delete",
@@ -730,6 +816,16 @@ def delete_document(doc_id):
         return jsonify({"error": "Wrong encryption password"}), 403
 
     if calculate_file_hash(decrypted) != doc.file_hash:
+        log_vault_event(
+            user_id=user.id,
+            action_type="vault_integrity_failed",
+            title="Vault integrity check failed",
+            description=f"Integrity check failed while deleting: {doc.filename}",
+            status=STATUS_FAILED,
+            severity=SEVERITY_HIGH,
+            doc=doc,
+            metadata={"operation": "delete", "filename": doc.filename},
+        )
         return jsonify({"error": "Integrity check failed"}), 409
 
     deleted_filename = doc.filename
@@ -740,6 +836,16 @@ def delete_document(doc_id):
     try:
         stored_path.unlink()
     except Exception as e:
+        log_vault_event(
+            user_id=user.id,
+            action_type="vault_operation_failed",
+            title="Vault operation failed",
+            description=f"Vault file deletion failed for: {doc.filename}",
+            status=STATUS_FAILED,
+            severity=SEVERITY_MEDIUM,
+            doc=doc,
+            metadata={"operation": "delete", "filename": doc.filename},
+        )
         return safe_error_response(
             public_message="Unable to delete the file right now.",
             error_code="vault_delete_failed",
@@ -751,23 +857,20 @@ def delete_document(doc_id):
     db.session.delete(doc)
     db.session.commit()
 
-    log_user_activity(UserEventPayload(
+    log_vault_event(
         user_id=user.id,
-        module=MODULE_VAULT,
         action_type="vault_file_deleted",
         title="Vault file deleted",
         description=f"Deleted encrypted file: {deleted_filename}",
         status=STATUS_SUCCESS,
-        severity=SEVERITY_LOW,
-        target_type="vault_document",
-        target_id=str(deleted_doc_id),
-        target_label=deleted_filename,
-        metadata_json={
+        severity=SEVERITY_HIGH,
+        metadata={
+            "document_id": deleted_doc_id,
             "filename": deleted_filename,
             "size_bytes": deleted_size,
             "offline_enabled": was_offline,
         },
-    ))
+    )
 
     return jsonify({
         "message": "File deleted successfully",

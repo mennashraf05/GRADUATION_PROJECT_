@@ -4,6 +4,7 @@ import { Shield, Mail, Lock, KeyRound, ArrowLeft, CheckCircle, XCircle } from "l
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Input } from "../ui/input";
 import { Button } from "../ui/button";
+import { useAppSettings } from "../../contexts/AppSettingsContext";
 
 const API_BASE_URL =
   import.meta.env.DEV ? "" : (import.meta.env.VITE_API_BASE_URL || "http://localhost:5000");
@@ -20,6 +21,7 @@ type InvitationDetails = {
 export default function AcceptInvitationPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
+  const { applicationName } = useAppSettings();
   const token = searchParams.get("token") || "";
 
   const [invitation, setInvitation] = useState<InvitationDetails | null>(null);
@@ -186,7 +188,7 @@ export default function AcceptInvitationPage() {
           <div>
             <h1 className="text-3xl font-semibold tracking-tight">Complete your invitation</h1>
             <p className="mt-2 max-w-xl text-sm leading-7 text-slate-400">
-              Finish your Sentinel AI account setup by choosing your password
+              Finish your {applicationName} account setup by choosing your password
               {invitation?.requireTwoFactor ? " and enabling 2FA" : ""}.
             </p>
           </div>

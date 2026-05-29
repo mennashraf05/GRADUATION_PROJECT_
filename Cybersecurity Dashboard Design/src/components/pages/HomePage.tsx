@@ -27,9 +27,11 @@ import {
 import { Button } from '../ui/button';
 import { Card } from '../ui/card';
 import { useLanguage } from '../../contexts/LanguageContext';
+import { useAppSettings } from '../../contexts/AppSettingsContext';
 
 export function HomePage() {
   const { language, isRtl } = useLanguage();
+  const { applicationName } = useAppSettings();
   const navigate = useNavigate();
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
@@ -175,7 +177,7 @@ export function HomePage() {
             <button onClick={() => navigate('/')} className="flex items-center">
               <Shield className={`h-8 w-8 text-[#00D4FF] ${isRtl ? 'ml-3' : 'mr-3'}`} />
               <span className="bg-gradient-to-r from-[#00D4FF] to-[#00FF94] bg-clip-text text-2xl font-bold text-transparent">
-                Sentinel AI
+                {applicationName}
               </span>
             </button>
 
@@ -321,7 +323,7 @@ export function HomePage() {
             </motion.div>
 
             <h1 className="mb-6 bg-gradient-to-r from-white via-[#00D4FF] to-[#00FF94] bg-clip-text text-5xl font-bold text-transparent md:text-7xl">
-              Protect Your Digital World with Sentinel AI
+              Protect Your Digital World with {applicationName}
             </h1>
 
             <p className="mx-auto mb-12 max-w-4xl text-xl leading-relaxed text-gray-300 md:text-2xl">
@@ -469,7 +471,7 @@ export function HomePage() {
         <div className="container mx-auto max-w-6xl">
           <motion.div initial={{ opacity: 0, y: 30 }} whileInView={{ opacity: 1, y: 0 }} transition={{ duration: 0.8 }} viewport={{ once: true }} className="mb-16 text-center">
             <h2 className="mb-6 bg-gradient-to-r from-white to-[#A855F7] bg-clip-text text-4xl font-bold text-transparent md:text-5xl">
-              Why Choose Sentinel AI
+              Why Choose {applicationName}
             </h2>
             <p className="mx-auto max-w-3xl text-xl text-gray-300">
               Designed for academic demonstration, security awareness, and practical cybersecurity workflows.
@@ -543,7 +545,7 @@ export function HomePage() {
             <div className="absolute inset-0 bg-gradient-to-r from-[#00D4FF]/10 via-transparent to-[#00FF94]/10" />
             <div className="relative z-10">
               <h2 className="mb-6 bg-gradient-to-r from-white via-[#00D4FF] to-[#00FF94] bg-clip-text text-4xl font-bold text-transparent md:text-5xl">
-                Ready to Explore Sentinel AI?
+                Ready to Explore {applicationName}?
               </h2>
               <p className="mx-auto mb-10 max-w-2xl text-xl text-gray-300">
                 Start checking passwords, learning phishing safety, reviewing identity exposure, and exploring privacy-safe security reports.
@@ -610,10 +612,10 @@ export function HomePage() {
                 <Shield className="mr-3 h-8 w-8 text-[#00D4FF]" />
                 <div>
                   <span className="bg-gradient-to-r from-[#00D4FF] to-[#00FF94] bg-clip-text text-2xl font-bold text-transparent">
-                    Sentinel AI
+                    {applicationName}
                   </span>
                   <p className="mt-1 text-sm text-gray-400">
-                    © 2025 Sentinel AI. Graduation project cybersecurity platform.
+                    © 2025 {applicationName}. Graduation project cybersecurity platform.
                   </p>
                 </div>
               </div>

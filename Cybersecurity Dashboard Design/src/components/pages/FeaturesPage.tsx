@@ -3,9 +3,11 @@ import { useNavigate } from 'react-router-dom';
 import { Shield, Lock, FileText, Eye, ArrowRight, Zap, Bell, CheckCircle, Network } from 'lucide-react';
 import { Button } from '../ui/button';
 import { useLanguage } from '../../contexts/LanguageContext';
+import { useAppSettings } from '../../contexts/AppSettingsContext';
 
 export function FeaturesPage() {
   const { language, isRtl } = useLanguage();
+  const { applicationName } = useAppSettings();
   const navigate = useNavigate();
   const features = [
     {
@@ -103,7 +105,7 @@ export function FeaturesPage() {
                 <Shield className="w-6 h-6 text-white" />
               </div>
               <span className="text-xl bg-gradient-to-r from-blue-400 to-green-400 bg-clip-text text-transparent">
-                Sentinel AI
+                {applicationName}
               </span>
             </button>
             <div className="flex items-center gap-4">
@@ -164,7 +166,7 @@ export function FeaturesPage() {
       <div className="relative pt-32 pb-20 px-6">
         <div className="max-w-7xl mx-auto text-center">
           <h1 className="text-5xl md:text-6xl lg:text-7xl mb-6 bg-gradient-to-r from-white via-blue-100 to-green-100 bg-clip-text text-transparent">
-            {language === 'arabic' ? 'استكشف مزايا Sentinel AI' : 'Explore Sentinel AI Features'}
+            {language === 'arabic' ? `استكشف مزايا ${applicationName}` : `Explore ${applicationName} Features`}
           </h1>
           <p className="text-xl md:text-2xl text-gray-400 max-w-3xl mx-auto">
             {language === 'arabic' ? 'أدوات مدعومة بالذكاء الاصطناعي لحماية بياناتك وهويتك.' : 'AI-powered tools to protect your data and identity.'}
@@ -239,7 +241,7 @@ export function FeaturesPage() {
       <div className="relative max-w-7xl mx-auto px-6 pb-32">
         <div className="text-center mb-16">
           <h2 className="text-4xl md:text-5xl mb-4 text-white">
-            {language === 'arabic' ? 'لماذا Sentinel AI؟' : 'Why Sentinel AI?'}
+            {language === 'arabic' ? `لماذا ${applicationName}؟` : `Why ${applicationName}?`}
           </h2>
           <div className="h-1 w-24 bg-gradient-to-r from-blue-500 to-green-500 rounded-full mx-auto" />
         </div>
@@ -287,7 +289,7 @@ export function FeaturesPage() {
       <footer className="relative border-t border-gray-800 bg-[#0F172A]">
         <div className="max-w-7xl mx-auto px-6 py-12">
           <div className="text-center text-gray-400">
-            <p>© 2025 Sentinel AI – All Rights Reserved.</p>
+            <p>© 2025 {applicationName} - All Rights Reserved.</p>
           </div>
         </div>
       </footer>

@@ -8,6 +8,7 @@ import { Checkbox } from '../ui/checkbox';
 import { Button } from '../ui/button';
 import { CheckedState } from '@radix-ui/react-checkbox';
 import { useLanguage } from '../../contexts/LanguageContext';
+import { useAppSettings } from '../../contexts/AppSettingsContext';
 import {
   Eye,
   EyeOff,
@@ -31,6 +32,7 @@ const API_BASE_URL =
 export function SignUpPage() {
   const navigate = useNavigate();
   const { language, isRtl } = useLanguage();
+  const { applicationName } = useAppSettings();
   const isArabic = language === 'arabic';
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
@@ -330,7 +332,7 @@ export function SignUpPage() {
             animate={{ y: 0, opacity: 1 }}
             transition={{ delay: 0.3 }}
           >
-            {isArabic ? 'مرحبًا بك في Sentinel AI!' : 'Welcome to Sentinel AI!'}
+            {isArabic ? `مرحبًا بك في ${applicationName}!` : `Welcome to ${applicationName}!`}
           </motion.h3>
 
           <motion.p
@@ -533,7 +535,7 @@ export function SignUpPage() {
               transition={{ delay: 0.7 }}
               className="text-5xl font-bold mb-4 bg-gradient-to-r from-white via-[#64FFDA] to-[#3B82F6] bg-clip-text text-transparent"
             >
-              Sentinel AI
+              {applicationName}
             </motion.h1>
 
             {/* Tagline */}
@@ -654,8 +656,8 @@ export function SignUpPage() {
                   className="text-gray-400"
                 >
                   {isArabic
-                    ? 'انضم إلى Sentinel AI للحصول على حماية سيبرانية متقدمة'
-                    : 'Join Sentinel AI for advanced cybersecurity protection'}
+                    ? `انضم إلى ${applicationName} للحصول على حماية سيبرانية متقدمة`
+                    : `Join ${applicationName} for advanced cybersecurity protection`}
                 </motion.p>
               </div>
 

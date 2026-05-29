@@ -154,6 +154,7 @@ from activity_logs import (
     MODULE_AI,
     MODULE_IDENTITY,
     MODULE_PASSWORD,
+    MODULE_SETTINGS,
     STATUS_FAILED,
     STATUS_INFO,
     STATUS_SUCCESS,
@@ -175,6 +176,7 @@ from activity_logs import (
     normalize_status as normalize_activity_status,
     safe_metadata as safe_activity_metadata,
     safe_str as safe_activity_str,
+    should_skip_recent_passive_audit,
 )
 from llm_providers.ollama_provider import (
     check_ollama_status,
@@ -6909,9 +6911,175 @@ def _admin_notification_item(
         "body": message,
         "job_id": job_id,
         "metadata": _sanitize_for_json(metadata_payload),
+        "module": metadata_payload.get("module") if isinstance(metadata_payload, dict) else None,
+        "action_url": metadata_payload.get("action_url") if isinstance(metadata_payload, dict) else None,
         "is_read": key in read_keys,
         "created_at": created_at_value,
     }
+
+
+ADMIN_NOTIFICATION_AUDIT_EXCLUDED_ACTIONS = {
+    "notification_marked_read",
+    "audit_trail_viewed",
+}
+
+
+def _admin_notification_severity_from_audit(status: object, severity: object) -> str:
+    status_value = str(status or "").strip().lower()
+    severity_value = str(severity or "").strip().lower()
+    if status_value == "failed":
+        return "error"
+    if severity_value == "critical":
+        return "critical"
+    if severity_value == "high":
+        return "warning"
+    if severity_value in {"medium", "warning"}:
+        return "warning"
+    if severity_value == "low":
+        return "info"
+    return "info"
+
+
+def _admin_notification_action_url(module_key: str, *, target_id: object = None, metadata: dict | None = None) -> str:
+    metadata = metadata if isinstance(metadata, dict) else {}
+    metadata_url = str(metadata.get("action_url") or "").strip()
+    if metadata_url:
+        return metadata_url
+
+    if module_key == "users_roles":
+        return "/admin/console?section=users"
+    if module_key == "threat_management":
+        return "/admin/console?section=alerts"
+    if module_key == "pcap_analysis":
+        job_id = str(metadata.get("job_id") or target_id or "").strip()
+        if job_id:
+            return f"/admin/console?section=pcap-analysis&job={quote(job_id)}"
+        return "/admin/console?section=pcap-analysis"
+    if module_key == "validation_lab":
+        return "/admin/console?section=security-lab"
+    if module_key in {"admin_audit", "admin_audit_trail"}:
+        return "/admin/console?section=audit-logs"
+    if module_key == "notifications":
+        return "/admin/console?section=notifications"
+    if module_key == "reports_center":
+        return "/admin/console?section=reports"
+    if module_key == "settings":
+        return "/admin/console?section=settings"
+    if module_key == "password_checker":
+        return "/admin/console?section=audit-logs&module=password_checker"
+    if module_key == "file_vault":
+        return "/admin/console?section=audit-logs&module=file_vault"
+    if module_key == "identity_leak":
+        return "/admin/console?section=audit-logs&module=identity_leak"
+    if module_key == "admin_authentication":
+        return "/admin/console?section=audit-logs&module=admin_authentication"
+    return "/admin/console?section=audit-logs"
+
+
+def _admin_audit_notification_item(entry: AdminAuditLog, read_keys: set[str]) -> dict[str, object] | None:
+    action_type = str(getattr(entry, "action_type", "") or "").strip()
+    if action_type in ADMIN_NOTIFICATION_AUDIT_EXCLUDED_ACTIONS:
+        return None
+    module_key = _admin_audit_module_key(getattr(entry, "module", ""))
+    if module_key == "ai_governance":
+        return None
+
+    metadata = _notification_metadata_from_json(getattr(entry, "metadata_json", None))
+    actor_name = str(getattr(entry, "actor_name", "") or "Admin").strip()
+    actor_email = str(getattr(entry, "actor_email", "") or "").strip().lower()
+    target_label = str(getattr(entry, "target_label", "") or "").strip()
+    module_label = _admin_audit_module_label(module_key)
+    status_value = str(getattr(entry, "status", "") or "success").strip().lower()
+    severity = _admin_notification_severity_from_audit(status_value, getattr(entry, "severity", None))
+    action_label = str(getattr(entry, "action_label", "") or action_type.replace("_", " ").title()).strip()
+    suffix = f" for {target_label}" if target_label else ""
+    status_note = "failed" if status_value == "failed" else "recorded"
+    message = f"{actor_name} {action_label.lower()}{suffix}. Admin audit event {status_note}."
+    if actor_email:
+        message = f"{message} Actor: {actor_email}."
+
+    return _admin_notification_item(
+        key=f"admin-audit:{getattr(entry, 'id', '')}",
+        type="admin_audit_event",
+        severity=severity,
+        title=action_label,
+        message=message,
+        created_at=getattr(entry, "created_at", None),
+        read_keys=read_keys,
+        job_id=str(metadata.get("job_id") or "").strip() or None,
+        metadata={
+            **metadata,
+            "admin_scope": "system",
+            "source": "admin_audit",
+            "module": module_label,
+            "module_key": module_key,
+            "action_type": action_type,
+            "status": status_value,
+            "actor_email": actor_email,
+            "target_type": str(getattr(entry, "target_type", "") or ""),
+            "target_label": target_label,
+            "action_url": _admin_notification_action_url(
+                module_key,
+                target_id=getattr(entry, "target_id", None),
+                metadata=metadata,
+            ),
+        },
+    )
+
+
+def _user_activity_admin_notification_item(entry: UserActivityLog, read_keys: set[str]) -> dict[str, object] | None:
+    module_key = _admin_audit_module_key(getattr(entry, "module", ""))
+    if module_key not in ADMIN_AUDIT_REAL_MODULE_LABELS:
+        return None
+    metadata = _sanitize_activity_metadata_for_user(getattr(entry, "metadata_json", None))
+    user = db.session.get(User, int(getattr(entry, "user_id", 0) or 0))
+    user_email = str(getattr(user, "email", "") or "").strip().lower() if user else ""
+    user_name = str(getattr(user, "full_name", "") or "").strip() if user else ""
+    actor_label = user_name or user_email or "User"
+    action_type = normalize_activity_action_type(getattr(entry, "action_type", None))
+    title = USER_ACTIVITY_LABELS.get(
+        action_type,
+        safe_activity_str(getattr(entry, "title", None), "User activity event"),
+    )
+    status_value = normalize_activity_status(getattr(entry, "status", None))
+    severity = _admin_notification_severity_from_audit(
+        status_value,
+        normalize_activity_severity(getattr(entry, "severity", None)),
+    )
+    target_label = safe_activity_str(getattr(entry, "target_label", None))
+    message = safe_activity_str(
+        getattr(entry, "description", None),
+        f"{actor_label} activity recorded in {_admin_audit_module_label(module_key)}.",
+    )
+    if user_email:
+        message = f"{message} Affected user: {user_email}."
+    if target_label:
+        message = f"{message} Target: {target_label}."
+
+    return _admin_notification_item(
+        key=f"user-activity:{getattr(entry, 'id', '')}",
+        type="user_activity_event",
+        severity=severity,
+        title=title,
+        message=message,
+        created_at=getattr(entry, "created_at", None),
+        read_keys=read_keys,
+        metadata={
+            **(metadata if isinstance(metadata, dict) else {}),
+            "admin_scope": "system",
+            "source": "user_activity",
+            "module": _admin_audit_module_label(module_key),
+            "module_key": module_key,
+            "action_type": action_type,
+            "status": status_value,
+            "affected_user_id": getattr(entry, "user_id", None),
+            "affected_user_email": user_email,
+            "affected_user_name": actor_label,
+            "target_type": safe_activity_str(getattr(entry, "target_type", None)),
+            "target_label": target_label,
+            "action_url": _admin_notification_action_url(module_key, metadata=metadata),
+        },
+    )
 
 
 def _build_admin_notifications(admin_email: str, limit: int = 20, offset: int = 0) -> tuple[list[dict[str, object]], int]:
@@ -6958,6 +7126,26 @@ def _build_admin_notifications(admin_email: str, limit: int = 20, offset: int = 
                 },
             )
         )
+
+    audit_entries = (
+        AdminAuditLog.query.order_by(AdminAuditLog.created_at.desc(), AdminAuditLog.id.desc())
+        .limit(160)
+        .all()
+    )
+    for audit_entry in audit_entries:
+        item = _admin_audit_notification_item(audit_entry, read_keys)
+        if item:
+            items.append(item)
+
+    activity_entries = (
+        UserActivityLog.query.order_by(UserActivityLog.created_at.desc(), UserActivityLog.id.desc())
+        .limit(120)
+        .all()
+    )
+    for activity_entry in activity_entries:
+        item = _user_activity_admin_notification_item(activity_entry, read_keys)
+        if item:
+            items.append(item)
 
     for job_state in jobs.list_recent(limit=80):
         status = _pcap_admin_status(getattr(job_state, "status", None))
@@ -7639,6 +7827,23 @@ def _sanitize_activity_metadata_for_user(metadata) -> dict[str, object]:
     return filtered
 
 
+def _recent_user_activity_exists(user_id: int, module: str, action_type: str, within_seconds: int) -> bool:
+    try:
+        cutoff = datetime.now(UTC) - timedelta(seconds=max(1, int(within_seconds or 60)))
+        return (
+            UserActivityLog.query.filter(
+                UserActivityLog.user_id == int(user_id),
+                UserActivityLog.module == normalize_activity_module(module),
+                UserActivityLog.action_type == normalize_activity_action_type(action_type),
+                UserActivityLog.created_at >= cutoff.replace(tzinfo=None),
+            ).first()
+            is not None
+        )
+    except Exception:
+        logging.exception("Passive user activity dedupe check failed | action_type=%s", action_type)
+        return False
+
+
 def log_user_event(
     *,
     user_id,
@@ -7690,6 +7895,21 @@ def log_user_event(
         created_at=_as_utc_datetime(created_at) if created_at else datetime.now(UTC),
         metadata_json=safe_activity_metadata(metadata_json or {}),
     )
+    recent_passive_exists = _recent_user_activity_exists(
+        normalized_user_id,
+        payload.module,
+        payload.action_type,
+        60,
+    )
+    if should_skip_recent_passive_audit(
+        normalized_user_id,
+        "user",
+        payload.module,
+        payload.action_type,
+        within_seconds=60,
+        recent_record_exists=recent_passive_exists,
+    ):
+        return None
     record = build_user_activity_record(payload)
     db.session.add(record)
     if commit:
@@ -7770,6 +7990,7 @@ def _identity_log_scan_completed(user_id: int, scan_id: int, result: dict, targe
             "sources_checked": _identity_sources_checked(result),
         },
     )
+    _identity_log_source_status_events(user_id, scan_id, result)
 
 
 def _identity_log_alerts(user_id: int, alert_id: int | None, scan_id: int, result: dict, findings: list[dict]):
@@ -7829,6 +8050,36 @@ def _identity_log_alerts(user_id: int, alert_id: int | None, scan_id: int, resul
                 "scan_id": scan_id,
                 "category": "confirmed_breach",
                 "source": "LeakCheck Public API",
+            },
+        )
+
+
+def _identity_log_source_status_events(user_id: int, scan_id: int, result: dict) -> None:
+    source_status = result.get("source_status") if isinstance(result, dict) else {}
+    if not isinstance(source_status, dict):
+        return
+    for source_name, raw_status in source_status.items():
+        status_value = _identity_source_status_value(raw_status)
+        if status_value not in {"skipped", "failed"}:
+            continue
+        _identity_log_event(
+            user_id,
+            "identity_source_skipped" if status_value == "skipped" else "identity_provider_error",
+            title="Identity source skipped" if status_value == "skipped" else "Identity provider unavailable",
+            description=(
+                "An identity scan source was skipped safely."
+                if status_value == "skipped"
+                else "An identity scan provider error was handled safely."
+            ),
+            status="skipped" if status_value == "skipped" else STATUS_FAILED,
+            severity=SEVERITY_LOW if status_value == "skipped" else SEVERITY_MEDIUM,
+            target_type="identity_scan",
+            target_id=str(scan_id),
+            target_label=f"Scan #{scan_id}",
+            metadata_json={
+                "scan_id": scan_id,
+                "source": safe_activity_str(source_name, "unknown")[:80],
+                "source_status": status_value,
             },
         )
 
@@ -10420,6 +10671,7 @@ def _serialize_user_activity_log(
             MODULE_AI: "AI Threat Detector",
             MODULE_IDENTITY: "Identity Leak Monitor",
             MODULE_PASSWORD: "Password Checker",
+            MODULE_SETTINGS: "Settings",
         }.get(record.module, "Activity"),
     }
 
@@ -10727,13 +10979,14 @@ def _admin_credentials_configured() -> bool:
 
 def create_admin_access_token(admin_email: str, admin_user: User | None = None) -> str:
     now = datetime.now(UTC)
+    session_timeout_minutes = _admin_session_timeout_minutes()
     payload = {
         "sub": f"admin:{str(admin_email or '').strip().lower()}",
         "email": str(admin_email or "").strip().lower(),
         "scope": ADMIN_JWT_SCOPE,
         "iat": int(now.timestamp()),
         "exp": int(
-            (now + timedelta(hours=ADMIN_ACCESS_TOKEN_EXPIRE_HOURS)).timestamp()
+            (now + timedelta(minutes=session_timeout_minutes)).timestamp()
         ),
     }
     if admin_user is not None and getattr(admin_user, "id", None) is not None:
@@ -10765,6 +11018,13 @@ def get_current_admin() -> Optional[dict[str, object]]:
 
     email = str(payload.get("email") or "").strip().lower()
     if not email:
+        return None
+
+    try:
+        issued_at = int(payload.get("iat") or 0)
+    except (TypeError, ValueError):
+        issued_at = 0
+    if issued_at and (int(datetime.now(UTC).timestamp()) - issued_at) > (_admin_session_timeout_minutes() * 60):
         return None
 
     admin_user_id = payload.get("admin_user_id")
@@ -11050,6 +11310,18 @@ def _run_security_simulation(definition: dict[str, object]) -> dict[str, object]
 @admin_auth_required
 def admin_security_simulation_tests():
     definitions = _security_simulation_definitions()
+    log_admin_action(
+        getattr(g, "current_admin", None),
+        "validation_result_viewed",
+        "Viewed security validation test catalog",
+        "validation_lab",
+        target_type="validation_catalog",
+        target_label=f"{len(definitions)} tests",
+        status="success",
+        severity="low",
+        metadata={"test_count": len(definitions)},
+        request=request,
+    )
     return jsonify(
         {
             "success": True,
@@ -11089,6 +11361,19 @@ def admin_security_simulation_run():
             status_code=400,
         )
 
+    log_admin_action(
+        getattr(g, "current_admin", None),
+        "validation_started",
+        "Started security validation run",
+        "validation_lab",
+        target_type="validation_run",
+        target_label="All validation tests" if run_all else (test_id or "validation test"),
+        status="success",
+        severity="medium",
+        metadata={"run_all": bool(run_all), "test_count": len(selected)},
+        request=request,
+    )
+
     try:
         results = [_run_security_simulation(definition) for definition in selected]
     except RuntimeError as exc:
@@ -11122,13 +11407,31 @@ def admin_security_simulation_run():
             log_context={"route": "admin_security_simulation_run"},
         )
 
+    passed = all(result.get("passed") for result in results)
+    log_admin_action(
+        getattr(g, "current_admin", None),
+        "validation_completed" if passed else "validation_failed",
+        "Completed security validation run" if passed else "Security validation run reported failures",
+        "validation_lab",
+        target_type="validation_run",
+        target_label="All validation tests" if run_all else (test_id or "validation test"),
+        status="success" if passed else "failed",
+        severity="medium" if passed else "high",
+        metadata={
+            "run_all": bool(run_all),
+            "test_count": len(results),
+            "passed": bool(passed),
+        },
+        request=request,
+    )
+
     if run_all:
         return jsonify(
             {
                 "success": True,
                 "run_all": True,
                 "results": results,
-                "passed": all(result.get("passed") for result in results),
+                "passed": passed,
                 "timestamp": datetime.now(UTC).isoformat(),
             }
         )
@@ -11294,6 +11597,31 @@ def _admin_actor_identity(actor=None) -> dict[str, object]:
     }
 
 
+def _recent_admin_audit_exists(actor_identity: dict[str, object], module: str, action_type: str, within_seconds: int) -> bool:
+    try:
+        cutoff = datetime.now(UTC) - timedelta(seconds=max(1, int(within_seconds or 60)))
+        query = AdminAuditLog.query.filter(
+            AdminAuditLog.action_type == str(action_type or "").strip()[:100],
+            AdminAuditLog.created_at >= cutoff.replace(tzinfo=None),
+        )
+        actor_user_id = actor_identity.get("actor_user_id")
+        actor_email = str(actor_identity.get("actor_email") or "").strip().lower()
+        actor_name = str(actor_identity.get("actor_name") or "").strip()
+        if actor_user_id:
+            query = query.filter(AdminAuditLog.actor_user_id == int(actor_user_id))
+        elif actor_email:
+            query = query.filter(func.lower(AdminAuditLog.actor_email) == actor_email)
+        elif actor_name:
+            query = query.filter(AdminAuditLog.actor_name == actor_name)
+        module_key = _admin_audit_module_key(module)
+        for entry in query.order_by(AdminAuditLog.created_at.desc()).limit(20).all():
+            if _admin_audit_module_key(getattr(entry, "module", "")) == module_key:
+                return True
+    except Exception:
+        logging.exception("Passive admin audit dedupe check failed | action_type=%s", action_type)
+    return False
+
+
 def log_admin_action(
     actor,
     action_type,
@@ -11313,11 +11641,27 @@ def log_admin_action(
         request_obj = request or globals().get("request")
         actor_identity = _admin_actor_identity(actor)
         status_value = str(status or "success").strip().lower()
-        if status_value not in {"success", "failed", "warning"}:
+        if status_value not in {"success", "failed", "skipped"}:
             status_value = "success"
         severity_value = str(severity or "medium").strip().lower()
         if severity_value not in {"low", "medium", "high", "critical"}:
             severity_value = "medium"
+
+        recent_passive_exists = _recent_admin_audit_exists(
+            actor_identity,
+            module,
+            action_type,
+            60,
+        )
+        if should_skip_recent_passive_audit(
+            actor_identity.get("actor_user_id") or actor_identity.get("actor_email"),
+            "admin",
+            module,
+            action_type,
+            within_seconds=60,
+            recent_record_exists=recent_passive_exists,
+        ):
+            return None
 
         ip_address = ""
         user_agent = ""
@@ -11371,6 +11715,7 @@ def _serialize_admin_audit_log(entry: AdminAuditLog) -> dict[str, object]:
         "action_type": str(getattr(entry, "action_type", "") or ""),
         "action_label": str(getattr(entry, "action_label", "") or ""),
         "module": str(getattr(entry, "module", "") or ""),
+        "module_label": _admin_audit_module_label(getattr(entry, "module", "")),
         "target_type": str(getattr(entry, "target_type", "") or ""),
         "target_id": "",
         "target_label": "",
@@ -11382,6 +11727,130 @@ def _serialize_admin_audit_log(entry: AdminAuditLog) -> dict[str, object]:
         "metadata": _sanitize_for_json(metadata),
         "created_at": created_at.isoformat() if created_at else None,
     }
+
+
+ADMIN_AUDIT_REAL_MODULE_LABELS = {
+    "admin_authentication": "Admin Authentication",
+    "users_roles": "Users & Roles",
+    "threat_management": "Threat Management",
+    "pcap_analysis": "PCAP Analysis",
+    "validation_lab": "Validation Lab",
+    "admin_audit": "Admin Audit Trail",
+    "admin_audit_trail": "Admin Audit Trail",
+    "notifications": "Notifications",
+    "reports_center": "Reports Center",
+    "settings": "Settings",
+    "password_checker": "Password Checker",
+    "file_vault": "File Vault",
+    "identity_leak": "Identity Leak Monitor",
+}
+
+ADMIN_AUDIT_MODULE_ALIASES = {
+    "admin_auth": "admin_authentication",
+    "authentication": "admin_authentication",
+    "auth": "admin_authentication",
+    "users_and_roles": "users_roles",
+    "users_roles": "users_roles",
+    "roles": "users_roles",
+    "threats": "threat_management",
+    "threat_intel": "threat_management",
+    "pcap": "pcap_analysis",
+    "pcap_analyzer": "pcap_analysis",
+    "security_lab": "validation_lab",
+    "security_validation_lab": "validation_lab",
+    "validation": "validation_lab",
+    "audit": "admin_audit",
+    "admin_audit_trail": "admin_audit",
+    "reports": "reports_center",
+    "reports_exports": "reports_center",
+    "report_exports": "reports_center",
+    "password": "password_checker",
+    "passwords": "password_checker",
+    "vault": "file_vault",
+    "encrypted_file_vault": "file_vault",
+    "encrypted_vault": "file_vault",
+    "identity": "identity_leak",
+    "identity_monitor": "identity_leak",
+    "identity_leak_monitor": "identity_leak",
+    "osint_monitor": "identity_leak",
+}
+
+ADMIN_AUDIT_TRUSTED_MODULE_OPTIONS = [
+    "admin_authentication",
+    "users_roles",
+    "threat_management",
+    "pcap_analysis",
+    "validation_lab",
+    "admin_audit",
+    "notifications",
+    "reports_center",
+    "settings",
+    "password_checker",
+    "file_vault",
+    "identity_leak",
+]
+
+ADMIN_AUDIT_USER_ACTIVITY_MODULES = {
+    "password_checker": MODULE_PASSWORD,
+    "file_vault": MODULE_VAULT,
+    "identity_leak": MODULE_IDENTITY,
+    "pcap_analysis": MODULE_PCAP,
+    "settings": MODULE_SETTINGS,
+}
+
+
+def _admin_audit_module_key(value) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    return ADMIN_AUDIT_MODULE_ALIASES.get(normalized, normalized)
+
+
+def _admin_audit_module_label(value) -> str:
+    module_key = _admin_audit_module_key(value)
+    if module_key in ADMIN_AUDIT_REAL_MODULE_LABELS:
+        return ADMIN_AUDIT_REAL_MODULE_LABELS[module_key]
+    cleaned = re.sub(r"[_\-]+", " ", str(value or "").strip()).strip()
+    return cleaned.title() if cleaned else "Unknown Module"
+
+
+def _admin_audit_status_value(value) -> str:
+    status = str(value or "").strip().lower()
+    if status in {"success", "failed", "warning", "skipped"}:
+        return status
+    if status == "info":
+        return "success"
+    return "success"
+
+
+def _admin_audit_module_filter_values(value) -> tuple[str, str | None]:
+    module_key = _admin_audit_module_key(value)
+    return module_key, ADMIN_AUDIT_USER_ACTIVITY_MODULES.get(module_key)
+
+
+def _admin_audit_admin_module_candidates(module_filter_key: str, raw_value: str) -> set[str]:
+    candidates = {str(raw_value or "").strip()}
+    label = ADMIN_AUDIT_REAL_MODULE_LABELS.get(module_filter_key)
+    if label:
+        candidates.add(label)
+    aliases = [
+        alias_key
+        for alias_key, canonical_key in ADMIN_AUDIT_MODULE_ALIASES.items()
+        if canonical_key == module_filter_key
+    ]
+    candidates.update(aliases)
+    candidates.add(module_filter_key)
+    return {candidate for candidate in candidates if candidate}
+
+
+def _admin_audit_label_matches_filter(raw_module: object, module_filter_key: str) -> bool:
+    if not module_filter_key:
+        return True
+    return _admin_audit_module_key(raw_module) == module_filter_key
+
+
+def _admin_audit_distinct_values(column) -> list[str]:
+    rows = db.session.query(column).filter(column.isnot(None)).distinct().all()
+    values = {str(row[0] or "").strip() for row in rows if str(row[0] or "").strip()}
+    return sorted(values, key=lambda item: item.lower())
 
 
 def _summarize_audit_details(details_json: str | None) -> str:
@@ -15873,6 +16342,10 @@ def signup():
     if not full_name or not email or not password:
         return jsonify({"success": False, "message": "Missing fields"}), 400
 
+    password_policy_error = _validate_password_against_admin_policy(password)
+    if password_policy_error:
+        return jsonify({"success": False, "message": password_policy_error}), 400
+
     if User.query.filter_by(email=email).first():
         return jsonify({"success": False, "message": "Email already exists"}), 409
 
@@ -16601,9 +17074,9 @@ def update_profile_settings():
         )
         log_user_event(
             user_id=user.id,
-            module=MODULE_AUTH,
-            action_type="profile_updated",
-            title=USER_ACTIVITY_LABELS["profile_updated"],
+            module=MODULE_SETTINGS,
+            action_type="profile_settings_updated",
+            title=USER_ACTIVITY_LABELS["profile_settings_updated"],
             description="Profile information was updated from the account settings page.",
             status=STATUS_SUCCESS,
             severity=SEVERITY_LOW,
@@ -16733,9 +17206,9 @@ def update_security_settings():
         )
         log_user_event(
             user_id=user.id,
-            module=MODULE_AUTH,
-            action_type="profile_updated",
-            title="Security settings updated",
+            module=MODULE_SETTINGS,
+            action_type="security_settings_updated",
+            title=USER_ACTIVITY_LABELS["security_settings_updated"],
             description="Security preferences were updated for the active account.",
             status=STATUS_SUCCESS,
             severity=SEVERITY_MEDIUM,
@@ -16817,12 +17290,13 @@ def update_password_settings():
             400,
         )
 
-    if len(new_password) < 8:
+    password_policy_error = _validate_password_against_admin_policy(new_password)
+    if password_policy_error:
         return (
             jsonify(
                 {
                     "success": False,
-                    "message": "New password must be at least 8 characters long.",
+                    "message": password_policy_error,
                 }
             ),
             400,
@@ -16863,7 +17337,7 @@ def update_password_settings():
         )
         log_user_event(
             user_id=user.id,
-            module=MODULE_AUTH,
+            module=MODULE_SETTINGS,
             action_type="password_changed",
             title=USER_ACTIVITY_LABELS["password_changed"],
             description="The account password was updated from the security settings page.",
@@ -17033,9 +17507,9 @@ def create_linked_account_settings():
         )
         log_user_event(
             user_id=user.id,
-            module=MODULE_AUTH,
-            action_type="profile_updated",
-            title="Linked account added",
+            module=MODULE_SETTINGS,
+            action_type="linked_account_added",
+            title=USER_ACTIVITY_LABELS["linked_account_added"],
             description="A linked account was added from the settings page.",
             status=STATUS_SUCCESS,
             severity=SEVERITY_LOW,
@@ -17233,9 +17707,9 @@ def update_linked_account_settings(account_id: int):
         )
         log_user_event(
             user_id=user.id,
-            module=MODULE_AUTH,
-            action_type="profile_updated",
-            title="Linked account updated",
+            module=MODULE_SETTINGS,
+            action_type="linked_account_updated",
+            title=USER_ACTIVITY_LABELS["linked_account_updated"],
             description="A linked account was updated from the settings page.",
             status=STATUS_SUCCESS,
             severity=SEVERITY_LOW,
@@ -17357,9 +17831,9 @@ def delete_linked_account_settings(account_id: int):
         )
         log_user_event(
             user_id=user.id,
-            module=MODULE_AUTH,
-            action_type="profile_updated",
-            title="Linked account deleted",
+            module=MODULE_SETTINGS,
+            action_type="linked_account_deleted",
+            title=USER_ACTIVITY_LABELS["linked_account_deleted"],
             description="A linked account was removed from the settings page.",
             status=STATUS_SUCCESS,
             severity=SEVERITY_MEDIUM,
@@ -17557,9 +18031,9 @@ def set_primary_linked_account_settings(account_id: int):
         )
         log_user_event(
             user_id=user.id,
-            module=MODULE_AUTH,
-            action_type="profile_updated",
-            title="Primary linked account changed",
+            module=MODULE_SETTINGS,
+            action_type="linked_account_primary_changed",
+            title=USER_ACTIVITY_LABELS["linked_account_primary_changed"],
             description="A linked account was promoted to Primary from the settings page.",
             status=STATUS_SUCCESS,
             severity=SEVERITY_MEDIUM,
@@ -17821,6 +18295,8 @@ def admin_notification_control_status():
 
 ADMIN_NOTIFICATION_CONTROL_SETTINGS_PATH = BASE_DIR / "instance" / "admin_notification_control_settings.json"
 ADMIN_THREAT_STATUS_OVERRIDES_PATH = BASE_DIR / "instance" / "admin_threat_status_overrides.json"
+ADMIN_SYSTEM_SETTINGS_PATH = BASE_DIR / "instance" / "admin_system_settings.json"
+ADMIN_SETTINGS_PREFERENCES_PATH = BASE_DIR / "instance" / "admin_settings_preferences.json"
 
 
 def _default_admin_notification_control_settings() -> dict:
@@ -17908,6 +18384,556 @@ def _write_admin_notification_control_settings(settings: dict) -> bool:
         return False
 
 
+def _default_admin_system_settings() -> dict:
+    return {
+        "general": {
+            "applicationName": "Sentinel AI",
+            "baseUrl": "https://sentinel-ai.company.com",
+            "supportEmail": "support@company.com",
+        },
+        "security": {
+            "requireTwoFactorAllUsers": True,
+            "sessionTimeoutMinutes": 60,
+            "passwordPolicy": "strong",
+            "allowedFileTypes": ".pdf, .doc, .docx, .txt, .zip",
+        },
+    }
+
+
+def _parse_admin_allowed_file_types(value: object) -> list[str]:
+    raw = str(value or "").strip()
+    parts = [part.strip().lower() for part in re.split(r"[,\s]+", raw) if part.strip()]
+    extensions: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        ext = part if part.startswith(".") else f".{part}"
+        if not re.fullmatch(r"\.[a-z0-9]{1,12}", ext):
+            continue
+        if ext in seen:
+            continue
+        seen.add(ext)
+        extensions.append(ext)
+    return extensions
+
+
+def _admin_allowed_file_extensions() -> set[str]:
+    settings = _read_admin_system_settings()
+    security = settings.get("security") if isinstance(settings.get("security"), dict) else {}
+    configured = _parse_admin_allowed_file_types(security.get("allowedFileTypes"))
+    defaults = _parse_admin_allowed_file_types(_default_admin_system_settings()["security"]["allowedFileTypes"])
+    return {ext.lstrip(".") for ext in (configured or defaults)}
+
+
+def _admin_session_timeout_minutes() -> int:
+    try:
+        settings = _read_admin_system_settings()
+        security = settings.get("security") if isinstance(settings.get("security"), dict) else {}
+        value = int(security.get("sessionTimeoutMinutes") or ADMIN_ACCESS_TOKEN_EXPIRE_HOURS * 60)
+    except Exception:
+        value = ADMIN_ACCESS_TOKEN_EXPIRE_HOURS * 60
+    return min(max(value, 5), 1440)
+
+
+def _validate_password_against_admin_policy(password: str) -> str | None:
+    settings = _read_admin_system_settings()
+    security = settings.get("security") if isinstance(settings.get("security"), dict) else {}
+    policy = str(security.get("passwordPolicy") or "strong").strip().lower()
+    if policy not in {"basic", "strong", "very-strong"}:
+        policy = "strong"
+
+    if policy == "basic":
+        if len(password) < 8:
+            return "Password must be at least 8 characters."
+        return None
+
+    if policy == "strong":
+        if len(password) < 12:
+            return "Password must be at least 12 characters."
+        if not re.search(r"[A-Z]", password) or not re.search(r"[a-z]", password) or not re.search(r"\d", password):
+            return "Password must include uppercase, lowercase, and number characters."
+        return None
+
+    if len(password) < 16:
+        return "Password must be at least 16 characters."
+    if not re.search(r"[A-Z]", password) or not re.search(r"[a-z]", password) or not re.search(r"\d", password):
+        return "Password must include uppercase, lowercase, and number characters."
+    if not re.search(r"[^A-Za-z0-9]", password):
+        return "Password must include at least one special character."
+    return None
+
+
+def _normalize_admin_system_settings(payload: dict) -> dict:
+    defaults = _default_admin_system_settings()
+    general = payload.get("general") if isinstance(payload.get("general"), dict) else {}
+    security = payload.get("security") if isinstance(payload.get("security"), dict) else {}
+    password_policy = str(security.get("passwordPolicy") or defaults["security"]["passwordPolicy"]).strip()
+    if password_policy not in {"basic", "strong", "very-strong"}:
+        password_policy = defaults["security"]["passwordPolicy"]
+    session_timeout = _safe_int(
+        security.get("sessionTimeoutMinutes"),
+        defaults["security"]["sessionTimeoutMinutes"],
+    )
+    session_timeout = min(max(session_timeout, 5), 1440)
+    allowed_file_types = _parse_admin_allowed_file_types(
+        security.get("allowedFileTypes") or defaults["security"]["allowedFileTypes"]
+    )
+    if not allowed_file_types:
+        allowed_file_types = _parse_admin_allowed_file_types(defaults["security"]["allowedFileTypes"])
+    return {
+        "general": {
+            "applicationName": str(general.get("applicationName") or defaults["general"]["applicationName"]).strip()[:120],
+            "baseUrl": str(general.get("baseUrl") or defaults["general"]["baseUrl"]).strip()[:255],
+            "supportEmail": str(general.get("supportEmail") or defaults["general"]["supportEmail"]).strip()[:255],
+        },
+        "security": {
+            "requireTwoFactorAllUsers": bool(
+                security.get(
+                    "requireTwoFactorAllUsers",
+                    defaults["security"]["requireTwoFactorAllUsers"],
+                )
+            ),
+            "sessionTimeoutMinutes": session_timeout,
+            "passwordPolicy": password_policy,
+            "allowedFileTypes": ", ".join(allowed_file_types)[:500],
+        },
+    }
+
+
+def _read_admin_system_settings() -> dict:
+    defaults = _default_admin_system_settings()
+    try:
+        with ADMIN_SYSTEM_SETTINGS_PATH.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            return _normalize_admin_system_settings(
+                {
+                    "general": {**defaults["general"], **(data.get("general") or {})},
+                    "security": {**defaults["security"], **(data.get("security") or {})},
+                }
+            )
+    except FileNotFoundError:
+        return defaults
+    except Exception:
+        logging.exception("Failed to read admin system settings")
+    return defaults
+
+
+def _write_admin_system_settings(settings: dict) -> bool:
+    try:
+        ADMIN_SYSTEM_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with ADMIN_SYSTEM_SETTINGS_PATH.open("w", encoding="utf-8") as handle:
+            json.dump(settings, handle, indent=2)
+        return True
+    except Exception:
+        logging.exception("Failed to save admin system settings")
+        return False
+
+
+def _current_admin_user() -> User | None:
+    current_admin = getattr(g, "current_admin", {}) or {}
+    admin_user_id = current_admin.get("user_id")
+    if admin_user_id is not None:
+        try:
+            user = db.session.get(User, int(admin_user_id))
+        except (TypeError, ValueError):
+            user = None
+        if user is not None:
+            return user
+
+    email = str(current_admin.get("email") or "").strip().lower()
+    if not email:
+        return None
+    user = User.query.filter(func.lower(User.email) == email).first()
+    if user is None:
+        return None
+    if _normalize_admin_role(getattr(user, "admin_role", "User")) != "Admin":
+        return None
+    if _normalize_admin_status(getattr(user, "admin_status", "Active")) != "Active":
+        return None
+    return user
+
+
+def _serialize_admin_settings_profile(user: User) -> dict:
+    return {
+        "fullName": str(getattr(user, "full_name", "") or "").strip(),
+        "email": str(getattr(user, "email", "") or "").strip().lower(),
+        "jobTitle": str(getattr(user, "job_title", "") or "").strip(),
+        "company": str(getattr(user, "company", "") or "").strip(),
+    }
+
+
+def _default_admin_account_preferences() -> dict:
+    return {
+        "notificationPreferences": {
+            "emailAlerts": True,
+            "weeklyReports": True,
+        },
+        "preferences": {
+            "interfaceLanguage": "english",
+        },
+    }
+
+
+def _admin_account_preferences_key(admin_email: str) -> str:
+    return str(admin_email or "").strip().lower()
+
+
+def _normalize_admin_account_preferences(payload: dict | None) -> dict:
+    defaults = _default_admin_account_preferences()
+    payload = payload if isinstance(payload, dict) else {}
+    notification_preferences = (
+        payload.get("notificationPreferences")
+        if isinstance(payload.get("notificationPreferences"), dict)
+        else {}
+    )
+    preferences = payload.get("preferences") if isinstance(payload.get("preferences"), dict) else {}
+    language = str(
+        preferences.get("interfaceLanguage")
+        or defaults["preferences"]["interfaceLanguage"]
+    ).strip().lower()
+    if language not in {"english", "arabic"}:
+        language = defaults["preferences"]["interfaceLanguage"]
+    return {
+        "notificationPreferences": {
+            "emailAlerts": bool(
+                notification_preferences.get(
+                    "emailAlerts",
+                    defaults["notificationPreferences"]["emailAlerts"],
+                )
+            ),
+            "weeklyReports": bool(
+                notification_preferences.get(
+                    "weeklyReports",
+                    defaults["notificationPreferences"]["weeklyReports"],
+                )
+            ),
+        },
+        "preferences": {
+            "interfaceLanguage": language,
+        },
+    }
+
+
+def _read_admin_settings_preferences_store() -> dict:
+    try:
+        with ADMIN_SETTINGS_PREFERENCES_PATH.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        logging.exception("Failed to read admin settings preferences")
+        return {}
+
+
+def _write_admin_settings_preferences_store(store: dict) -> bool:
+    try:
+        ADMIN_SETTINGS_PREFERENCES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with ADMIN_SETTINGS_PREFERENCES_PATH.open("w", encoding="utf-8") as handle:
+            json.dump(store, handle, indent=2)
+        return True
+    except Exception:
+        logging.exception("Failed to save admin settings preferences")
+        return False
+
+
+def _read_admin_account_preferences(admin_email: str) -> dict:
+    key = _admin_account_preferences_key(admin_email)
+    store = _read_admin_settings_preferences_store()
+    return _normalize_admin_account_preferences(store.get(key) if key else None)
+
+
+def _write_admin_account_preferences(admin_email: str, updates: dict) -> dict | None:
+    key = _admin_account_preferences_key(admin_email)
+    if not key:
+        return None
+    store = _read_admin_settings_preferences_store()
+    current = _read_admin_account_preferences(admin_email)
+    updates = updates if isinstance(updates, dict) else {}
+    merged = _normalize_admin_account_preferences(
+        {
+            "notificationPreferences": {
+                **current.get("notificationPreferences", {}),
+                **(updates.get("notificationPreferences") or {}),
+            },
+            "preferences": {
+                **current.get("preferences", {}),
+                **(updates.get("preferences") or {}),
+            },
+        }
+    )
+    store[key] = merged
+    if not _write_admin_settings_preferences_store(store):
+        return None
+    return merged
+
+
+app.extensions["get_admin_allowed_file_extensions"] = _admin_allowed_file_extensions
+
+
+@app.route("/api/admin/system-settings", methods=["GET", "PATCH", "POST"])
+@admin_auth_required
+def admin_system_settings():
+    if request.method == "GET":
+        return jsonify({"success": True, "settings": _read_admin_system_settings()})
+
+    data = request.get_json(silent=True) or {}
+    current = _read_admin_system_settings()
+    settings = _normalize_admin_system_settings(
+        {
+            "general": {**current.get("general", {}), **(data.get("general") or {})},
+            "security": {**current.get("security", {}), **(data.get("security") or {})},
+        }
+    )
+    if not _write_admin_system_settings(settings):
+        return jsonify({"success": False, "message": "System settings could not be saved."}), 500
+
+    changed_sections = [
+        section
+        for section in ("general", "security")
+        if data.get(section) is not None
+    ]
+    log_admin_action(
+        getattr(g, "current_admin", None),
+        "settings_updated",
+        "Updated admin system settings",
+        "settings",
+        target_type="admin_system_settings",
+        target_label=", ".join(changed_sections) or "system settings",
+        status="success",
+        severity="medium",
+        metadata={
+            "changed_sections": changed_sections,
+            "application_name": settings["general"]["applicationName"],
+            "session_timeout_minutes": settings["security"]["sessionTimeoutMinutes"],
+            "password_policy": settings["security"]["passwordPolicy"],
+            "allowed_file_types": settings["security"]["allowedFileTypes"],
+        },
+        request=request,
+    )
+    return jsonify({"success": True, "settings": settings})
+
+
+@app.route("/api/public/app-settings", methods=["GET"])
+def public_app_settings():
+    settings = _read_admin_system_settings()
+    general = settings.get("general") if isinstance(settings.get("general"), dict) else {}
+    application_name = str(
+        general.get("applicationName")
+        or _default_admin_system_settings()["general"]["applicationName"]
+    ).strip()[:120]
+    return jsonify(
+        {
+            "success": True,
+            "settings": {
+                "applicationName": application_name,
+            },
+        }
+    )
+
+
+@app.route("/api/admin/settings/profile", methods=["GET", "PATCH"])
+@admin_auth_required
+def admin_settings_profile():
+    user = _current_admin_user()
+    if user is None:
+        return jsonify({"success": False, "message": "Admin account not found."}), 404
+
+    if request.method == "GET":
+        return jsonify({"success": True, "profile": _serialize_admin_settings_profile(user)})
+
+    data = request.get_json(silent=True) or {}
+    full_name = str(data.get("fullName") or data.get("full_name") or "").strip()
+    job_title = str(data.get("jobTitle") or data.get("job_title") or "").strip()
+    company = str(data.get("company") or "").strip()
+    if not full_name:
+        return jsonify({"success": False, "message": "Full name is required."}), 400
+
+    user.full_name = full_name[:255]
+    user.job_title = job_title[:255] or None
+    user.company = company[:255] or None
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        logging.exception("Failed to update admin settings profile")
+        return jsonify({"success": False, "message": "Profile could not be updated."}), 500
+
+    log_admin_action(
+        user,
+        "profile_updated",
+        "Updated admin settings profile",
+        "settings",
+        target_type="admin_profile",
+        target_id=getattr(user, "id", None),
+        target_label=str(getattr(user, "email", "") or "").strip().lower(),
+        status="success",
+        severity="low",
+        metadata={
+            "full_name_present": bool(full_name),
+            "job_title_present": bool(job_title),
+            "company_present": bool(company),
+        },
+        request=request,
+    )
+    return jsonify({"success": True, "profile": _serialize_admin_settings_profile(user)})
+
+
+@app.route("/api/admin/settings/change-password", methods=["POST"])
+@admin_auth_required
+def admin_settings_change_password():
+    user = _current_admin_user()
+    if user is None:
+        return jsonify({"success": False, "message": "Admin account not found."}), 404
+
+    data = request.get_json(silent=True) or {}
+    current_password = str(data.get("currentPassword") or data.get("current_password") or "")
+    new_password = str(data.get("newPassword") or data.get("new_password") or "")
+    confirm_password = str(data.get("confirmPassword") or data.get("confirm_password") or "")
+
+    def audit_failure(reason: str) -> None:
+        log_admin_action(
+            user,
+            "password_update_failed",
+            "Admin password update failed",
+            "settings",
+            target_type="admin_password",
+            target_id=getattr(user, "id", None),
+            target_label=str(getattr(user, "email", "") or "").strip().lower(),
+            status="failed",
+            severity="medium",
+            metadata={"reason": reason},
+            request=request,
+        )
+
+    if not current_password or not new_password or not confirm_password:
+        audit_failure("missing_fields")
+        return jsonify({"success": False, "message": "All password fields are required."}), 400
+    if not check_password_hash(user.password_hash, current_password):
+        audit_failure("invalid_current_password")
+        return jsonify({"success": False, "message": "Current password is incorrect."}), 400
+    if new_password != confirm_password:
+        audit_failure("password_mismatch")
+        return jsonify({"success": False, "message": "New password and confirmation do not match."}), 400
+    policy_error = _validate_password_against_admin_policy(new_password)
+    if policy_error:
+        audit_failure("policy_failed")
+        return jsonify({"success": False, "message": policy_error}), 400
+    if check_password_hash(user.password_hash, new_password):
+        audit_failure("password_reused")
+        return jsonify({"success": False, "message": "New password must be different from the current password."}), 400
+
+    user.password_hash = generate_password_hash(new_password)
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        logging.exception("Failed to update admin password")
+        audit_failure("database_error")
+        return jsonify({"success": False, "message": "Password could not be updated."}), 500
+
+    log_admin_action(
+        user,
+        "password_updated",
+        "Updated admin password",
+        "settings",
+        target_type="admin_password",
+        target_id=getattr(user, "id", None),
+        target_label=str(getattr(user, "email", "") or "").strip().lower(),
+        status="success",
+        severity="medium",
+        metadata={"password_policy": _read_admin_system_settings()["security"]["passwordPolicy"]},
+        request=request,
+    )
+    return jsonify({"success": True, "message": "Password updated successfully."})
+
+
+@app.route("/api/admin/settings/notification-preferences", methods=["GET", "PATCH"])
+@admin_auth_required
+def admin_settings_notification_preferences():
+    user = _current_admin_user()
+    if user is None:
+        return jsonify({"success": False, "message": "Admin account not found."}), 404
+    admin_email = str(getattr(user, "email", "") or "").strip().lower()
+
+    if request.method == "GET":
+        settings = _read_admin_account_preferences(admin_email)
+        return jsonify(
+            {
+                "success": True,
+                "preferences": settings["notificationPreferences"],
+            }
+        )
+
+    data = request.get_json(silent=True) or {}
+    stored = _write_admin_account_preferences(
+        admin_email,
+        {
+            "notificationPreferences": {
+                "emailAlerts": bool(data.get("emailAlerts", True)),
+                "weeklyReports": bool(data.get("weeklyReports", True)),
+            }
+        },
+    )
+    if stored is None:
+        return jsonify({"success": False, "message": "Notification preferences could not be saved."}), 500
+
+    log_admin_action(
+        user,
+        "notification_preferences_updated",
+        "Updated admin notification preferences",
+        "settings",
+        target_type="admin_notification_preferences",
+        target_id=getattr(user, "id", None),
+        target_label=admin_email,
+        status="success",
+        severity="low",
+        metadata=stored["notificationPreferences"],
+        request=request,
+    )
+    return jsonify({"success": True, "preferences": stored["notificationPreferences"]})
+
+
+@app.route("/api/admin/settings/preferences", methods=["GET", "PATCH"])
+@admin_auth_required
+def admin_settings_preferences():
+    user = _current_admin_user()
+    if user is None:
+        return jsonify({"success": False, "message": "Admin account not found."}), 404
+    admin_email = str(getattr(user, "email", "") or "").strip().lower()
+
+    if request.method == "GET":
+        settings = _read_admin_account_preferences(admin_email)
+        return jsonify({"success": True, "preferences": settings["preferences"]})
+
+    data = request.get_json(silent=True) or {}
+    language = str(data.get("interfaceLanguage") or "").strip().lower()
+    if language not in {"english", "arabic"}:
+        return jsonify({"success": False, "message": "Selected language is not supported."}), 400
+
+    stored = _write_admin_account_preferences(
+        admin_email,
+        {"preferences": {"interfaceLanguage": language}},
+    )
+    if stored is None:
+        return jsonify({"success": False, "message": "Language preference could not be saved."}), 500
+
+    log_admin_action(
+        user,
+        "language_changed",
+        "Updated admin interface language",
+        "settings",
+        target_type="admin_preferences",
+        target_id=getattr(user, "id", None),
+        target_label=admin_email,
+        status="success",
+        severity="low",
+        metadata={"interface_language": stored["preferences"]["interfaceLanguage"]},
+        request=request,
+    )
+    return jsonify({"success": True, "preferences": stored["preferences"]})
+
+
 @app.route("/api/admin/notification-control/settings", methods=["GET", "PATCH", "POST"])
 @admin_auth_required
 def admin_notification_control_settings():
@@ -17919,6 +18945,22 @@ def admin_notification_control_settings():
     if not _write_admin_notification_control_settings(settings):
         return jsonify({"success": False, "message": "Notification settings could not be saved."}), 500
 
+    log_admin_action(
+        getattr(g, "current_admin", None),
+        "notification_settings_updated",
+        "Updated admin notification control settings",
+        "notifications",
+        target_type="notification_settings",
+        target_label="Admin notification control",
+        status="success",
+        severity="medium",
+        metadata={
+            "email_enabled": bool(settings.get("email", {}).get("enabled")) if isinstance(settings.get("email"), dict) else None,
+            "telegram_enabled": bool(settings.get("telegram", {}).get("enabled")) if isinstance(settings.get("telegram"), dict) else None,
+            "silent_hours_enabled": bool(settings.get("silentHours", {}).get("enabled")) if isinstance(settings.get("silentHours"), dict) else None,
+        },
+        request=request,
+    )
     return jsonify({"success": True, "settings": settings})
 
 
@@ -18031,6 +19073,23 @@ def admin_notification_control_test():
         }
         _write_admin_notification_control_settings(
             _normalize_admin_notification_control_settings(latest_settings)
+        )
+
+        log_admin_action(
+            getattr(g, "current_admin", None),
+            "notification_sent",
+            "Sent admin notification test",
+            "notifications",
+            target_type="notification_test",
+            target_label=channel,
+            status="success",
+            severity="medium",
+            metadata={
+                "channel": channel,
+                "severity": severity,
+                "recipient_configured": bool(recipient_email if channel == "email" else destination_chat_id),
+            },
+            request=request,
         )
 
         return jsonify(
@@ -18413,6 +19472,18 @@ def admin_mark_notifications_read():
 
     updated = _mark_admin_notification_keys_read(admin_email, keys)
     _, unread_count = _build_admin_notifications(admin_email, limit=1, offset=0)
+    log_admin_action(
+        getattr(g, "current_admin", None),
+        "notification_marked_read",
+        "Marked admin notifications read",
+        "notifications",
+        target_type="admin_notification",
+        target_label=f"{int(updated or 0)} notifications",
+        status="success",
+        severity="low",
+        metadata={"requested_count": len(notification_ids), "updated_count": int(updated or 0)},
+        request=request,
+    )
     return jsonify({"success": True, "updated": int(updated or 0), "unread_count": unread_count})
 
 
@@ -18424,6 +19495,18 @@ def admin_mark_all_notifications_read():
     all_notifications, _ = _build_admin_notifications(admin_email, limit=250, offset=0)
     keys = [str(item.get("key") or "") for item in all_notifications if item.get("key")]
     updated = _mark_admin_notification_keys_read(admin_email, keys)
+    log_admin_action(
+        getattr(g, "current_admin", None),
+        "notification_marked_read",
+        "Marked all admin notifications read",
+        "notifications",
+        target_type="admin_notification",
+        target_label=f"{int(updated or 0)} notifications",
+        status="success",
+        severity="low",
+        metadata={"updated_count": int(updated or 0), "scope": "admin"},
+        request=request,
+    )
     return jsonify({"success": True, "updated": int(updated or 0), "unread_count": 0, "scope": "admin"})
 
 
@@ -20357,6 +21440,20 @@ def protection_rate():
         return jsonify({"error": "Unauthorized"}), 401
     rate = get_protection_rate(user.id)
     total = get_total_breaches(user.id)
+    _identity_log_event(
+        user.id,
+        "identity_protection_rate_calculated",
+        title="Identity protection rate calculated",
+        description="Identity Leak protection rate was calculated.",
+        status=STATUS_SUCCESS,
+        severity=SEVERITY_LOW,
+        target_type="identity_summary",
+        target_label="Protection rate",
+        metadata_json={
+            "protection_rate": _safe_int(rate, 0),
+            "total_breaches": _safe_int(total, 0),
+        },
+    )
     return jsonify({"protection_rate": rate, "total_breaches": total})
 
 
@@ -20732,6 +21829,18 @@ def identity_web_scan():
         return jsonify(result), 200
     except ValueError as exc:
         fail_identity_web_scan(scan_id, str(exc), _identity_web_now(), user_id)
+        _identity_log_event(
+            user_id,
+            "identity_provider_error",
+            title="Identity scan request failed",
+            description="An identity scan request error was handled safely.",
+            status=STATUS_FAILED,
+            severity=SEVERITY_MEDIUM,
+            target_type="identity_scan",
+            target_id=str(scan_id),
+            target_label=target_label,
+            metadata_json={"scan_id": scan_id, "error_code": "invalid_request"},
+        )
         return safe_error_response(
             public_message="Unable to complete the identity scan request.",
             error_code="identity_scan_invalid_request",
@@ -20743,6 +21852,18 @@ def identity_web_scan():
     except Exception:
         logging.exception("Identity Leak Monitor public web scan failed")
         fail_identity_web_scan(scan_id, "Public web scan failed. Please try again later.", _identity_web_now(), user_id)
+        _identity_log_event(
+            user_id,
+            "identity_provider_error",
+            title="Identity scan provider failed",
+            description="An identity scan provider error was handled safely.",
+            status=STATUS_FAILED,
+            severity=SEVERITY_MEDIUM,
+            target_type="identity_scan",
+            target_id=str(scan_id),
+            target_label=target_label,
+            metadata_json={"scan_id": scan_id, "error_code": "provider_unavailable"},
+        )
         return jsonify({"error": "Public web scan failed. Please try again later.", "scan_id": scan_id}), 502
 
 
@@ -24422,6 +25543,18 @@ def admin_users_summary():
 @admin_auth_required
 def admin_list_threats():
     alerts = _filter_admin_threat_feed(_build_admin_threat_feed(), request.args)
+    log_admin_action(
+        getattr(g, "current_admin", None),
+        "threat_viewed",
+        "Viewed admin threat feed",
+        "threat_management",
+        target_type="threat_feed",
+        target_label=f"{len(alerts)} alerts",
+        status="success",
+        severity="low",
+        metadata={"returned_count": len(alerts), "filters": dict(request.args)},
+        request=request,
+    )
     return jsonify({"success": True, "alerts": alerts})
 
 
@@ -24823,8 +25956,33 @@ def _identity_admin_report_payload(args) -> dict[str, object]:
         }
 
 
+def _log_reports_center_action(action_type: str, action_label: str, report_name: str, *, severity: str = "low", metadata: dict | None = None) -> None:
+    log_admin_action(
+        getattr(g, "current_admin", None),
+        action_type,
+        action_label,
+        "reports_center",
+        target_type="admin_report",
+        target_label=report_name,
+        status="success",
+        severity=severity,
+        metadata=metadata or {},
+        request=request,
+    )
+
+
 def admin_identity_report_summary():
-    return jsonify({"success": True, "report": _identity_admin_report_payload(request.args)})
+    report = _identity_admin_report_payload(request.args)
+    _log_reports_center_action(
+        "report_viewed",
+        "Viewed Identity Leak report summary",
+        "Identity Leak Summary",
+        metadata={
+            "total_scans": _safe_int(report.get("total_scans"), 0),
+            "total_findings": _safe_int(report.get("total_findings"), 0),
+        },
+    )
+    return jsonify({"success": True, "report": report})
 
 
 def admin_identity_report_export():
@@ -24853,6 +26011,13 @@ def admin_identity_report_export():
     response = make_response(output.getvalue().encode("utf-8-sig"))
     response.headers["Content-Type"] = "text/csv; charset=utf-8"
     response.headers["Content-Disposition"] = 'attachment; filename="identity-leak-summary.csv"'
+    _log_reports_center_action(
+        "report_exported",
+        "Exported Identity Leak report CSV",
+        "Identity Leak Summary",
+        severity="high",
+        metadata={"format": "csv", "exported_rows": len(report.get("recent_reports", []))},
+    )
     return response
 
 
@@ -25068,7 +26233,25 @@ def _password_admin_report_payload(args=None) -> dict[str, object]:
 
 
 def admin_password_risk_report_summary():
-    return jsonify({"success": True, "report": _password_admin_report_payload(request.args)})
+    report = _password_admin_report_payload(request.args)
+    summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    log_admin_action(
+        getattr(g, "current_admin", None),
+        "password_report_generated",
+        "Generated password risk summary",
+        "password_checker",
+        target_type="report",
+        target_label="Password Risk Summary",
+        status="success",
+        severity="medium",
+        metadata={
+            "total_checks": _safe_int(summary.get("total_checks"), 0),
+            "breached_findings": _safe_int(summary.get("breached_findings"), 0),
+            "weak_findings": _safe_int(summary.get("weak_findings"), 0),
+        },
+        request=request,
+    )
+    return jsonify({"success": True, "report": report})
 
 
 def admin_password_risk_report_export():
@@ -25103,6 +26286,22 @@ def admin_password_risk_report_export():
     response = make_response(output.getvalue().encode("utf-8-sig"))
     response.headers["Content-Type"] = "text/csv; charset=utf-8"
     response.headers["Content-Disposition"] = 'attachment; filename="password-risk-summary.csv"'
+    log_admin_action(
+        getattr(g, "current_admin", None),
+        "password_report_exported",
+        "Exported password risk summary CSV",
+        "password_checker",
+        target_type="report",
+        target_label="Password Risk Summary",
+        status="success",
+        severity="medium",
+        metadata={
+            "total_checks": _safe_int(summary.get("total_checks"), 0),
+            "breached_findings": _safe_int(summary.get("breached_findings"), 0),
+            "weak_findings": _safe_int(summary.get("weak_findings"), 0),
+        },
+        request=request,
+    )
     return response
 
 
@@ -25623,7 +26822,19 @@ def _monthly_security_admin_report_payload() -> dict[str, object]:
 
 
 def admin_monthly_security_report_summary():
-    return jsonify({"success": True, "report": _monthly_security_admin_report_payload()})
+    report = _monthly_security_admin_report_payload()
+    _log_reports_center_action(
+        "report_generated",
+        "Generated monthly security report summary",
+        "Monthly Security Report",
+        metadata={
+            "total_events": _safe_int((report.get("summary") or {}).get("total_events"), 0)
+            if isinstance(report.get("summary"), dict)
+            else 0,
+            "empty": bool(report.get("empty")),
+        },
+    )
+    return jsonify({"success": True, "report": report})
 
 
 USER_ACTIVITY_REPORT_EMPTY_MESSAGE = "No user activity data is available for this period."
@@ -25935,7 +27146,19 @@ def _user_activity_report_payload(args) -> dict[str, object]:
 
 
 def admin_user_activity_report_summary():
-    return jsonify({"success": True, "report": _user_activity_report_payload(request.args)})
+    report = _user_activity_report_payload(request.args)
+    _log_reports_center_action(
+        "report_viewed",
+        "Viewed user activity report summary",
+        "User Activity Report",
+        metadata={
+            "total_activity_events": _safe_int((report.get("summary") or {}).get("total_activity_events"), 0)
+            if isinstance(report.get("summary"), dict)
+            else 0,
+            "filters": dict(request.args),
+        },
+    )
+    return jsonify({"success": True, "report": report})
 
 
 HIGH_RISK_USERS_EMPTY_MESSAGE = "No high-risk users were found for this period."
@@ -26372,7 +27595,19 @@ def _high_risk_users_payload(args) -> dict[str, object]:
 
 
 def admin_high_risk_users_report_summary():
-    return jsonify({"success": True, "report": _high_risk_users_payload(request.args)})
+    report = _high_risk_users_payload(request.args)
+    _log_reports_center_action(
+        "report_viewed",
+        "Viewed high-risk users report summary",
+        "High-Risk Users Report",
+        metadata={
+            "high_risk_users": _safe_int((report.get("summary") or {}).get("high_risk_users"), 0)
+            if isinstance(report.get("summary"), dict)
+            else 0,
+            "filters": dict(request.args),
+        },
+    )
+    return jsonify({"success": True, "report": report})
 
 
 SECURITY_INCIDENTS_EMPTY_MESSAGE = "No security incidents were found for this period."
@@ -26732,7 +27967,20 @@ def _security_incidents_payload(args) -> dict[str, object]:
 
 
 def admin_security_incidents_report_summary():
-    return jsonify({"success": True, "report": _security_incidents_payload(request.args)})
+    report = _security_incidents_payload(request.args)
+    _log_reports_center_action(
+        "report_viewed",
+        "Viewed security incidents report summary",
+        "Security Incidents Report",
+        severity="medium",
+        metadata={
+            "total_incidents": _safe_int((report.get("summary") or {}).get("total_incidents"), 0)
+            if isinstance(report.get("summary"), dict)
+            else 0,
+            "filters": dict(request.args),
+        },
+    )
+    return jsonify({"success": True, "report": report})
 
 
 PCAP_ADMIN_DONE_STATUSES = {"done", "completed", "success", "succeeded"}
@@ -27600,7 +28848,7 @@ def admin_create_user():
 
     log_admin_action(
         getattr(g, "current_admin", None),
-        "role_changed" if existing_user else "user_invited",
+        "user_role_changed" if existing_user else "user_created",
         (
             "Updated invited user role"
             if existing_user
@@ -27614,7 +28862,7 @@ def admin_create_user():
         target_type="user",
         target_id=getattr(invite_user, "id", None),
         target_label=str(getattr(invite_user, "email", "") or email).strip().lower(),
-        status="success" if invitation_email_sent else "warning",
+        status="success",
         severity="high" if role == "Admin" else "medium",
         metadata={
             "role": role,
@@ -27678,8 +28926,9 @@ def accept_invitation(token: str):
 
     if not invitation_token:
         return jsonify({"success": False, "message": "Invitation token is required."}), 400
-    if len(password) < 8:
-        return jsonify({"success": False, "message": "Password must be at least 8 characters."}), 400
+    password_policy_error = _validate_password_against_admin_policy(password)
+    if password_policy_error:
+        return jsonify({"success": False, "message": password_policy_error}), 400
 
     user = User.query.filter_by(invite_token=invitation_token).first()
     if user is None:
@@ -27776,7 +29025,7 @@ def admin_update_user_status(user_id: int):
         logging.exception("Failed to update admin-managed user status | user_id=%s", user_id)
         return jsonify({"success": False, "message": "Failed to update user status."}), 500
 
-    action_type = "user_locked" if next_status == "Locked" else "user_unlocked" if previous_status == "Locked" else "settings_updated"
+    action_type = "user_disabled" if next_status == "Locked" else "user_status_changed"
     log_admin_action(
         getattr(g, "current_admin", None),
         action_type,
@@ -27788,6 +29037,122 @@ def admin_update_user_status(user_id: int):
         status="success",
         severity="critical" if next_status == "Locked" else "high",
         metadata={"previous_status": previous_status, "new_status": next_status},
+        request=request,
+    )
+    return jsonify({"success": True, "user": _serialize_admin_user(user)})
+
+
+def _log_admin_role_change_failed(user_id: int, reason: str, *, old_role: str | None = None, new_role: str | None = None, target_email: str | None = None) -> None:
+    log_admin_action(
+        getattr(g, "current_admin", None),
+        "user_role_change_failed",
+        "User role change failed",
+        "users_roles",
+        target_type="user",
+        target_id=user_id,
+        target_label=target_email,
+        status="failed",
+        severity="high" if reason in {"self_demotion_blocked", "last_admin_blocked"} else "medium",
+        metadata={
+            "target_user_id": user_id,
+            "target_user_email": target_email,
+            "old_role": old_role,
+            "new_role": new_role,
+            "reason": reason,
+        },
+        request=request,
+    )
+
+
+@app.route("/api/admin/users/<int:user_id>/role", methods=["PATCH"])
+@admin_auth_required
+def admin_update_user_role(user_id: int):
+    data = request.get_json(silent=True) or {}
+    raw_role = str(data.get("role") or "").strip()
+    if raw_role.lower() not in {"admin", "user"}:
+        _log_admin_role_change_failed(user_id, "invalid_role", new_role=raw_role[:50])
+        return jsonify({"success": False, "message": "Invalid role. Allowed roles are Admin and User."}), 400
+
+    new_role = _normalize_admin_role(raw_role)
+    user = db.session.get(User, int(user_id))
+    if user is None:
+        _log_admin_role_change_failed(user_id, "user_not_found", new_role=new_role)
+        return jsonify({"success": False, "message": "User not found."}), 404
+
+    old_role = _normalize_admin_role(getattr(user, "admin_role", "User"))
+    target_email = str(getattr(user, "email", "") or "").strip().lower()
+    current_admin = getattr(g, "current_admin", {}) or {}
+    current_admin_user_id = current_admin.get("user_id")
+    current_admin_email = str(current_admin.get("email") or "").strip().lower()
+    is_self = (
+        (current_admin_user_id is not None and int(current_admin_user_id) == int(user_id))
+        or (current_admin_email and current_admin_email == target_email)
+    )
+
+    if old_role == new_role:
+        return jsonify({"success": True, "user": _serialize_admin_user(user), "message": "Role is already assigned."})
+
+    if is_self and old_role == "Admin" and new_role != "Admin":
+        _log_admin_role_change_failed(
+            user_id,
+            "self_demotion_blocked",
+            old_role=old_role,
+            new_role=new_role,
+            target_email=target_email,
+        )
+        return jsonify({"success": False, "message": "You cannot remove your own admin role while signed in."}), 403
+
+    if old_role == "Admin" and new_role != "Admin":
+        admin_count = sum(
+            1
+            for candidate in User.query.all()
+            if _normalize_admin_role(getattr(candidate, "admin_role", "User")) == "Admin"
+        )
+        if admin_count <= 1:
+            _log_admin_role_change_failed(
+                user_id,
+                "last_admin_blocked",
+                old_role=old_role,
+                new_role=new_role,
+                target_email=target_email,
+            )
+            return jsonify({"success": False, "message": "At least one admin account must remain."}), 403
+
+    user.admin_role = new_role
+    user.updated_at = datetime.now(UTC)
+    if old_role == "Admin" and new_role != "Admin":
+        user.session_version = _get_user_session_version(user) + 1
+
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        logging.exception("Failed to update admin-managed user role | user_id=%s", user_id)
+        _log_admin_role_change_failed(
+            user_id,
+            "database_error",
+            old_role=old_role,
+            new_role=new_role,
+            target_email=target_email,
+        )
+        return jsonify({"success": False, "message": "Failed to update user role."}), 500
+
+    log_admin_action(
+        getattr(g, "current_admin", None),
+        "user_role_changed",
+        "Changed user role",
+        "users_roles",
+        target_type="user",
+        target_id=user_id,
+        target_label=target_email,
+        status="success",
+        severity="high",
+        metadata={
+            "target_user_id": user_id,
+            "target_user_email": target_email,
+            "old_role": old_role,
+            "new_role": new_role,
+        },
         request=request,
     )
     return jsonify({"success": True, "user": _serialize_admin_user(user)})
@@ -27928,7 +29293,9 @@ def _filtered_admin_audit_query(args):
     if action_type and action_type.lower() != "all":
         query = query.filter(AdminAuditLog.action_type == action_type)
     if module and module.lower() != "all":
-        query = query.filter(AdminAuditLog.module == module)
+        module_filter_key, _ = _admin_audit_module_filter_values(module)
+        candidates = _admin_audit_admin_module_candidates(module_filter_key, module)
+        query = query.filter(AdminAuditLog.module.in_(candidates))
     if status and status != "all":
         query = query.filter(AdminAuditLog.status == status)
     if severity and severity != "all":
@@ -27954,28 +29321,231 @@ def _admin_audit_summary(query) -> dict[str, int]:
     }
 
 
+def _admin_audit_action_options() -> list[dict[str, str]]:
+    seen = set()
+    options = []
+    for value in (
+        _admin_audit_distinct_values(AdminAuditLog.action_type)
+        + [
+            str(row[0] or "").strip()
+            for row in (
+                db.session.query(UserActivityLog.action_type)
+                .filter(UserActivityLog.module.in_(ADMIN_AUDIT_USER_ACTIVITY_MODULES.values()))
+                .filter(UserActivityLog.action_type.isnot(None))
+                .distinct()
+                .all()
+            )
+        ]
+    ):
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        options.append({"value": value, "label": value.replace("_", " ").title()})
+    return options
+
+
+def _admin_audit_filter_options() -> dict[str, list[dict[str, str]]]:
+    module_options = [
+        {"value": key, "label": ADMIN_AUDIT_REAL_MODULE_LABELS[key]}
+        for key in ADMIN_AUDIT_TRUSTED_MODULE_OPTIONS
+    ]
+    seen_module_values = {option["value"] for option in module_options}
+    for module_value in _admin_audit_distinct_values(AdminAuditLog.module):
+        module_key = _admin_audit_module_key(module_value)
+        if module_key == "ai_governance":
+            continue
+        option_value = (
+            module_key if module_key in ADMIN_AUDIT_REAL_MODULE_LABELS else module_value
+        )
+        if option_value in seen_module_values:
+            continue
+        seen_module_values.add(option_value)
+        module_options.append(
+            {"value": option_value, "label": _admin_audit_module_label(module_value)}
+        )
+
+    user_activity_rows = (
+        db.session.query(UserActivityLog.module)
+        .filter(UserActivityLog.module.in_(ADMIN_AUDIT_USER_ACTIVITY_MODULES.values()))
+        .distinct()
+        .all()
+    )
+    for row in user_activity_rows:
+        module_key = _admin_audit_module_key(row[0])
+        if module_key in ADMIN_AUDIT_REAL_MODULE_LABELS and module_key not in seen_module_values:
+            seen_module_values.add(module_key)
+            module_options.append(
+                {"value": module_key, "label": ADMIN_AUDIT_REAL_MODULE_LABELS[module_key]}
+            )
+
+    return {
+        "action_types": [
+            option
+            for option in _admin_audit_action_options()
+            if option.get("value")
+        ],
+        "modules": module_options,
+    }
+
+
+def _serialize_user_activity_as_admin_audit(entry: UserActivityLog) -> dict[str, object]:
+    user = db.session.get(User, int(getattr(entry, "user_id", 0) or 0))
+    metadata = _sanitize_activity_metadata_for_user(getattr(entry, "metadata_json", None))
+    created_at = _as_utc_datetime(getattr(entry, "created_at", None))
+    module_key = _admin_audit_module_key(getattr(entry, "module", ""))
+    action_type = normalize_activity_action_type(getattr(entry, "action_type", None))
+    actor_email = str(getattr(user, "email", "") or "").strip().lower() if user else ""
+    actor_name = str(getattr(user, "full_name", "") or "").strip() if user else ""
+    if not actor_name and actor_email:
+        actor_name = actor_email.split("@", 1)[0].replace(".", " ").title()
+    return {
+        "id": f"activity-{getattr(entry, 'id', '')}",
+        "actor_user_id": getattr(entry, "user_id", None),
+        "actor_name": actor_name or "User",
+        "actor_email": actor_email,
+        "actor_role": "User",
+        "action_type": action_type,
+        "action_label": USER_ACTIVITY_LABELS.get(
+            action_type,
+            safe_activity_str(getattr(entry, "title", None), "User activity event"),
+        ),
+        "module": module_key,
+        "module_label": _admin_audit_module_label(module_key),
+        "target_type": safe_activity_str(getattr(entry, "target_type", None)),
+        "target_id": "",
+        "target_label": "",
+        "event_scope": _admin_audit_module_label(module_key),
+        "status": _admin_audit_status_value(getattr(entry, "status", None)),
+        "severity": normalize_activity_severity(getattr(entry, "severity", None)),
+        "ip_address": safe_activity_str(getattr(entry, "ip_address", None)),
+        "user_agent": "",
+        "metadata": metadata,
+        "created_at": created_at.isoformat() if created_at else None,
+        "_sort_at": created_at or datetime.min.replace(tzinfo=UTC),
+    }
+
+
+def _serialize_admin_audit_for_combined(entry: AdminAuditLog) -> dict[str, object]:
+    payload = _serialize_admin_audit_log(entry)
+    payload["status"] = _admin_audit_status_value(payload.get("status"))
+    payload["_sort_at"] = _as_utc_datetime(getattr(entry, "created_at", None)) or datetime.min.replace(tzinfo=UTC)
+    return payload
+
+
+def _filtered_user_activity_audit_query(args):
+    query = UserActivityLog.query.join(User, User.id == UserActivityLog.user_id)
+    search = str(args.get("search") or "").strip()
+    action_type = str(args.get("action_type") or "").strip()
+    module = str(args.get("module") or "").strip()
+    status = str(args.get("status") or "").strip().lower()
+    severity = str(args.get("severity") or "").strip().lower()
+    start_date = _parse_admin_audit_datetime(args.get("start_date"))
+    end_date = _parse_admin_audit_datetime(args.get("end_date"), end_of_day=True)
+
+    allowed_activity_modules = set(ADMIN_AUDIT_USER_ACTIVITY_MODULES.values())
+    if module and module.lower() != "all":
+        _, activity_module = _admin_audit_module_filter_values(module)
+        if not activity_module:
+            return query.filter(False)
+        query = query.filter(UserActivityLog.module == activity_module)
+    else:
+        query = query.filter(UserActivityLog.module.in_(allowed_activity_modules))
+
+    if search:
+        needle = f"%{search}%"
+        query = query.filter(
+            or_(
+                User.full_name.ilike(needle),
+                User.email.ilike(needle),
+                UserActivityLog.action_type.ilike(needle),
+                UserActivityLog.title.ilike(needle),
+                UserActivityLog.description.ilike(needle),
+                UserActivityLog.module.ilike(needle),
+                UserActivityLog.status.ilike(needle),
+                UserActivityLog.severity.ilike(needle),
+                UserActivityLog.ip_address.ilike(needle),
+                UserActivityLog.target_label.ilike(needle),
+            )
+        )
+    if action_type and action_type.lower() != "all":
+        query = query.filter(UserActivityLog.action_type == action_type)
+    if status and status != "all":
+        if status == "success":
+            query = query.filter(UserActivityLog.status.in_([STATUS_SUCCESS, STATUS_INFO]))
+        else:
+            query = query.filter(UserActivityLog.status == status)
+    if severity and severity != "all":
+        query = query.filter(UserActivityLog.severity == severity)
+    if start_date:
+        query = query.filter(UserActivityLog.created_at >= start_date)
+    if end_date:
+        query = query.filter(UserActivityLog.created_at <= end_date)
+    return query
+
+
+def _combined_admin_audit_items(args) -> list[dict[str, object]]:
+    admin_items = [
+        _serialize_admin_audit_for_combined(item)
+        for item in _filtered_admin_audit_query(args).all()
+        if _admin_audit_module_key(getattr(item, "module", "")) != "ai_governance"
+    ]
+    activity_items = [
+        _serialize_user_activity_as_admin_audit(item)
+        for item in _filtered_user_activity_audit_query(args).all()
+    ]
+    combined = admin_items + activity_items
+    combined.sort(key=lambda item: (item.get("_sort_at"), str(item.get("id", ""))), reverse=True)
+    for item in combined:
+        item.pop("_sort_at", None)
+    return combined
+
+
+def _admin_audit_summary_from_items(items: list[dict[str, object]]) -> dict[str, int]:
+    return {
+        "total_events": len(items),
+        "successful_events": sum(1 for item in items if item.get("status") == "success"),
+        "failed_events": sum(1 for item in items if item.get("status") == "failed"),
+        "high_risk_events": sum(1 for item in items if item.get("severity") in {"high", "critical"}),
+        "critical_events": sum(1 for item in items if item.get("severity") == "critical"),
+        "unique_admins": len({str(item.get("actor_email") or item.get("actor_name") or item.get("actor_user_id") or "") for item in items}),
+    }
+
+
 @app.route("/api/admin/audit-logs", methods=["GET"])
 @admin_auth_required
 def admin_audit_logs():
     page = _parse_positive_int(request.args.get("page"), 1) or 1
     limit = _parse_positive_int(request.args.get("limit"), 20) or 20
     limit = min(max(limit, 10), 100)
-    query = _filtered_admin_audit_query(request.args)
-    total = query.count()
-    summary = _admin_audit_summary(query)
-    items = (
-        query.order_by(AdminAuditLog.created_at.desc(), AdminAuditLog.id.desc())
-        .offset((page - 1) * limit)
-        .limit(limit)
-        .all()
+    combined_items = _combined_admin_audit_items(request.args)
+    total = len(combined_items)
+    summary = _admin_audit_summary_from_items(combined_items)
+    items = combined_items[(page - 1) * limit : page * limit]
+    log_admin_action(
+        getattr(g, "current_admin", None),
+        "audit_trail_viewed",
+        "Viewed admin audit trail",
+        "admin_audit_trail",
+        target_type="audit_log",
+        target_label=f"page {page}",
+        status="success",
+        severity="low",
+        metadata={
+            "page": page,
+            "limit": limit,
+            "total_matching_events": total,
+            "filters": dict(request.args),
+        },
+        request=request,
     )
     return jsonify(
         {
-            "items": [_serialize_admin_audit_log(item) for item in items],
+            "items": items,
             "total": total,
             "page": page,
             "limit": limit,
             "summary": summary,
+            "filter_options": _admin_audit_filter_options(),
         }
     )
 
@@ -27983,29 +29553,23 @@ def admin_audit_logs():
 @app.route("/api/admin/audit-logs/export", methods=["GET"])
 @admin_auth_required
 def admin_audit_logs_export():
-    query = _filtered_admin_audit_query(request.args)
-    items = (
-        query.order_by(AdminAuditLog.created_at.desc(), AdminAuditLog.id.desc())
-        .limit(5000)
-        .all()
-    )
+    items = _combined_admin_audit_items(request.args)[:5000]
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(sanitize_csv_row(["Date", "Actor", "Email", "Role", "Action", "Module", "Event Scope", "Status", "Severity", "IP Address"]))
     for item in items:
-        created_at = _as_utc_datetime(getattr(item, "created_at", None))
         writer.writerow(
             sanitize_csv_row([
-                created_at.isoformat() if created_at else "",
-                item.actor_name or "",
-                item.actor_email or "",
-                item.actor_role or "",
-                item.action_label or item.action_type or "",
-                item.module or "",
-                _admin_audit_event_scope(item),
-                item.status or "",
-                item.severity or "",
-                item.ip_address or "",
+                item.get("created_at") or "",
+                item.get("actor_name") or "",
+                item.get("actor_email") or "",
+                item.get("actor_role") or "",
+                item.get("action_label") or item.get("action_type") or "",
+                item.get("module_label") or _admin_audit_module_label(item.get("module")),
+                item.get("event_scope") or "",
+                item.get("status") or "",
+                item.get("severity") or "",
+                item.get("ip_address") or "",
             ])
         )
     log_admin_action(
@@ -28455,6 +30019,7 @@ def _apply_route_specific_rate_limits() -> None:
         ("admin_password_risk_report_export_early", "RATELIMIT_ADMIN_EXPORT", "10 per hour", admin),
         ("admin_create_user", "RATELIMIT_ADMIN_DESTRUCTIVE", "20 per hour", admin),
         ("admin_update_user_status", "RATELIMIT_ADMIN_DESTRUCTIVE", "20 per hour", admin),
+        ("admin_update_user_role", "RATELIMIT_ADMIN_DESTRUCTIVE", "20 per hour", admin),
         ("admin_delete_user", "RATELIMIT_ADMIN_DESTRUCTIVE", "20 per hour", admin),
         ("admin_audit_threat_action", "RATELIMIT_ADMIN_DESTRUCTIVE", "20 per hour", admin),
         ("admin_ai_governance_update_confidence_thresholds", "RATELIMIT_ADMIN_DESTRUCTIVE", "20 per hour", admin),

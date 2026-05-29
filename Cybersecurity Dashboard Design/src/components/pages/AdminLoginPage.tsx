@@ -7,6 +7,7 @@ import { Button } from '../ui/button';
 import { Card } from '../ui/card';
 import { Input } from '../ui/input';
 import { Label } from '../ui/label';
+import { useAppSettings } from '../../contexts/AppSettingsContext';
 
 type AdminLoginStep = 'credentials' | '2fa';
 const API_BASE_URL =
@@ -15,6 +16,7 @@ const PENDING_2FA_STORAGE_KEY = 'sentinel_pending_2fa_token';
 
 const AdminLoginPage: React.FC = () => {
   const navigate = useNavigate();
+  const { applicationName } = useAppSettings();
   const [step, setStep] = useState<AdminLoginStep>('credentials');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -218,7 +220,7 @@ const AdminLoginPage: React.FC = () => {
           >
             {step === '2fa'
               ? 'Enter the authenticator code for this admin account'
-              : 'Sentinel AI Administrative Access'}
+              : `${applicationName} Administrative Access`}
           </motion.p>
         </div>
 

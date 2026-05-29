@@ -5,10 +5,12 @@ import { ShieldAlert, Lock, ArrowLeft } from 'lucide-react';
 import { Button } from '../ui/button';
 import { Card } from '../ui/card';
 import { useLanguage } from '../../contexts/LanguageContext';
+import { useAppSettings } from '../../contexts/AppSettingsContext';
 
 export const ForbiddenPage: React.FC = () => {
   const navigate = useNavigate();
   const { language, isRtl } = useLanguage();
+  const { applicationName } = useAppSettings();
   const isArabic = language === 'arabic';
   return (
     <div dir={isRtl ? 'rtl' : 'ltr'} className="min-h-screen bg-[#0B0F19] flex items-center justify-center p-4">
@@ -119,7 +121,7 @@ export const ForbiddenPage: React.FC = () => {
           transition={{ delay: 0.6 }}
           className="text-center text-sm text-gray-500 mt-6"
         >
-          Sentinel AI Security Platform • All access is monitored
+          {applicationName} Security Platform - All access is monitored
         </motion.p>
       </motion.div>
     </div>

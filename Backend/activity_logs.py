@@ -16,11 +16,13 @@ MODULE_VAULT = "vault"
 MODULE_AI = "ai"
 MODULE_IDENTITY = "identity"
 MODULE_PASSWORD = "password"
+MODULE_SETTINGS = "settings"
 
 STATUS_SUCCESS = "success"
 STATUS_FAILED = "failed"
 STATUS_WARNING = "warning"
 STATUS_INFO = "info"
+STATUS_SKIPPED = "skipped"
 
 SEVERITY_LOW = "low"
 SEVERITY_MEDIUM = "medium"
@@ -58,8 +60,13 @@ PCAP_EVENT_TYPES = {
 
 VAULT_EVENT_TYPES = {
     "vault_file_uploaded",
+    "vault_file_encrypted",
     "vault_file_downloaded",
     "vault_file_deleted",
+    "vault_access_denied",
+    "vault_operation_failed",
+    "vault_integrity_failed",
+    "vault_integrity_verified",
     "vault_offline_enabled",
     "vault_offline_disabled",
     "vault_wrong_password",
@@ -86,6 +93,9 @@ IDENTITY_EVENT_TYPES = {
     "identity_scan_viewed",
     "identity_report_downloaded",
     "identity_chatbot_question",
+    "identity_source_skipped",
+    "identity_provider_error",
+    "identity_protection_rate_calculated",
 }
 
 PASSWORD_EVENT_TYPES = {
@@ -96,6 +106,17 @@ PASSWORD_EVENT_TYPES = {
     "password_history_cleared",
 }
 
+SETTINGS_EVENT_TYPES = {
+    "profile_settings_updated",
+    "security_settings_updated",
+    "notification_setting_changed",
+    "password_changed",
+    "linked_account_added",
+    "linked_account_updated",
+    "linked_account_deleted",
+    "linked_account_primary_changed",
+}
+
 VALID_ACTIVITY_EVENT_TYPES = (
     AUTH_EVENT_TYPES
     | PCAP_EVENT_TYPES
@@ -103,6 +124,7 @@ VALID_ACTIVITY_EVENT_TYPES = (
     | AI_EVENT_TYPES
     | IDENTITY_EVENT_TYPES
     | PASSWORD_EVENT_TYPES
+    | SETTINGS_EVENT_TYPES
 )
 
 VALID_ACTIVITY_MODULES = {
@@ -112,6 +134,7 @@ VALID_ACTIVITY_MODULES = {
     MODULE_AI,
     MODULE_IDENTITY,
     MODULE_PASSWORD,
+    MODULE_SETTINGS,
 }
 
 VALID_ACTIVITY_STATUSES = {
@@ -119,6 +142,7 @@ VALID_ACTIVITY_STATUSES = {
     STATUS_FAILED,
     STATUS_WARNING,
     STATUS_INFO,
+    STATUS_SKIPPED,
 }
 
 VALID_ACTIVITY_SEVERITIES = {
@@ -126,6 +150,47 @@ VALID_ACTIVITY_SEVERITIES = {
     SEVERITY_MEDIUM,
     SEVERITY_HIGH,
     SEVERITY_CRITICAL,
+}
+
+PASSIVE_AUDIT_ACTION_TYPES = {
+    "threat_viewed",
+    "audit_trail_viewed",
+    "report_viewed",
+    "identity_scan_viewed",
+    "evidence_viewed",
+    "password_history_viewed",
+    "pcap_report_viewed",
+    "pcap_evidence_viewed",
+}
+
+NEVER_DEDUPE_AUDIT_ACTION_TYPES = {
+    "admin_login",
+    "admin_logout",
+    "login_failed",
+    "login_success",
+    "suspicious_login_detected",
+    "new_device_login",
+    "user_invited",
+    "user_created",
+    "user_role_changed",
+    "user_disabled",
+    "user_deleted",
+    "password_breach_detected",
+    "password_check_completed",
+    "vault_access_denied",
+    "vault_file_uploaded",
+    "vault_file_deleted",
+    "identity_confirmed_breach_detected",
+    "identity_scan_started",
+    "identity_scan_completed",
+    "pcap_uploaded",
+    "pcap_analysis_started",
+    "pcap_analysis_completed",
+    "pcap_analysis_cancelled",
+    "pcap_report_downloaded",
+    "pcap_evidence_downloaded",
+    "security_alert_dismissed",
+    "security_alerts_cleared",
 }
 
 USER_ACTIVITY_LABELS = {
@@ -155,8 +220,13 @@ USER_ACTIVITY_LABELS = {
     "pcap_chatbot_question": "PCAP chatbot question asked",
 
     "vault_file_uploaded": "Vault file uploaded",
+    "vault_file_encrypted": "Vault file encrypted",
     "vault_file_downloaded": "Vault file downloaded",
     "vault_file_deleted": "Vault file deleted",
+    "vault_access_denied": "Vault access denied",
+    "vault_operation_failed": "Vault operation failed",
+    "vault_integrity_failed": "Vault integrity check failed",
+    "vault_integrity_verified": "Vault file integrity verified",
     "vault_offline_enabled": "Vault offline access enabled",
     "vault_offline_disabled": "Vault offline access disabled",
     "vault_wrong_password": "Wrong vault password attempt",
@@ -179,12 +249,22 @@ USER_ACTIVITY_LABELS = {
     "identity_scan_viewed": "Identity scan viewed",
     "identity_report_downloaded": "Identity report downloaded",
     "identity_chatbot_question": "Identity chatbot question asked",
+    "identity_source_skipped": "Identity source skipped",
+    "identity_provider_error": "Identity provider unavailable",
+    "identity_protection_rate_calculated": "Identity protection rate calculated",
 
     "password_check_completed": "Password check completed",
     "password_breach_detected": "Breached password detected",
     "weak_password_detected": "Weak password detected",
     "password_history_viewed": "Password history viewed",
     "password_history_cleared": "Password history cleared",
+    "profile_settings_updated": "Profile settings updated",
+    "security_settings_updated": "Security settings updated",
+    "notification_setting_changed": "Notification setting changed",
+    "linked_account_added": "Linked account added",
+    "linked_account_updated": "Linked account updated",
+    "linked_account_deleted": "Linked account deleted",
+    "linked_account_primary_changed": "Primary linked account changed",
 }
 
 
@@ -234,6 +314,23 @@ def normalize_status(value: Any) -> str:
 def normalize_severity(value: Any) -> str:
     normalized = safe_str(value).lower()
     return normalized if normalized in VALID_ACTIVITY_SEVERITIES else SEVERITY_LOW
+
+
+def should_skip_recent_passive_audit(
+    actor_id: Any,
+    actor_type: Any,
+    module: Any,
+    action_type: Any,
+    within_seconds: int = 60,
+    *,
+    recent_record_exists: bool = False,
+) -> bool:
+    normalized_action = safe_str(action_type).lower()
+    if normalized_action in NEVER_DEDUPE_AUDIT_ACTION_TYPES:
+        return False
+    if normalized_action not in PASSIVE_AUDIT_ACTION_TYPES:
+        return False
+    return bool(recent_record_exists)
 
 
 def normalize_bool(value: Any) -> bool:

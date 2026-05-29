@@ -10,6 +10,7 @@ import {
   persistEmergencyModeState,
 } from "../../utils/authSession";
 import { useLanguage } from "../../contexts/LanguageContext";
+import { useAppSettings } from "../../contexts/AppSettingsContext";
 import {
   Eye,
   EyeOff,
@@ -29,6 +30,7 @@ const PENDING_2FA_STORAGE_KEY = "sentinel_pending_2fa_token";
   
 export default function LoginPage() {
   const { language, isRtl } = useLanguage();
+  const { applicationName } = useAppSettings();
   const navigate = useNavigate();
 
   const [showPassword, setShowPassword] = useState(false);
@@ -290,7 +292,7 @@ export default function LoginPage() {
           <div>
             <Shield className="w-16 h-16 mx-auto text-[#64FFDA]" />
             <h1 className="text-4xl font-bold mt-6 bg-gradient-to-r from-white via-[#64FFDA] to-[#3B82F6] bg-clip-text text-transparent">
-              Sentinel AI
+              {applicationName}
             </h1>
             <p className="text-gray-300 mt-4">
               {language === "arabic" ? "أمن سيبراني متقدم مدعوم بالذكاء الاصطناعي." : "Advanced cybersecurity powered by artificial intelligence."}

@@ -72,7 +72,7 @@ class UploadSecurityValidationTests(unittest.TestCase):
         self.assertEqual(file_storage.stream.read(), data)
 
     def test_vault_dangerous_extension_is_rejected_safely(self):
-        for filename in ("malware.exe", "secret.env"):
+        for filename in ("malware.exe", "secret.env", "dump.sql", "deploy.sh", "shell.ps1", "web.php"):
             with self.subTest(filename=filename):
                 file_storage = _upload(filename, b"plain text")
 
@@ -81,6 +81,10 @@ class UploadSecurityValidationTests(unittest.TestCase):
                 self.assertFalse(result["ok"])
                 self.assertEqual(result["error_code"], "invalid_file_type")
                 self.assertEqual(result["safe_reason"], "invalid_extension")
+                self.assertEqual(
+                    result["public_message"],
+                    "This file type is not allowed for security reasons.",
+                )
                 self.assertNotIn(filename, result["public_message"])
 
     def test_vault_normal_text_file_is_accepted(self):

@@ -3,7 +3,7 @@ from pathlib import PurePosixPath, PureWindowsPath
 
 
 PCAP_PUBLIC_MESSAGE = "Invalid PCAP file. Please upload a valid .pcap or .pcapng file."
-VAULT_PUBLIC_MESSAGE = "This file type is not allowed."
+VAULT_PUBLIC_MESSAGE = "This file type is not allowed for security reasons."
 
 PCAP_ALLOWED_EXTENSIONS = {".pcap", ".pcapng"}
 PCAP_CLASSIC_MAGIC = (

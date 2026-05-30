@@ -12657,6 +12657,137 @@ def _list_admin_password_check_threats(
     return threats
 
 
+def _vault_activity_metadata(raw_value) -> dict:
+    if isinstance(raw_value, dict):
+        return raw_value
+    try:
+        parsed = json.loads(_safe_str(raw_value) or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _list_admin_vault_threats(
+    user_by_id: dict[int, "User"],
+    *,
+    limit: int = 80,
+) -> list[dict[str, object]]:
+    threat_actions = {
+        "vault_wrong_password",
+        "vault_access_denied",
+        "vault_integrity_failed",
+        "vault_operation_failed",
+        "vault_file_deleted",
+        "vault_offline_enabled",
+        "ai_vault_suspicious_behavior",
+        "ai_vault_wrong_password_pattern",
+        "ai_vault_mass_download_pattern",
+        "ai_vault_mass_delete_pattern",
+        "ai_vault_offline_risk_pattern",
+    }
+
+    try:
+        records = (
+            UserActivityLog.query.filter(
+                or_(
+                    UserActivityLog.module == MODULE_VAULT,
+                    UserActivityLog.action_type.in_(threat_actions),
+                )
+            )
+            .filter(UserActivityLog.action_type.in_(threat_actions))
+            .order_by(UserActivityLog.created_at.desc(), UserActivityLog.id.desc())
+            .limit(max(1, min(int(limit or 80), 160)))
+            .all()
+        )
+    except Exception:
+        logging.exception("Failed to read File Vault activity for admin threat feed")
+        return []
+
+    severity_by_action = {
+        "vault_wrong_password": "High",
+        "vault_access_denied": "High",
+        "vault_integrity_failed": "Critical",
+        "vault_operation_failed": "High",
+        "vault_file_deleted": "Medium",
+        "vault_offline_enabled": "Medium",
+        "ai_vault_suspicious_behavior": "High",
+        "ai_vault_wrong_password_pattern": "High",
+        "ai_vault_mass_download_pattern": "High",
+        "ai_vault_mass_delete_pattern": "Critical",
+        "ai_vault_offline_risk_pattern": "Medium",
+    }
+    confidence_by_severity = {"Critical": 94, "High": 86, "Medium": 68, "Low": 45}
+
+    threats: list[dict[str, object]] = []
+    for record in records:
+        action_type = _safe_str(getattr(record, "action_type", None))
+        severity = _normalize_dashboard_alert_severity(
+            severity_by_action.get(action_type) or getattr(record, "severity", None)
+        )
+        confidence = confidence_by_severity.get(severity, 60)
+        timestamp_dt = _as_utc_datetime(getattr(record, "created_at", None))
+        timestamp = timestamp_dt.isoformat() if timestamp_dt else None
+        user_id = _safe_int(getattr(record, "user_id", None), 0)
+        user = user_by_id.get(user_id)
+        masked_identifier = _mask_admin_identifier(getattr(user, "email", None))
+        metadata = _vault_activity_metadata(getattr(record, "metadata_json", None))
+        filename = _safe_str(getattr(record, "target_label", None) or metadata.get("filename"))
+        title = _safe_str(getattr(record, "title", None), "File Vault security event")
+        description = _safe_str(
+            getattr(record, "description", None),
+            "Encrypted File Vault activity requires administrative review.",
+        )
+        evidence = _sanitize_for_json(
+            {
+                "Vault Event ID": _safe_str(getattr(record, "event_id", None)) or None,
+                "Action Type": action_type,
+                "Status": _safe_str(getattr(record, "status", None)) or None,
+                "Vault File": filename or None,
+                "Target Type": _safe_str(getattr(record, "target_type", None)) or None,
+                "Target ID": _safe_str(getattr(record, "target_id", None)) or None,
+                "Offline Enabled": metadata.get("offline_enabled"),
+                "Previous Offline Enabled": metadata.get("previous_offline_enabled"),
+                "Size Bytes": metadata.get("size_bytes"),
+                "Timestamp": timestamp,
+            }
+        )
+        threats.append(
+            {
+                "id": f"vault-{getattr(record, 'id', '')}",
+                "title": title,
+                "description": description,
+                "module": "File Vault",
+                "source_module": "File Vault",
+                "masked_user_identifier": masked_identifier,
+                "affected_user_name": "Masked user",
+                "affected_user_email": masked_identifier,
+                "severity": severity,
+                "status": _normalize_admin_threat_status(None, severity=severity, confidence=confidence),
+                "confidence": confidence,
+                "risk_score": confidence,
+                "timestamp": timestamp,
+                "summary": description,
+                "allowed_actions": ["view_evidence", "acknowledge", "mark_false_positive"],
+                "evidence_available": True,
+                "threat_detected": severity in {"Critical", "High"},
+                "linked_accounts_count": 0,
+                "ip_address": _safe_str(getattr(record, "ip_address", None)) or None,
+                "device_context": "Encrypted File Vault",
+                "investigation_summary": description,
+                "evidence": evidence,
+                "audit_preview": [
+                    {
+                        "label": "Vault event recorded",
+                        "actor": "Encrypted File Vault",
+                        "createdAt": timestamp,
+                    }
+                ],
+            }
+        )
+
+    return threats
+
+
 def _build_demo_shared_admin_threats(
     users: list["User"], linked_accounts_by_user_id: dict[int, int]
 ) -> list[dict[str, object]]:
@@ -12787,6 +12918,7 @@ def _build_admin_threat_feed() -> list[dict[str, object]]:
         for alert in pcap_alerts
     )
     alerts.extend(_list_admin_password_check_threats(user_by_id, represented_password_check_ids))
+    alerts.extend(_list_admin_vault_threats(user_by_id))
 
     alerts.sort(
         key=lambda item: _parse_dashboard_alert_epoch(item.get("timestamp"), fallback=0.0),
@@ -16894,6 +17026,12 @@ def _admin_security_incidents_report_summary_early():
     return admin_security_incidents_report_summary()
 
 
+
+@app.route("/api/admin/reports/file-vault-activity-summary", methods=["GET"], endpoint="admin_file_vault_activity_report_summary_early")
+@admin_auth_required
+def _admin_file_vault_activity_report_summary_early():
+    return admin_file_vault_activity_report_summary()
+
 @app.route("/api/<path:path>", methods=["OPTIONS"])
 def handle_options(path):
     resp = app.make_response("")
@@ -20573,6 +20711,90 @@ def _deserialize_monthly_report_payload(report_record: "MonthlySecurityReport") 
         return {}
 
 
+def _get_monthly_report_payload_for_user(user_id: int, report_month_key: str) -> dict | None:
+    normalized = normalize_report_month(report_month_key)
+    if normalized is None:
+        return None
+
+    report_record = MonthlySecurityReport.query.filter_by(
+        user_id=int(user_id),
+        report_month=normalized.month_key,
+    ).first()
+    if report_record is None:
+        return None
+
+    return _deserialize_monthly_report_payload(report_record)
+
+
+def _monthly_report_vault_section_needs_repair(payload: dict) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    sections = payload.get("sections") if isinstance(payload.get("sections"), dict) else {}
+    vault = sections.get("vault") if isinstance(sections.get("vault"), dict) else {}
+    if not vault:
+        return False
+    total_events = _safe_int(vault.get("total_events"), 0)
+    action_breakdown = vault.get("action_breakdown")
+    if total_events <= 0 or not isinstance(action_breakdown, list):
+        return False
+    names = {
+        str(item.get("name") or "").strip().lower()
+        for item in action_breakdown
+        if isinstance(item, dict)
+    }
+    known_total = sum(
+        _safe_int(vault.get(key), 0)
+        for key in ("uploads", "downloads", "deletes", "offline_enabled", "offline_disabled", "wrong_password")
+    )
+    return "unknown" in names or known_total == 0
+
+
+def _monthly_report_payload_with_repaired_vault(report_record: "MonthlySecurityReport", user) -> dict:
+    payload = _deserialize_monthly_report_payload(report_record)
+    if not _monthly_report_vault_section_needs_repair(payload):
+        return payload
+
+    normalized = normalize_report_month(getattr(report_record, "report_month", None))
+    if normalized is None:
+        return payload
+
+    try:
+        repaired = build_monthly_security_report_data(
+            user=user,
+            report_month=normalized,
+            pcap_alert_query=_query_user_pcap_alert_records,
+            list_recent_jobs=lambda: jobs.list_recent(limit=0),
+            load_report_payload_for_job=_load_report_payload_for_job,
+            activity_log_query=_query_user_activity_log_records,
+            password_check_query=_query_user_password_check_records,
+        )
+        repaired_sections = repaired.get("sections") if isinstance(repaired.get("sections"), dict) else {}
+        repaired_vault = repaired_sections.get("vault") if isinstance(repaired_sections.get("vault"), dict) else None
+        if not repaired_vault:
+            return payload
+
+        sections = payload.setdefault("sections", {})
+        if not isinstance(sections, dict):
+            sections = {}
+            payload["sections"] = sections
+        sections["vault"] = repaired_vault
+
+        summary = payload.setdefault("summary", {})
+        if isinstance(summary, dict):
+            summary["activity_events"] = _safe_int(repaired_vault.get("total_events"), 0)
+
+        payload["generated_at"] = payload.get("generated_at") or repaired.get("generated_at")
+        report_record.report_payload_json = json.dumps(payload, default=str)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        logging.exception(
+            "Failed to repair monthly File Vault report section | report_id=%s",
+            getattr(report_record, "id", None),
+        )
+    return payload
+
+
 def _query_user_pcap_alert_records(user_id: int):
     return (
         PcapAlertRecord.query.filter_by(user_id=int(user_id))
@@ -20745,7 +20967,7 @@ def list_monthly_security_reports():
     )
     items = []
     for report_record in reports:
-        payload = _deserialize_monthly_report_payload(report_record)
+        payload = _monthly_report_payload_with_repaired_vault(report_record, user)
         items.append(
             {
                 **build_monthly_security_report_summary(payload, report_record),
@@ -20770,7 +20992,7 @@ def get_latest_monthly_security_report():
     if report_record is None:
         return jsonify({"report": None}), 200
 
-    payload = _deserialize_monthly_report_payload(report_record)
+    payload = _monthly_report_payload_with_repaired_vault(report_record, user)
     return jsonify(
         {
             "report": {
@@ -20797,7 +21019,7 @@ def get_monthly_security_report(report_month):
     if report_record is None:
         return jsonify({"error": "Monthly report not found"}), 404
 
-    payload = _deserialize_monthly_report_payload(report_record)
+    payload = _monthly_report_payload_with_repaired_vault(report_record, user)
     return jsonify(
         {
             "report": {
@@ -20824,7 +21046,15 @@ def upload_monthly_report_to_drive(report_month):
 
     try:
         # Ensure the report exists and has a PDF.
-        report_payload = _get_monthly_report_payload_for_user(user.id, normalized.month_key)
+        report_record_for_payload = MonthlySecurityReport.query.filter_by(
+            user_id=user.id,
+            report_month=normalized.month_key,
+        ).first()
+        report_payload = (
+            _monthly_report_payload_with_repaired_vault(report_record_for_payload, user)
+            if report_record_for_payload is not None
+            else None
+        )
         if not isinstance(report_payload, dict):
             return jsonify({"error": "Monthly report was not found. Generate it first."}), 404
 
@@ -20947,7 +21177,7 @@ def generate_monthly_security_report():
         )
         return jsonify({"error": "Monthly report generation failed"}), 500
 
-    payload = _deserialize_monthly_report_payload(report_record)
+    payload = _monthly_report_payload_with_repaired_vault(report_record, user)
     return jsonify(
         {
             "success": True,
@@ -27159,6 +27389,186 @@ def admin_user_activity_report_summary():
         },
     )
     return jsonify({"success": True, "report": report})
+
+
+
+def _file_vault_activity_report_payload(args) -> dict[str, object]:
+    period_start, period_end, period_label = _user_activity_report_period(args)
+    period_start_db = period_start.replace(tzinfo=None)
+    period_end_db = period_end.replace(tzinfo=None)
+
+    from encrypted_file_vault.models import VaultDocument
+
+    total_documents = int(VaultDocument.query.count() or 0)
+    documents_uploaded = int(
+        VaultDocument.query
+        .filter(VaultDocument.upload_date >= period_start_db)
+        .filter(VaultDocument.upload_date <= period_end_db)
+        .count()
+        or 0
+    )
+    offline_enabled_documents = int(
+        VaultDocument.query.filter(VaultDocument.offline_enabled.is_(True)).count()
+        or 0
+    )
+    unique_owners = int(
+        db.session.query(func.count(func.distinct(VaultDocument.user_id)))
+        .select_from(VaultDocument)
+        .scalar()
+        or 0
+    )
+
+    latest_document = (
+        VaultDocument.query
+        .order_by(VaultDocument.upload_date.desc(), VaultDocument.id.desc())
+        .first()
+    )
+
+    records = (
+        UserActivityLog.query
+        .filter(UserActivityLog.module == MODULE_VAULT)
+        .filter(UserActivityLog.created_at >= period_start_db)
+        .filter(UserActivityLog.created_at <= period_end_db)
+        .order_by(UserActivityLog.created_at.desc(), UserActivityLog.id.desc())
+        .limit(5000)
+        .all()
+    )
+
+    action_distribution = Counter(
+        normalize_activity_action_type(getattr(item, "action_type", None))
+        for item in records
+    )
+    severity_distribution = Counter(
+        normalize_activity_severity(getattr(item, "severity", None))
+        for item in records
+    )
+    status_distribution = Counter(
+        normalize_activity_status(getattr(item, "status", None))
+        for item in records
+    )
+    timeline_counter = Counter(
+        _as_utc_datetime(getattr(item, "created_at", None)).date().isoformat()
+        for item in records
+        if _as_utc_datetime(getattr(item, "created_at", None)) is not None
+    )
+    file_counter = Counter(
+        safe_activity_str(getattr(item, "target_label", None))
+        for item in records
+        if safe_activity_str(getattr(item, "target_label", None))
+    )
+
+    def action_count(*action_types: str) -> int:
+        wanted = {normalize_activity_action_type(action_type) for action_type in action_types}
+        return int(sum(count for action_type, count in action_distribution.items() if action_type in wanted))
+
+    suspicious_events = [
+        item
+        for item in records
+        if bool(getattr(item, "is_suspicious", False))
+        or normalize_activity_status(getattr(item, "status", None)) == STATUS_FAILED
+        or normalize_activity_severity(getattr(item, "severity", None)) in {SEVERITY_HIGH, SEVERITY_CRITICAL}
+    ]
+
+    latest_activity = _as_utc_datetime(getattr(records[0], "created_at", None)) if records else None
+    latest_upload_at = _as_utc_datetime(getattr(latest_document, "upload_date", None)) if latest_document else None
+
+    recommendations: list[str] = []
+    if total_documents <= 0:
+        recommendations.append("Upload at least one encrypted file to populate the File Vault activity report.")
+    if action_count("vault_wrong_password") > 0:
+        recommendations.append("Review wrong vault password attempts and confirm they were expected.")
+    if action_count("vault_access_denied") > 0:
+        recommendations.append("Investigate denied vault access attempts against protected documents.")
+    if action_count("vault_integrity_failed") > 0:
+        recommendations.append("Check vault file integrity failures immediately and verify stored encrypted files.")
+    if not recommendations:
+        recommendations.append("Encrypted File Vault is active with no high-risk vault events in the selected period.")
+
+    return {
+        "report_name": "File Vault Activity Summary",
+        "status": "active",
+        "generated_at": datetime.now(UTC).isoformat(),
+        "reporting_period": {
+            "label": period_label,
+            "start": period_start.isoformat(),
+            "end": period_end.isoformat(),
+        },
+        "data_source": "encrypted_file_vault",
+        "summary": {
+            "total_documents": total_documents,
+            "documents_uploaded": documents_uploaded,
+            "unique_owners": unique_owners,
+            "offline_enabled_documents": offline_enabled_documents,
+            "upload_events": action_count("vault_file_uploaded"),
+            "encryption_events": action_count("vault_file_encrypted"),
+            "download_events": action_count("vault_file_downloaded"),
+            "delete_events": action_count("vault_file_deleted"),
+            "integrity_verified_events": action_count("vault_integrity_verified"),
+            "wrong_password_events": action_count("vault_wrong_password"),
+            "access_denied_events": action_count("vault_access_denied"),
+            "integrity_failures": action_count("vault_integrity_failed"),
+            "offline_enabled_events": action_count("vault_offline_enabled"),
+            "offline_disabled_events": action_count("vault_offline_disabled"),
+            "suspicious_events": len(suspicious_events),
+            "latest_activity_at": latest_activity.isoformat() if latest_activity else None,
+            "latest_upload_at": latest_upload_at.isoformat() if latest_upload_at else None,
+        },
+        "action_distribution": dict(sorted(action_distribution.items())),
+        "severity_distribution": dict(sorted(severity_distribution.items())),
+        "status_distribution": dict(sorted(status_distribution.items())),
+        "timeline": [{"date": date, "count": count} for date, count in sorted(timeline_counter.items())],
+        "top_files": [
+            {"target_label": label, "count": count}
+            for label, count in file_counter.most_common(10)
+        ],
+        "recent_activity": [
+            {
+                "timestamp": (
+                    _as_utc_datetime(getattr(item, "created_at", None)).isoformat()
+                    if _as_utc_datetime(getattr(item, "created_at", None))
+                    else None
+                ),
+                "user_id": getattr(item, "user_id", None),
+                "action_type": normalize_activity_action_type(getattr(item, "action_type", None)),
+                "action": USER_ACTIVITY_LABELS.get(
+                    normalize_activity_action_type(getattr(item, "action_type", None)),
+                    safe_activity_str(getattr(item, "title", None), "Vault activity"),
+                ),
+                "status": normalize_activity_status(getattr(item, "status", None)),
+                "severity": normalize_activity_severity(getattr(item, "severity", None)),
+                "target_label": safe_activity_str(getattr(item, "target_label", None)) or None,
+            }
+            for item in records[:50]
+        ],
+        "recommendations": recommendations,
+        "empty": total_documents <= 0 and len(records) == 0,
+        "message": (
+            "No encrypted vault documents or vault activity records are available yet."
+            if total_documents <= 0 and len(records) == 0
+            else ""
+        ),
+        "supported_formats": ["pdf", "csv"],
+        "report_available": True,
+        "usingFallback": False,
+    }
+
+
+def admin_file_vault_activity_report_summary():
+    report = _file_vault_activity_report_payload(request.args)
+    _log_reports_center_action(
+        "report_viewed",
+        "Viewed File Vault activity report summary",
+        "File Vault Activity Summary",
+        metadata={
+            "total_documents": _safe_int((report.get("summary") or {}).get("total_documents"), 0)
+            if isinstance(report.get("summary"), dict)
+            else 0,
+            "vault_events": len(report.get("recent_activity") or []),
+            "filters": dict(request.args),
+        },
+    )
+    return jsonify({"success": True, "report": report})
+
 
 
 HIGH_RISK_USERS_EMPTY_MESSAGE = "No high-risk users were found for this period."

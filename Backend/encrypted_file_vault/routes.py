@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from io import BytesIO
 
-from flask import Blueprint, request, jsonify, abort, send_file, current_app
+from flask import Blueprint, request, jsonify, send_file, current_app
 from cryptography.fernet import InvalidToken
 from werkzeug.exceptions import HTTPException
 
@@ -13,7 +13,7 @@ from .crypto import generate_salt, get_cipher_from_password
 from .models import VaultDocument
 from extensions import db
 from security_utils import ensure_path_within_directory, safe_error_response
-from upload_security import validate_vault_upload
+from upload_security import VAULT_DANGEROUS_EXTENSIONS, validate_vault_upload
 
 from activity_logs import (
     MODULE_VAULT,
@@ -84,6 +84,19 @@ def log_vault_event(
         if any(fragment in clean_key.lower() for fragment in ("hash", "salt", "key", "stored_filename", "path")):
             continue
         safe_metadata[clean_key] = value
+    target_id = None
+    target_label = None
+    if doc:
+        try:
+            target_id = str(doc.id)
+            target_label = doc.filename
+        except Exception:
+            target_id = None
+            target_label = None
+    if not target_id and safe_metadata.get("document_id") is not None:
+        target_id = str(safe_metadata.get("document_id"))
+    if not target_label and safe_metadata.get("filename"):
+        target_label = str(safe_metadata.get("filename"))
     try:
         log_user_activity(UserEventPayload(
             user_id=user_id,
@@ -93,9 +106,9 @@ def log_vault_event(
             description=description,
             status=status,
             severity=severity,
-            target_type="vault_document" if doc else None,
-            target_id=str(doc.id) if doc else None,
-            target_label=doc.filename if doc else None,
+            target_type="vault_document" if target_id or target_label else None,
+            target_id=target_id,
+            target_label=target_label,
             ip_address=ip_address[:64] or None,
             metadata_json=safe_metadata,
         ))
@@ -188,16 +201,24 @@ def sanitize_filename(name: str) -> str:
     name = name.replace("\\", "/").split("/")[-1]
     name = _INVALID_NAME_CHARS.sub("_", name)
 
-    if len(name) > 180:
+    if len(name) > 255:
         root, dot, ext = name.rpartition(".")
         if dot:
-            root = root[:150]
-            ext = ext[:20]
+            ext = ext[:32]
+            root = root[: max(1, 254 - len(ext))]
             name = f"{root}.{ext}"
         else:
-            name = name[:180]
+            name = name[:255]
 
     return name or "file"
+
+
+def public_extension_list(extensions: set[str]) -> list[str]:
+    return sorted(
+        str(item or "").strip().lower().lstrip(".")
+        for item in extensions
+        if str(item or "").strip()
+    )
 
 
 def allowed_file(filename: str) -> bool:
@@ -241,6 +262,17 @@ def get_upload_dir() -> Path:
     return upload_dir
 
 
+@bp.route("/api/documents/rules", methods=["GET"])
+def document_rules():
+    return jsonify({
+        "allowed_extensions": public_extension_list(get_allowed_extensions()),
+        "blocked_extensions": public_extension_list(VAULT_DANGEROUS_EXTENSIONS),
+        "max_size_bytes": MAX_FILE_SIZE_BYTES,
+        "max_size_mb": MAX_FILE_SIZE_BYTES // (1024 * 1024),
+        "blocked_message": "This file type is not allowed for security reasons.",
+    }), 200
+
+
 @bp.route("/api/documents", methods=["GET"])
 def list_documents():
     user = get_current_user_via_app()
@@ -259,8 +291,31 @@ def list_documents():
     out = []
 
     for d in docs:
-        path = upload_dir / d.stored_filename
-        size = path.stat().st_size if path.exists() else 0
+        try:
+            path = ensure_path_within_directory(upload_dir / d.stored_filename, upload_dir)
+            size = path.stat().st_size if path.exists() else 0
+        except (OSError, ValueError) as exc:
+            log_vault_event(
+                user_id=user.id,
+                action_type="vault_operation_failed",
+                title="Vault storage path rejected",
+                description="A stored vault filename failed path safety validation.",
+                status=STATUS_FAILED,
+                severity=SEVERITY_HIGH,
+                doc=d,
+                metadata={
+                    "operation": "list_documents",
+                    "document_id": d.id,
+                    "filename": d.filename,
+                },
+            )
+            current_app.logger.warning(
+                "Rejected unsafe vault stored filename | user_id=%s | doc_id=%s | error=%s",
+                user.id,
+                d.id,
+                exc,
+            )
+            size = 0
 
         out.append({
             "id": d.id,
@@ -304,7 +359,7 @@ def upload_document():
             validation.get("safe_reason") or "invalid_file",
         )
         return safe_error_response(
-            public_message=validation.get("public_message") or "This file type is not allowed.",
+            public_message=validation.get("public_message") or "This file type is not allowed for security reasons.",
             error_code=validation.get("error_code") or "invalid_file_type",
             status_code=400,
             log_context={
@@ -318,7 +373,7 @@ def upload_document():
     if not allowed_file(original_name):
         current_app.logger.warning("Rejected File Vault upload | reason=invalid_extension")
         return safe_error_response(
-            public_message="This file type is not allowed.",
+            public_message="This file type is not allowed for security reasons.",
             error_code="invalid_file_type",
             status_code=400,
             log_context={"module": "file_vault", "reason": "invalid_extension"},
@@ -327,11 +382,12 @@ def upload_document():
     raw = file.read()
 
     if not raw:
-        return jsonify({"error": "Empty file"}), 400
+        return jsonify({"error": "empty_file", "message": "Empty files cannot be uploaded."}), 400
 
     if len(raw) > MAX_FILE_SIZE_BYTES:
         return jsonify({
-            "error": "File is too large",
+            "error": "file_too_large",
+            "message": "File size exceeds the allowed limit.",
             "max_size_mb": MAX_FILE_SIZE_BYTES // (1024 * 1024),
         }), 400
 
@@ -443,7 +499,10 @@ def toggle_offline_access(doc_id):
             doc=doc,
             metadata={"operation": "toggle_offline", "document_id": doc_id},
         )
-        abort(403)
+        return jsonify({
+            "error": "forbidden",
+            "message": "You are not allowed to access this file.",
+        }), 403
 
     data = request.get_json(silent=True) or {}
     enabled = bool(data.get("offline_enabled", False))
@@ -514,7 +573,10 @@ def verify_document_integrity(doc_id):
             doc=doc,
             metadata={"operation": "verify_integrity", "document_id": doc_id},
         )
-        abort(403)
+        return jsonify({
+            "error": "forbidden",
+            "message": "You are not allowed to access this file.",
+        }), 403
 
     upload_dir = get_upload_dir()
 
@@ -536,7 +598,7 @@ def verify_document_integrity(doc_id):
         )
 
     if not stored_path.exists():
-        return jsonify({"error": "File not found"}), 404
+        return jsonify({"error": "file_not_found", "message": "File not found."}), 404
 
     with open(stored_path, "rb") as f:
         encrypted_data = f.read()
@@ -559,7 +621,7 @@ def verify_document_integrity(doc_id):
                 "filename": doc.filename,
             },
         )
-        return jsonify({"error": "Wrong encryption password"}), 403
+        return jsonify({"error": "wrong_password", "message": "Wrong encryption password."}), 403
 
     current_hash = calculate_file_hash(decrypted)
 
@@ -634,7 +696,10 @@ def download_document(doc_id):
             doc=doc,
             metadata={"operation": "download", "document_id": doc_id},
         )
-        abort(403)
+        return jsonify({
+            "error": "forbidden",
+            "message": "You are not allowed to access this file.",
+        }), 403
 
     upload_dir = get_upload_dir()
 
@@ -656,7 +721,7 @@ def download_document(doc_id):
         )
 
     if not stored_path.exists():
-        return jsonify({"error": "File not found"}), 404
+        return jsonify({"error": "file_not_found", "message": "File not found."}), 404
 
     with open(stored_path, "rb") as f:
         encrypted_data = f.read()
@@ -679,7 +744,7 @@ def download_document(doc_id):
                 "filename": doc.filename,
             },
         )
-        return jsonify({"error": "Wrong encryption password"}), 403
+        return jsonify({"error": "wrong_password", "message": "Wrong encryption password."}), 403
 
     if calculate_file_hash(decrypted) != doc.file_hash:
         log_vault_event(
@@ -768,7 +833,10 @@ def delete_document(doc_id):
             doc=doc,
             metadata={"operation": "delete", "document_id": doc_id},
         )
-        abort(403)
+        return jsonify({
+            "error": "forbidden",
+            "message": "You are not allowed to access this file.",
+        }), 403
 
     upload_dir = get_upload_dir()
 
@@ -790,7 +858,7 @@ def delete_document(doc_id):
         )
 
     if not stored_path.exists():
-        return jsonify({"error": "File not found"}), 404
+        return jsonify({"error": "file_not_found", "message": "File not found."}), 404
 
     with open(stored_path, "rb") as f:
         encrypted_data = f.read()
@@ -813,7 +881,7 @@ def delete_document(doc_id):
                 "filename": doc.filename,
             },
         )
-        return jsonify({"error": "Wrong encryption password"}), 403
+        return jsonify({"error": "wrong_password", "message": "Wrong encryption password."}), 403
 
     if calculate_file_hash(decrypted) != doc.file_hash:
         log_vault_event(
@@ -864,6 +932,7 @@ def delete_document(doc_id):
         description=f"Deleted encrypted file: {deleted_filename}",
         status=STATUS_SUCCESS,
         severity=SEVERITY_HIGH,
+        doc=doc,
         metadata={
             "document_id": deleted_doc_id,
             "filename": deleted_filename,

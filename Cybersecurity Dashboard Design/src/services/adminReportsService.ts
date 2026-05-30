@@ -10,7 +10,7 @@ import {
 } from "./adminPcapOverview";
 
 export type ReportExportFormat = "pdf" | "csv";
-export type ReportModule = "pcap" | "identity" | "password" | "monthly" | "activity" | "high-risk-users";
+export type ReportModule = "pcap" | "identity" | "password" | "monthly" | "activity" | "high-risk-users" | "security-incidents" | "vault";
 export type PcapReportStatus = "completed" | "running" | "failed" | "queued" | "unknown";
 export type PcapReportRisk = "low" | "medium" | "high" | "critical" | "unknown";
 export type PcapReportAnalysisMode =
@@ -1450,8 +1450,9 @@ export function getFutureReportCategories(): FutureReportCategory[] {
     {
       id: "file-vault",
       title: "File Vault Activity Summary",
-      badge: "Waiting for Module Integration",
-      description: "Prepared for vault access, encryption, and sensitive file activity reporting.",
+      badge: "Connected",
+      description:
+        "Connected to encrypted vault uploads, downloads, encryption events, offline access changes, failed access attempts, and integrity activity records.",
     },
   ];
 }

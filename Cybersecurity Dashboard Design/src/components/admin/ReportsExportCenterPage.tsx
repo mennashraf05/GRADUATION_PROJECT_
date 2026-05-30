@@ -24,7 +24,7 @@ import {
   Users,
   XCircle,
 } from "lucide-react";
-import { toast } from "sonner@2.0.3";
+import { toast } from "sonner";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Card } from "../ui/card";
@@ -72,7 +72,7 @@ import {
   getReportsOverview,
   regeneratePcapReport,
 } from "../../services/adminReportsService";
-import { formatAdminPcapTime } from "../../services/adminPcapOverview";
+import { ADMIN_PCAP_API_BASE, formatAdminPcapTime } from "../../services/adminPcapOverview";
 import "./ReportsExportCenterPage.css";
 
 const DEFAULT_FILTERS: PcapReportFilters = {
@@ -126,6 +126,26 @@ const DEFAULT_SECURITY_INCIDENTS_FILTERS: SecurityIncidentsReportFilters = {
   moduleSource: "all",
   incidentType: "all",
   status: "all",
+};
+
+type VaultReportFilters = {
+  dateFrom: string;
+  dateTo: string;
+  activityType: string;
+  accessStatus: string;
+  severity: string;
+  offlineAccess: string;
+  securitySignal: string;
+};
+
+const DEFAULT_VAULT_FILTERS: VaultReportFilters = {
+  dateFrom: "",
+  dateTo: "",
+  activityType: "all",
+  accessStatus: "all",
+  severity: "all",
+  offlineAccess: "all",
+  securitySignal: "all",
 };
 
 const PASSWORD_FILTER_QUERY_PARAMS = [
@@ -740,8 +760,105 @@ const EMPTY_SECURITY_INCIDENTS_SUMMARY: SecurityIncidentsReportSummary = {
   usingFallback: false,
 };
 
-function formatNumber(value: number | null | undefined): string {
-  return Number(value || 0).toLocaleString();
+
+type FileVaultActivityReportSummary = {
+  report_name: string;
+  status: string;
+  generated_at: string | null;
+  reporting_period: {
+    label: string;
+    start: string | null;
+    end: string | null;
+  };
+  data_source?: string;
+  summary: {
+    total_documents: number;
+    documents_uploaded: number;
+    unique_owners: number;
+    offline_enabled_documents: number;
+    upload_events: number;
+    encryption_events: number;
+    download_events: number;
+    delete_events: number;
+    integrity_verified_events: number;
+    wrong_password_events: number;
+    access_denied_events: number;
+    integrity_failures: number;
+    offline_enabled_events: number;
+    offline_disabled_events: number;
+    suspicious_events: number;
+    latest_activity_at: string | null;
+    latest_upload_at: string | null;
+  };
+  action_distribution: Record<string, number>;
+  severity_distribution: Record<string, number>;
+  status_distribution: Record<string, number>;
+  timeline: Array<{ date: string; count: number }>;
+  top_files: Array<{ target_label: string; count: number }>;
+  recent_activity: Array<{
+    timestamp: string | null;
+    user_id: number | null;
+    action_type: string;
+    action: string;
+    status: string;
+    severity: string;
+    target_label: string | null;
+  }>;
+  recommendations: string[];
+  empty: boolean;
+  message: string;
+  supported_formats: string[];
+  report_available: boolean;
+  usingFallback: boolean;
+};
+
+const EMPTY_FILE_VAULT_SUMMARY: FileVaultActivityReportSummary = {
+  report_name: "File Vault Activity Summary",
+  status: "active",
+  generated_at: null,
+  reporting_period: {
+    label: "Current Month",
+    start: null,
+    end: null,
+  },
+  data_source: "encrypted_file_vault",
+  summary: {
+    total_documents: 0,
+    documents_uploaded: 0,
+    unique_owners: 0,
+    offline_enabled_documents: 0,
+    upload_events: 0,
+    encryption_events: 0,
+    download_events: 0,
+    delete_events: 0,
+    integrity_verified_events: 0,
+    wrong_password_events: 0,
+    access_denied_events: 0,
+    integrity_failures: 0,
+    offline_enabled_events: 0,
+    offline_disabled_events: 0,
+    suspicious_events: 0,
+    latest_activity_at: null,
+    latest_upload_at: null,
+  },
+  action_distribution: {},
+  severity_distribution: {},
+  status_distribution: {},
+  timeline: [],
+  top_files: [],
+  recent_activity: [],
+  recommendations: [],
+  empty: true,
+  message: "No encrypted vault documents or vault activity records are available yet.",
+  supported_formats: ["pdf", "csv"],
+  report_available: false,
+  usingFallback: false,
+};
+
+
+function formatNumber(value: unknown): string {
+  const numeric = Number(value || 0);
+  return Number.isFinite(numeric) ? numeric.toLocaleString() : "0";
 }
 
 function titleCase(value: string): string {
@@ -962,7 +1079,18 @@ const futureIcons: LucideIcon[] = [
   FolderLock,
 ];
 
-type ActiveReportModule = "pcap" | "identity" | "password" | "monthly" | "activity" | "highRisk" | "incidents";
+
+function isVaultReportCategory(category: FutureReportCategory): boolean {
+  const id = String(category.id || "").toLowerCase();
+  const title = String(category.title || "").toLowerCase();
+  return (
+    id.includes("vault") ||
+    title.includes("file vault") ||
+    title.includes("vault activity")
+  );
+}
+
+type ActiveReportModule = "pcap" | "identity" | "password" | "monthly" | "activity" | "highRisk" | "incidents" | "vault";
 
 export default function ReportsExportCenterPage() {
   const [activeReportModule, setActiveReportModule] = useState<ActiveReportModule>("pcap");
@@ -975,6 +1103,7 @@ export default function ReportsExportCenterPage() {
   const [activitySummary, setActivitySummary] = useState<UserActivityReportSummary>(EMPTY_ACTIVITY_SUMMARY);
   const [highRiskSummary, setHighRiskSummary] = useState<HighRiskUsersReportSummary>(EMPTY_HIGH_RISK_SUMMARY);
   const [incidentsSummary, setIncidentsSummary] = useState<SecurityIncidentsReportSummary>(EMPTY_SECURITY_INCIDENTS_SUMMARY);
+  const [vaultSummary, setVaultSummary] = useState<FileVaultActivityReportSummary>(EMPTY_FILE_VAULT_SUMMARY);
   const [futureCategories] = useState(() => getFutureReportCategories());
   const [filters, setFilters] = useState<PcapReportFilters>(DEFAULT_FILTERS);
   const [appliedFilters, setAppliedFilters] = useState<PcapReportFilters>(DEFAULT_FILTERS);
@@ -990,6 +1119,8 @@ export default function ReportsExportCenterPage() {
   const [appliedHighRiskFilters, setAppliedHighRiskFilters] = useState<HighRiskUsersReportFilters>(DEFAULT_HIGH_RISK_FILTERS);
   const [incidentsFilters, setIncidentsFilters] = useState<SecurityIncidentsReportFilters>(DEFAULT_SECURITY_INCIDENTS_FILTERS);
   const [appliedIncidentsFilters, setAppliedIncidentsFilters] = useState<SecurityIncidentsReportFilters>(DEFAULT_SECURITY_INCIDENTS_FILTERS);
+  const [vaultFilters, setVaultFilters] = useState<VaultReportFilters>(DEFAULT_VAULT_FILTERS);
+  const [appliedVaultFilters, setAppliedVaultFilters] = useState<VaultReportFilters>(DEFAULT_VAULT_FILTERS);
   const [loading, setLoading] = useState(true);
   const [identityLoading, setIdentityLoading] = useState(true);
   const [passwordLoading, setPasswordLoading] = useState(true);
@@ -997,6 +1128,7 @@ export default function ReportsExportCenterPage() {
   const [activityLoading, setActivityLoading] = useState(true);
   const [highRiskLoading, setHighRiskLoading] = useState(true);
   const [incidentsLoading, setIncidentsLoading] = useState(true);
+  const [vaultLoading, setVaultLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [identityError, setIdentityError] = useState<string | null>(null);
   const [passwordError, setPasswordError] = useState<string | null>(null);
@@ -1004,6 +1136,7 @@ export default function ReportsExportCenterPage() {
   const [activityError, setActivityError] = useState<string | null>(null);
   const [highRiskError, setHighRiskError] = useState<string | null>(null);
   const [incidentsError, setIncidentsError] = useState<string | null>(null);
+  const [vaultError, setVaultError] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   const [exporting, setExporting] = useState<string | null>(null);
   const [regenerating, setRegenerating] = useState<string | null>(null);
@@ -1017,6 +1150,7 @@ export default function ReportsExportCenterPage() {
   const activityReportRequestId = useRef(0);
   const highRiskReportRequestId = useRef(0);
   const incidentsReportRequestId = useRef(0);
+  const vaultReportRequestId = useRef(0);
 
   const passwordSummaryHasLoaded = Boolean(
     passwordSummary.generated_at ||
@@ -1030,8 +1164,8 @@ export default function ReportsExportCenterPage() {
     monthlySummary.summary.total_events > 0
   );
   const usingFallback = overview.usingFallback || summary.usingFallback;
-  const activeLoading = activeReportModule === "pcap" ? loading : activeReportModule === "identity" ? identityLoading : activeReportModule === "password" ? passwordLoading : activeReportModule === "monthly" ? monthlyLoading : activeReportModule === "activity" ? activityLoading : activeReportModule === "highRisk" ? highRiskLoading : incidentsLoading;
-  const activeError = activeReportModule === "pcap" ? error : activeReportModule === "identity" ? identityError : activeReportModule === "password" ? passwordError : activeReportModule === "monthly" ? monthlyError : activeReportModule === "activity" ? activityError : activeReportModule === "highRisk" ? highRiskError : incidentsError;
+  const activeLoading = activeReportModule === "pcap" ? loading : activeReportModule === "identity" ? identityLoading : activeReportModule === "password" ? passwordLoading : activeReportModule === "monthly" ? monthlyLoading : activeReportModule === "activity" ? activityLoading : activeReportModule === "highRisk" ? highRiskLoading : activeReportModule === "incidents" ? incidentsLoading : vaultLoading;
+  const activeError = activeReportModule === "pcap" ? error : activeReportModule === "identity" ? identityError : activeReportModule === "password" ? passwordError : activeReportModule === "monthly" ? monthlyError : activeReportModule === "activity" ? activityError : activeReportModule === "highRisk" ? highRiskError : activeReportModule === "incidents" ? incidentsError : vaultError;
 
   const attackFamilyOptions = useMemo(() => {
     const families = Array.from(
@@ -1061,9 +1195,48 @@ export default function ReportsExportCenterPage() {
     incidentsSummary.generated_at ||
     incidentsSummary.report_available
   );
+  const vaultSummaryHasLoaded = Boolean(
+    vaultSummary.generated_at ||
+    vaultSummary.report_available ||
+    vaultSummary.summary.total_documents > 0 ||
+    vaultSummary.summary.upload_events > 0
+  );
   const monthlyCoverageHasData = Object.entries(monthlySummary.module_activity_summary).some(([key, value]) => (
     key !== "latest_activity_timestamp" && Number(value || 0) > 0
   ));
+
+  const filteredVaultRecentActivity = useMemo(() => {
+    return vaultSummary.recent_activity.filter((item) => {
+      const actionType = String(item.action_type || item.action || "").toLowerCase();
+      const actionText = String(item.action || item.action_type || "").toLowerCase();
+      const status = String(item.status || "").toLowerCase();
+      const severity = String(item.severity || "").toLowerCase();
+      const eventDate = item.timestamp ? new Date(item.timestamp) : null;
+      const eventDateIso = eventDate && !Number.isNaN(eventDate.getTime()) ? eventDate.toISOString().slice(0, 10) : "";
+      const combined = `${actionType} ${actionText} ${status} ${severity}`;
+
+      if (appliedVaultFilters.dateFrom && (!eventDateIso || eventDateIso < appliedVaultFilters.dateFrom)) return false;
+      if (appliedVaultFilters.dateTo && (!eventDateIso || eventDateIso > appliedVaultFilters.dateTo)) return false;
+      if (appliedVaultFilters.activityType !== "all" && !combined.includes(appliedVaultFilters.activityType)) return false;
+      if (appliedVaultFilters.accessStatus !== "all" && status !== appliedVaultFilters.accessStatus) return false;
+      if (appliedVaultFilters.severity !== "all" && severity !== appliedVaultFilters.severity) return false;
+      if (appliedVaultFilters.offlineAccess === "enabled" && !combined.includes("offline_enabled")) return false;
+      if (appliedVaultFilters.offlineAccess === "disabled" && !combined.includes("offline_disabled")) return false;
+      if (appliedVaultFilters.securitySignal === "suspicious" && !(severity === "critical" || severity === "high" || status === "failed" || status === "denied")) return false;
+      if (appliedVaultFilters.securitySignal === "failed_access" && !(combined.includes("wrong_password") || combined.includes("access_denied") || status === "denied" || status === "failed")) return false;
+      if (appliedVaultFilters.securitySignal === "wrong_password" && !combined.includes("wrong_password")) return false;
+      if (appliedVaultFilters.securitySignal === "integrity_failure" && !(combined.includes("integrity") && (status === "failed" || severity === "critical" || severity === "high"))) return false;
+      return true;
+    });
+  }, [appliedVaultFilters, vaultSummary.recent_activity]);
+
+  const filteredVaultActionDistribution = useMemo(() => {
+    return filteredVaultRecentActivity.reduce<Record<string, number>>((acc, item) => {
+      const key = String(item.action_type || item.action || "vault_activity").toLowerCase();
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {});
+  }, [filteredVaultRecentActivity]);
 
   const loadReports = async (nextFilters = appliedFilters, showToast = false) => {
     const requestId = pcapReportRequestId.current + 1;
@@ -1234,6 +1407,41 @@ export default function ReportsExportCenterPage() {
     }
   };
 
+
+  const loadVaultReport = async (showToast = false) => {
+    const requestId = vaultReportRequestId.current + 1;
+    vaultReportRequestId.current = requestId;
+    setVaultLoading(true);
+    setVaultError(null);
+    try {
+      const adminToken =
+        localStorage.getItem("sentinel_admin_token") ||
+        localStorage.getItem("admin_access_token") ||
+        localStorage.getItem("access_token") ||
+        localStorage.getItem("token") ||
+        "";
+      const response = await fetch(`${ADMIN_PCAP_API_BASE}/api/admin/reports/file-vault-activity-summary`, {
+        credentials: "include",
+        headers: adminToken ? { Authorization: `Bearer ${adminToken}` } : undefined,
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || payload?.success === false) {
+        throw new Error(payload?.message || payload?.error || "File Vault Activity Summary could not be loaded.");
+      }
+      if (requestId !== vaultReportRequestId.current) return;
+      setVaultSummary(payload.report || EMPTY_FILE_VAULT_SUMMARY);
+      if (showToast) toast.success("File Vault Activity Summary refreshed");
+    } catch (loadError) {
+      if (requestId !== vaultReportRequestId.current) return;
+      setVaultError(loadError instanceof Error ? loadError.message : "File Vault Activity Summary could not be loaded.");
+      toast.error("File Vault Activity Summary could not be loaded.");
+    } finally {
+      if (requestId === vaultReportRequestId.current) {
+        setVaultLoading(false);
+      }
+    }
+  };
+
   useEffect(() => {
     void loadReports(DEFAULT_FILTERS);
     void loadIdentityReports(DEFAULT_IDENTITY_FILTERS);
@@ -1242,6 +1450,7 @@ export default function ReportsExportCenterPage() {
     void loadActivityReport(DEFAULT_ACTIVITY_FILTERS);
     void loadHighRiskReport(DEFAULT_HIGH_RISK_FILTERS);
     void loadIncidentsReport(DEFAULT_SECURITY_INCIDENTS_FILTERS);
+    void loadVaultReport();
   }, []);
 
   const applyFilters = () => {
@@ -1306,6 +1515,11 @@ export default function ReportsExportCenterPage() {
       }
       setAppliedIncidentsFilters(selectedIncidentsFilters);
       void loadIncidentsReport(selectedIncidentsFilters, true);
+      return;
+    }
+    if (activeReportModule === "vault") {
+      setAppliedVaultFilters(vaultFilters);
+      void loadVaultReport(true);
       return;
     }
     setAppliedFilters(filters);
@@ -1373,6 +1587,12 @@ export default function ReportsExportCenterPage() {
       void loadIncidentsReport(DEFAULT_SECURITY_INCIDENTS_FILTERS, true);
       return;
     }
+    if (activeReportModule === "vault") {
+      setVaultFilters(DEFAULT_VAULT_FILTERS);
+      setAppliedVaultFilters(DEFAULT_VAULT_FILTERS);
+      void loadVaultReport(true);
+      return;
+    }
     setFilters(DEFAULT_FILTERS);
     setAppliedFilters(DEFAULT_FILTERS);
     void loadReports(DEFAULT_FILTERS);
@@ -1423,6 +1643,10 @@ export default function ReportsExportCenterPage() {
         toast.success("Security Incidents Report refreshed from safe incident records");
         return;
       }
+      if (activeReportModule === "vault") {
+        await loadVaultReport(true);
+        return;
+      }
       const nextSummary = await generatePcapReport(appliedFilters);
       setSummary(nextSummary);
       await loadReports(appliedFilters);
@@ -1439,7 +1663,7 @@ export default function ReportsExportCenterPage() {
 
   const handleExport = async (reportId: string, format: ReportExportFormat) => {
     if (exporting || !activeReportActionsEnabled) return;
-    const exportKey = activeReportModule === "identity" ? `identity-${format}` : activeReportModule === "password" ? `password-${format}` : activeReportModule === "monthly" ? `monthly-${format}` : activeReportModule === "activity" ? `activity-${format}` : activeReportModule === "highRisk" ? `high-risk-${format}` : `${reportId}-${format}`;
+    const exportKey = activeReportModule === "identity" ? `identity-${format}` : activeReportModule === "password" ? `password-${format}` : activeReportModule === "monthly" ? `monthly-${format}` : activeReportModule === "activity" ? `activity-${format}` : activeReportModule === "highRisk" ? `high-risk-${format}` : activeReportModule === "vault" ? `vault-${format}` : `${reportId}-${format}`;
     setExporting(exportKey);
     try {
       if (activeReportModule !== "pcap") {
@@ -1485,6 +1709,9 @@ export default function ReportsExportCenterPage() {
     if (module === "incidents" && !incidentsSummary.generated_at && !incidentsLoading) {
       void loadIncidentsReport(appliedIncidentsFilters);
     }
+    if (module === "vault" && !vaultSummary.generated_at && !vaultLoading) {
+      void loadVaultReport();
+    }
   };
 
   const handleRegenerate = async (reportId: string) => {
@@ -1514,6 +1741,8 @@ export default function ReportsExportCenterPage() {
               ? "High-Risk Users Report"
               : activeReportModule === "incidents"
                 ? "Security Incidents Report"
+                : activeReportModule === "vault"
+                  ? "File Vault Activity Summary"
             : "PCAP Analysis Summary";
   const activeReportLabel =
     activeReportModule === "identity"
@@ -1528,6 +1757,8 @@ export default function ReportsExportCenterPage() {
               ? "High-Risk Users Reporting Active"
               : activeReportModule === "incidents"
                 ? "Security Incidents Reporting Active"
+                : activeReportModule === "vault"
+                  ? "File Vault Reporting Active"
             : "PCAP Reporting Active";
   const activeReportDescription =
     activeReportModule === "identity"
@@ -1542,8 +1773,10 @@ export default function ReportsExportCenterPage() {
               ? "High-Risk Users Report ranks users from safe password, identity, PCAP, notification, and activity risk signals."
               : activeReportModule === "incidents"
                 ? "Security Incidents Report summarizes real security incidents, alerts, findings, and suspicious risk events only."
+                : activeReportModule === "vault"
+                  ? "File Vault Activity Summary uses real Encrypted File Vault documents and safe vault activity logs: uploads, encryption events, downloads, deletes, failed access, integrity checks, offline access, and recommendations."
             : "PCAP report generation based on uploaded capture files, completed analysis jobs, detected attack families, severity distribution, ML/heuristic decisions, evidence availability, timestamps, and export status.";
-  const activeSummaryItems =
+  const activeSummaryItems: Array<[string, React.ReactNode]> =
     activeReportModule === "identity"
       ? [
           ["Report Name", identitySummary.report_name],
@@ -1620,6 +1853,17 @@ export default function ReportsExportCenterPage() {
                     ["Resolved Incidents", formatNumber(incidentsSummary.summary.resolved_incidents)],
                     ["Latest Incident", formatAdminPcapTime(incidentsSummary.summary.latest_incident_timestamp)],
                   ]
+                 : activeReportModule === "vault"
+                  ? [
+                      ["Report Name", vaultSummary.report_name],
+                      ["Generated At", formatAdminPcapTime(vaultSummary.generated_at)],
+                      ["Total Documents", formatNumber(vaultSummary.summary.total_documents)],
+                      ["Upload Events", formatNumber(vaultSummary.summary.upload_events)],
+                      ["Download Events", formatNumber(vaultSummary.summary.download_events)],
+                      ["Failed Access", formatNumber(vaultSummary.summary.wrong_password_events + vaultSummary.summary.access_denied_events)],
+                      ["Integrity Failures", formatNumber(vaultSummary.summary.integrity_failures)],
+                      ["Latest Activity", formatAdminPcapTime(vaultSummary.summary.latest_activity_at)],
+                    ]
         : [
             ["Report Name", summary.report_name],
             ["Last Generated", formatAdminPcapTime(summary.last_generated_at)],
@@ -1645,6 +1889,8 @@ export default function ReportsExportCenterPage() {
               ? highRiskSummaryHasLoaded
               : activeReportModule === "incidents"
                 ? incidentsSummaryHasLoaded
+                : activeReportModule === "vault"
+                  ? vaultSummaryHasLoaded
               : Boolean(summary.last_generated_at || summary.report_available || reports.length > 0);
   const activeReportActionsEnabled = activeReportHasLoaded && !activeLoading && !activeError;
   const activeExportKey = activeReportModule === "highRisk" ? "high-risk" : activeReportModule;
@@ -1696,6 +1942,19 @@ export default function ReportsExportCenterPage() {
         ["Module / Source", titleCase(appliedIncidentsFilters.moduleSource)],
         ["Incident Type", titleCase(appliedIncidentsFilters.incidentType)],
         ["Status", titleCase(appliedIncidentsFilters.status)],
+      ];
+    }
+    if (activeReportModule === "vault") {
+      return [
+        ["Date From", appliedVaultFilters.dateFrom || "All"],
+        ["Date To", appliedVaultFilters.dateTo || "All"],
+        ["Module / Source", "Encrypted File Vault"],
+        ["Vault Activity", titleCase(appliedVaultFilters.activityType)],
+        ["Access Status", titleCase(appliedVaultFilters.accessStatus)],
+        ["Security Level", titleCase(appliedVaultFilters.severity)],
+        ["Offline Access", titleCase(appliedVaultFilters.offlineAccess)],
+        ["Security Signal", titleCase(appliedVaultFilters.securitySignal)],
+        ["Visible Events", formatNumber(filteredVaultRecentActivity.length)],
       ];
     }
     return [
@@ -1825,6 +2084,31 @@ export default function ReportsExportCenterPage() {
         ]),
       };
     }
+    if (activeReportModule === "vault") {
+      const rows: unknown[][] = [
+        ["Section", "Item", "Value", "Count", "Timestamp", "Notes"],
+        sectionRow("Report Metadata", "Report Title", vaultSummary.report_name),
+        sectionRow("Report Metadata", "Generated At", "", "", vaultSummary.generated_at || ""),
+        sectionRow("Report Metadata", "Reporting Period", vaultSummary.reporting_period.label),
+        sectionRow("Summary", "Total Documents", "", vaultSummary.summary.total_documents),
+        sectionRow("Summary", "Documents Uploaded", "", vaultSummary.summary.documents_uploaded),
+        sectionRow("Summary", "Unique Owners", "", vaultSummary.summary.unique_owners),
+        sectionRow("Summary", "Offline Enabled Documents", "", vaultSummary.summary.offline_enabled_documents),
+        sectionRow("Summary", "Upload Events", "", vaultSummary.summary.upload_events),
+        sectionRow("Summary", "Encryption Events", "", vaultSummary.summary.encryption_events),
+        sectionRow("Summary", "Download Events", "", vaultSummary.summary.download_events),
+        sectionRow("Summary", "Delete Events", "", vaultSummary.summary.delete_events),
+        sectionRow("Summary", "Wrong Password Events", "", vaultSummary.summary.wrong_password_events),
+        sectionRow("Summary", "Access Denied Events", "", vaultSummary.summary.access_denied_events),
+        sectionRow("Summary", "Integrity Failures", "", vaultSummary.summary.integrity_failures),
+        sectionRow("Summary", "Latest Activity", "", "", vaultSummary.summary.latest_activity_at || ""),
+      ];
+      Object.entries(vaultSummary.action_distribution).forEach(([action, count]) => rows.push(sectionRow("Action Distribution", titleCase(action), "", count)));
+      Object.entries(vaultSummary.severity_distribution).forEach(([severity, count]) => rows.push(sectionRow("Severity Distribution", titleCase(severity), "", count)));
+      filteredVaultRecentActivity.forEach((item) => rows.push(sectionRow("Recent Activity", item.action, item.target_label || "Aggregate vault event", "", item.timestamp || "", `${titleCase(item.status)} / ${titleCase(item.severity)}`)));
+      vaultSummary.recommendations.forEach((recommendation, index) => rows.push(sectionRow("Recommendations", `Recommendation ${index + 1}`, recommendation)));
+      return { filename: "file-vault-activity-summary.csv", blob: csvBlob(rows) };
+    }
     return { filename: "report.csv", blob: csvBlob([["message"], ["No aggregate report selected"]]) };
   };
 
@@ -1868,6 +2152,13 @@ export default function ReportsExportCenterPage() {
       Object.entries(incidentsSummary.incident_type_distribution).forEach(([type, count]) => rows.push([`Incident Type: ${titleCase(type)}`, count]));
       incidentsSummary.recent_incidents.slice(0, 8).forEach((item, index) => rows.push([`Incident Row ${index + 1}`, `${titleCase(item.severity)} - ${titleCase(item.source)} - ${item.title}`]));
       return { filename: "security-incidents-report.pdf", blob: buildSimplePdfBlob("Security Incidents Report", "Safe filtered security incidents export", rows) };
+    }
+    if (activeReportModule === "vault") {
+      Object.entries(vaultSummary.action_distribution).forEach(([action, count]) => rows.push([`Action: ${titleCase(action)}`, count]));
+      Object.entries(vaultSummary.severity_distribution).forEach(([severity, count]) => rows.push([`Severity: ${titleCase(severity)}`, count]));
+      filteredVaultRecentActivity.slice(0, 8).forEach((item, index) => rows.push([`Vault Activity ${index + 1}`, `${item.action} - ${titleCase(item.status)} - ${formatAdminPcapTime(item.timestamp)}`]));
+      vaultSummary.recommendations.slice(0, 6).forEach((item, index) => rows.push([`Recommendation ${index + 1}`, item]));
+      return { filename: "file-vault-activity-summary.pdf", blob: buildSimplePdfBlob("File Vault Activity Summary", "Safe aggregate vault report export", rows) };
     }
     return { filename: "report.pdf", blob: buildSimplePdfBlob(activeReportTitle, "Safe report export", rows) };
   };
@@ -1938,6 +2229,13 @@ export default function ReportsExportCenterPage() {
             >
               Security Incidents Report
             </Button>
+            <Button
+              variant="outline"
+              className={activeReportModule === "vault" ? "reports-module-button-active" : "reports-action-button"}
+              onClick={() => switchReportModule("vault")}
+            >
+              File Vault Activity Summary
+            </Button>
           </div>
         </div>
         <div className="reports-hero-actions">
@@ -1945,13 +2243,13 @@ export default function ReportsExportCenterPage() {
             <span />
             {activeReportLabel}
           </Badge>
-          <Button variant="outline" className="reports-action-button" disabled={activeLoading} onClick={() => activeReportModule === "identity" ? void loadIdentityReports(appliedIdentityFilters, true) : activeReportModule === "password" ? void loadPasswordReport(appliedPasswordFilters, true) : activeReportModule === "monthly" ? void loadMonthlyReport(appliedMonthlyFilters, true) : activeReportModule === "activity" ? void loadActivityReport(appliedActivityFilters, true) : activeReportModule === "highRisk" ? void loadHighRiskReport(appliedHighRiskFilters, true) : activeReportModule === "incidents" ? void loadIncidentsReport(appliedIncidentsFilters, true) : void loadReports(appliedFilters, true)}>
+          <Button variant="outline" className="reports-action-button" disabled={activeLoading} onClick={() => activeReportModule === "identity" ? void loadIdentityReports(appliedIdentityFilters, true) : activeReportModule === "password" ? void loadPasswordReport(appliedPasswordFilters, true) : activeReportModule === "monthly" ? void loadMonthlyReport(appliedMonthlyFilters, true) : activeReportModule === "activity" ? void loadActivityReport(appliedActivityFilters, true) : activeReportModule === "highRisk" ? void loadHighRiskReport(appliedHighRiskFilters, true) : activeReportModule === "incidents" ? void loadIncidentsReport(appliedIncidentsFilters, true) : activeReportModule === "vault" ? void loadVaultReport(true) : void loadReports(appliedFilters, true)}>
             {activeLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
             Refresh Report
           </Button>
           <Button className="reports-primary-button" onClick={handleGenerate} disabled={generating}>
             {generating ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
-            {activeReportModule === "identity" ? "Generate Identity Report" : activeReportModule === "password" ? "Generate Password Report" : activeReportModule === "monthly" ? "Refresh Monthly Report" : activeReportModule === "activity" ? "Refresh User Activity Report" : activeReportModule === "highRisk" ? "Refresh High-Risk Users Report" : activeReportModule === "incidents" ? "Refresh Security Incidents Report" : "Generate PCAP Report"}
+            {activeReportModule === "identity" ? "Generate Identity Report" : activeReportModule === "password" ? "Generate Password Report" : activeReportModule === "monthly" ? "Refresh Monthly Report" : activeReportModule === "activity" ? "Refresh User Activity Report" : activeReportModule === "highRisk" ? "Refresh High-Risk Users Report" : activeReportModule === "incidents" ? "Refresh Security Incidents Report" : activeReportModule === "vault" ? "Refresh Vault Report" : "Generate PCAP Report"}
           </Button>
           <Button
             variant="outline"
@@ -2002,6 +2300,13 @@ export default function ReportsExportCenterPage() {
             <KpiCard title="High Events" value={monthlyLoading ? "..." : formatNumber(monthlySummary.summary.high)} detail="High severity signals this month" icon={AlertTriangle} tone="purple" />
             <KpiCard title="Generated At" value={monthlyLoading ? "..." : formatAdminPcapTime(monthlySummary.generated_at)} detail="Latest report refresh timestamp" icon={FileText} tone="green" />
           </>
+        ) : activeReportModule === "vault" ? (
+          <>
+            <KpiCard title="Vault Documents" value={vaultLoading ? "..." : formatNumber(vaultSummary.summary.total_documents)} detail="Encrypted documents stored in vault" icon={FolderLock} tone="blue" />
+            <KpiCard title="Upload Events" value={vaultLoading ? "..." : formatNumber(vaultSummary.summary.upload_events)} detail="Vault uploads in reporting period" icon={FileText} tone="green" />
+            <KpiCard title="Downloads / Deletes" value={vaultLoading ? "..." : `${formatNumber(vaultSummary.summary.download_events)} / ${formatNumber(vaultSummary.summary.delete_events)}`} detail="Sensitive vault file activity" icon={FileDown} tone="purple" />
+            <KpiCard title="Failed Access" value={vaultLoading ? "..." : formatNumber(vaultSummary.summary.wrong_password_events + vaultSummary.summary.access_denied_events)} detail="Wrong password and denied access events" icon={ShieldAlert} tone="red" />
+          </>
         ) : activeReportModule === "activity" ? (
           <>
             <KpiCard title="Activity Events" value={activityLoading ? "..." : formatNumber(activitySummary.summary.total_activity_events)} detail="Safe activity records in scope" icon={Users} tone="blue" />
@@ -2045,7 +2350,7 @@ export default function ReportsExportCenterPage() {
             </div>
             <div className="reports-document-visual" aria-hidden="true">
               <FileBarChart className="h-16 w-16" />
-              <span>{activeReportModule === "identity" ? "IDENTITY" : activeReportModule === "password" ? "PASSWORD" : activeReportModule === "monthly" ? "MONTHLY" : activeReportModule === "activity" ? "ACTIVITY" : activeReportModule === "highRisk" ? "RISK" : activeReportModule === "incidents" ? "INCIDENTS" : "PCAP"}</span>
+              <span>{activeReportModule === "identity" ? "IDENTITY" : activeReportModule === "password" ? "PASSWORD" : activeReportModule === "monthly" ? "MONTHLY" : activeReportModule === "activity" ? "ACTIVITY" : activeReportModule === "highRisk" ? "RISK" : activeReportModule === "incidents" ? "INCIDENTS" : activeReportModule === "vault" ? "VAULT" : "PCAP"}</span>
             </div>
           </div>
 
@@ -2061,7 +2366,7 @@ export default function ReportsExportCenterPage() {
           <div className="reports-active-actions">
             <Button className="reports-primary-button" onClick={handleGenerate} disabled={generating}>
               {generating ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
-              {activeReportModule === "identity" ? "Generate Identity Report" : activeReportModule === "password" ? "Generate Password Report" : activeReportModule === "monthly" ? "Refresh Monthly Report" : activeReportModule === "activity" ? "Refresh User Activity Report" : activeReportModule === "highRisk" ? "Refresh High-Risk Users Report" : activeReportModule === "incidents" ? "Refresh Security Incidents Report" : "Generate Report"}
+              {activeReportModule === "identity" ? "Generate Identity Report" : activeReportModule === "password" ? "Generate Password Report" : activeReportModule === "monthly" ? "Refresh Monthly Report" : activeReportModule === "activity" ? "Refresh User Activity Report" : activeReportModule === "highRisk" ? "Refresh High-Risk Users Report" : activeReportModule === "incidents" ? "Refresh Security Incidents Report" : activeReportModule === "vault" ? "Refresh Vault Report" : "Generate Report"}
             </Button>
             <Button
               variant="outline"
@@ -2087,7 +2392,7 @@ export default function ReportsExportCenterPage() {
               variant="outline"
               className="reports-action-button"
               onClick={() => {
-                const table = document.getElementById(activeReportModule === "identity" ? "recent-identity-reports" : activeReportModule === "password" ? "password-risk-report" : activeReportModule === "monthly" ? "monthly-security-report" : activeReportModule === "activity" ? "user-activity-report" : activeReportModule === "highRisk" ? "high-risk-users-report" : activeReportModule === "incidents" ? "security-incidents-report" : "recent-pcap-reports");
+                const table = document.getElementById(activeReportModule === "identity" ? "recent-identity-reports" : activeReportModule === "password" ? "password-risk-report" : activeReportModule === "monthly" ? "monthly-security-report" : activeReportModule === "activity" ? "user-activity-report" : activeReportModule === "highRisk" ? "high-risk-users-report" : activeReportModule === "incidents" ? "security-incidents-report" : activeReportModule === "vault" ? "file-vault-activity-report" : "recent-pcap-reports");
                 table?.scrollIntoView({ behavior: "smooth", block: "start" });
               }}
               disabled={!activeReportActionsEnabled}
@@ -2107,36 +2412,48 @@ export default function ReportsExportCenterPage() {
             <Layers className="h-5 w-5 text-blue-300" />
           </div>
           <div className="reports-future-grid">
-            {futureCategories.map((category, index) => (
-              <FutureCategoryCard
-                key={category.id}
-                category={
-                  category.id === "user-activity" && activityError
-                    ? { ...category, badge: "Waiting for Module Integration" }
-                    : category.id === "high-risk-users" && highRiskError
-                    ? { ...category, badge: "Waiting for Module Integration" }
-                    : category.id === "security-incidents" && incidentsError
-                    ? { ...category, badge: "Waiting for Module Integration" }
-                    : category
-                }
-                icon={futureIcons[index] || FileText}
-                onSelect={
-                  category.id === "monthly-security"
-                    ? () => switchReportModule("monthly")
-                    : category.id === "identity-leak"
-                    ? () => switchReportModule("identity")
-                    : category.id === "user-activity"
-                    ? () => switchReportModule("activity")
-                    : category.id === "high-risk-users"
-                    ? () => switchReportModule("highRisk")
-                    : category.id === "security-incidents"
-                    ? () => switchReportModule("incidents")
-                    : category.id === "password-risk"
-                      ? () => switchReportModule("password")
-                      : undefined
-                }
-              />
-            ))}
+            {futureCategories.map((category, index) => {
+              const isVaultCategory = isVaultReportCategory(category);
+              const displayCategory: FutureReportCategory = isVaultCategory
+                ? {
+                    ...category,
+                    badge: "Connected" as const,
+                    description:
+                      "Connected to encrypted vault documents, uploads, downloads, deletes, integrity checks, failed access, and offline access activity.",
+                  }
+                : category.id === "user-activity" && activityError
+                  ? { ...category, badge: "Waiting for Module Integration" as const }
+                  : category.id === "high-risk-users" && highRiskError
+                  ? { ...category, badge: "Waiting for Module Integration" as const }
+                  : category.id === "security-incidents" && incidentsError
+                  ? { ...category, badge: "Waiting for Module Integration" as const }
+                  : category;
+
+              return (
+                <FutureCategoryCard
+                  key={category.id}
+                  category={displayCategory}
+                  icon={isVaultCategory ? FolderLock : futureIcons[index] || FileText}
+                  onSelect={
+                    isVaultCategory
+                      ? () => switchReportModule("vault")
+                      : category.id === "monthly-security"
+                      ? () => switchReportModule("monthly")
+                      : category.id === "identity-leak"
+                      ? () => switchReportModule("identity")
+                      : category.id === "user-activity"
+                      ? () => switchReportModule("activity")
+                      : category.id === "high-risk-users"
+                      ? () => switchReportModule("highRisk")
+                      : category.id === "security-incidents"
+                      ? () => switchReportModule("incidents")
+                      : category.id === "password-risk"
+                        ? () => switchReportModule("password")
+                        : undefined
+                  }
+                />
+              );
+            })}
           </div>
         </Card>
       </div>
@@ -2145,12 +2462,126 @@ export default function ReportsExportCenterPage() {
         <Card className="reports-filter-card">
           <div className="reports-card-head">
             <div>
-              <h2>{activeReportModule === "identity" ? "Identity Report Filters" : activeReportModule === "password" ? "Password Report Scope" : activeReportModule === "monthly" ? "Monthly Report Scope" : activeReportModule === "activity" ? "User Activity Report Filters" : activeReportModule === "highRisk" ? "High-Risk Users Report Filters" : activeReportModule === "incidents" ? "Security Incidents Report Filters" : "PCAP Report Filters"}</h2>
-              <p>{activeReportModule === "identity" ? "Refine identity scans by risk, source, status, date, and findings." : activeReportModule === "password" ? "Password Risk Summary is aggregate-only and uses all safe Password Checker records." : activeReportModule === "monthly" ? "Monthly Security Report summarizes safe current-month aggregates only." : activeReportModule === "activity" ? "Refine safe user activity by period, role, activity type, and source." : activeReportModule === "highRisk" ? "Refine high-risk users by period, risk level, source, and role." : activeReportModule === "incidents" ? "Refine real security incidents by period, severity, source, type, and status." : "Refine the recent PCAP jobs list by report-ready fields."}</p>
+              <h2>{activeReportModule === "identity" ? "Identity Report Filters" : activeReportModule === "password" ? "Password Report Scope" : activeReportModule === "monthly" ? "Monthly Report Scope" : activeReportModule === "activity" ? "User Activity Report Filters" : activeReportModule === "highRisk" ? "High-Risk Users Report Filters" : activeReportModule === "incidents" ? "Security Incidents Report Filters" : activeReportModule === "vault" ? "File Vault Report Scope" : "PCAP Report Filters"}</h2>
+              <p>{activeReportModule === "identity" ? "Refine identity scans by risk, source, status, date, and findings." : activeReportModule === "password" ? "Password Risk Summary is aggregate-only and uses all safe Password Checker records." : activeReportModule === "monthly" ? "Monthly Security Report summarizes safe current-month aggregates only." : activeReportModule === "activity" ? "Refine safe user activity by period, role, activity type, and source." : activeReportModule === "highRisk" ? "Refine high-risk users by period, risk level, source, and role." : activeReportModule === "incidents" ? "Refine real security incidents by period, severity, source, type, and status." : activeReportModule === "vault" ? "File Vault report uses the current reporting period and safe aggregate vault records only." : "Refine the recent PCAP jobs list by report-ready fields."}</p>
             </div>
             <Filter className="h-5 w-5 text-blue-300" />
           </div>
-          {activeReportModule === "monthly" ? (
+          {activeReportModule === "vault" ? (
+          <>
+            <div className="reports-filter-grid">
+              <div className="reports-filter-span">
+                <label>Date Range</label>
+                <div className="reports-date-row">
+                  <Input
+                    type="date"
+                    value={vaultFilters.dateFrom}
+                    onChange={(event) => setVaultFilters((current) => ({ ...current, dateFrom: event.target.value }))}
+                  />
+                  <Input
+                    type="date"
+                    value={vaultFilters.dateTo}
+                    onChange={(event) => setVaultFilters((current) => ({ ...current, dateTo: event.target.value }))}
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label>Vault Activity</label>
+                <Select value={vaultFilters.activityType} onValueChange={(value: string) => setVaultFilters((current) => ({ ...current, activityType: value }))}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All</SelectItem>
+                    <SelectItem value="upload">Upload</SelectItem>
+                    <SelectItem value="encrypt">Encryption</SelectItem>
+                    <SelectItem value="download">Download</SelectItem>
+                    <SelectItem value="delete">Delete</SelectItem>
+                    <SelectItem value="integrity">Integrity Check</SelectItem>
+                    <SelectItem value="offline">Offline Access</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div>
+                <label>Access Status</label>
+                <Select value={vaultFilters.accessStatus} onValueChange={(value: string) => setVaultFilters((current) => ({ ...current, accessStatus: value }))}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All</SelectItem>
+                    <SelectItem value="success">Success</SelectItem>
+                    <SelectItem value="completed">Completed</SelectItem>
+                    <SelectItem value="failed">Failed</SelectItem>
+                    <SelectItem value="denied">Denied</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div>
+                <label>Security Level</label>
+                <Select value={vaultFilters.severity} onValueChange={(value: string) => setVaultFilters((current) => ({ ...current, severity: value }))}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All</SelectItem>
+                    <SelectItem value="critical">Critical</SelectItem>
+                    <SelectItem value="high">High</SelectItem>
+                    <SelectItem value="medium">Medium</SelectItem>
+                    <SelectItem value="low">Low</SelectItem>
+                    <SelectItem value="unknown">Unknown</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div>
+                <label>Offline Access</label>
+                <Select value={vaultFilters.offlineAccess} onValueChange={(value: string) => setVaultFilters((current) => ({ ...current, offlineAccess: value }))}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All</SelectItem>
+                    <SelectItem value="enabled">Enabled</SelectItem>
+                    <SelectItem value="disabled">Disabled</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div>
+                <label>Security Signal</label>
+                <Select value={vaultFilters.securitySignal} onValueChange={(value: string) => setVaultFilters((current) => ({ ...current, securitySignal: value }))}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All</SelectItem>
+                    <SelectItem value="suspicious">Suspicious Only</SelectItem>
+                    <SelectItem value="failed_access">Failed Access</SelectItem>
+                    <SelectItem value="wrong_password">Wrong Password</SelectItem>
+                    <SelectItem value="integrity_failure">Integrity Failure</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            <div className="reports-evidence-list">
+              <div className="reports-evidence-card">
+                <div className="reports-active-title-row">
+                  <h3>Vault Filter Scope</h3>
+                  <Badge className="reports-badge reports-badge-success">Safe</Badge>
+                </div>
+                <div className="reports-summary-grid">
+                  <div className="reports-summary-item">
+                    <span>Filters Apply To</span>
+                    <strong>Recent vault activity and exports</strong>
+                  </div>
+                  <div className="reports-summary-item">
+                    <span>Security Focus</span>
+                    <strong>Failed access, wrong password, integrity failures</strong>
+                  </div>
+                  <div className="reports-summary-item">
+                    <span>Hidden</span>
+                    <strong>File contents, keys, hashes, salts</strong>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </>
+          ) : activeReportModule === "monthly" ? (
           <div className="reports-filter-grid">
             <div>
               <label>Severity</label>
@@ -2161,7 +2592,7 @@ export default function ReportsExportCenterPage() {
             </div>
             <div>
               <label>Module / Source</label>
-              <Select value={monthlyFilters.module} onValueChange={(value) => setMonthlyFilters((current) => ({ ...current, module: value }))}>
+              <Select value={monthlyFilters.module} onValueChange={(value: MonthlySecurityReportFilters["module"]) => setMonthlyFilters((current) => ({ ...current, module: value }))}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent><SelectItem value="all">All</SelectItem><SelectItem value="pcap_analyzer">PCAP Analyzer</SelectItem><SelectItem value="identity_leak_monitor">Identity Leak Monitor</SelectItem><SelectItem value="password_checker">Password Checker</SelectItem><SelectItem value="notifications">Notifications</SelectItem><SelectItem value="admin_audit_trail">Admin Audit Trail</SelectItem><SelectItem value="user_activity">User Activity</SelectItem><SelectItem value="other_unknown">Other / Unknown</SelectItem></SelectContent>
               </Select>
@@ -2192,7 +2623,7 @@ export default function ReportsExportCenterPage() {
             </div>
             <div>
               <label>Module / Source</label>
-              <Select value={activityFilters.moduleSource} onValueChange={(value) => setActivityFilters((current) => ({ ...current, moduleSource: value }))}>
+              <Select value={activityFilters.moduleSource} onValueChange={(value: UserActivityReportFilters["moduleSource"]) => setActivityFilters((current) => ({ ...current, moduleSource: value }))}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent><SelectItem value="all">All</SelectItem><SelectItem value="admin_audit">Admin Audit Trail</SelectItem><SelectItem value="password_checker">Password Checker</SelectItem><SelectItem value="identity_leak_monitor">Identity Leak Monitor</SelectItem><SelectItem value="pcap_analyzer">PCAP Analyzer</SelectItem><SelectItem value="reports_exports">Reports/Exports</SelectItem><SelectItem value="notifications">Notifications</SelectItem><SelectItem value="authentication">Authentication</SelectItem></SelectContent>
               </Select>
@@ -2216,14 +2647,14 @@ export default function ReportsExportCenterPage() {
             </div>
             <div>
               <label>Module / Source</label>
-              <Select value={incidentsFilters.moduleSource} onValueChange={(value) => setIncidentsFilters((current) => ({ ...current, moduleSource: value }))}>
+              <Select value={incidentsFilters.moduleSource} onValueChange={(value: SecurityIncidentsReportFilters["moduleSource"]) => setIncidentsFilters((current) => ({ ...current, moduleSource: value }))}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent><SelectItem value="all">All</SelectItem><SelectItem value="pcap_analyzer">PCAP Analyzer</SelectItem><SelectItem value="identity_leak_monitor">Identity Leak Monitor</SelectItem><SelectItem value="password_checker">Password Checker</SelectItem><SelectItem value="notifications">Notifications</SelectItem><SelectItem value="authentication">Authentication</SelectItem><SelectItem value="threat_management">Threat Management</SelectItem><SelectItem value="user_activity">User Activity</SelectItem><SelectItem value="admin_audit">Admin Audit Trail</SelectItem><SelectItem value="other">Other / Unknown</SelectItem></SelectContent>
               </Select>
             </div>
             <div>
               <label>Incident Type</label>
-              <Select value={incidentsFilters.incidentType} onValueChange={(value) => setIncidentsFilters((current) => ({ ...current, incidentType: value }))}>
+              <Select value={incidentsFilters.incidentType} onValueChange={(value: SecurityIncidentsReportFilters["incidentType"]) => setIncidentsFilters((current) => ({ ...current, incidentType: value }))}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent><SelectItem value="all">All</SelectItem><SelectItem value="network_alert">Network Alert</SelectItem><SelectItem value="identity_exposure">Identity Exposure</SelectItem><SelectItem value="password_risk">Password Risk</SelectItem><SelectItem value="security_notification">Security Notification</SelectItem><SelectItem value="auth_warning">Auth Warning</SelectItem><SelectItem value="audit_warning">Audit Warning</SelectItem><SelectItem value="threat_management">Threat Management</SelectItem><SelectItem value="other">Other</SelectItem></SelectContent>
               </Select>
@@ -2254,7 +2685,7 @@ export default function ReportsExportCenterPage() {
             </div>
             <div>
               <label>Module / Source</label>
-              <Select value={highRiskFilters.moduleSource} onValueChange={(value) => setHighRiskFilters((current) => ({ ...current, moduleSource: value }))}>
+              <Select value={highRiskFilters.moduleSource} onValueChange={(value: HighRiskUsersReportFilters["moduleSource"]) => setHighRiskFilters((current) => ({ ...current, moduleSource: value }))}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent><SelectItem value="all">All</SelectItem><SelectItem value="password_checker">Password Checker</SelectItem><SelectItem value="identity_leak_monitor">Identity Leak Monitor</SelectItem><SelectItem value="pcap_analyzer">PCAP Analyzer</SelectItem><SelectItem value="authentication">Authentication</SelectItem><SelectItem value="notifications">Notifications</SelectItem><SelectItem value="user_activity">User Activity</SelectItem></SelectContent>
               </Select>
@@ -2279,7 +2710,7 @@ export default function ReportsExportCenterPage() {
               </div>
               <div>
                 <label>Password Strength</label>
-                <Select value={passwordFilters.passwordStrength} onValueChange={(value) => setPasswordFilters((current) => ({ ...current, passwordStrength: value }))}>
+                <Select value={passwordFilters.passwordStrength} onValueChange={(value: PasswordRiskReportFilters["passwordStrength"]) => setPasswordFilters((current) => ({ ...current, passwordStrength: value }))}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent><SelectItem value="all">All</SelectItem><SelectItem value="very_weak">Very Weak</SelectItem><SelectItem value="weak">Weak</SelectItem><SelectItem value="medium">Medium</SelectItem><SelectItem value="strong">Strong</SelectItem></SelectContent>
                 </Select>
@@ -2322,7 +2753,7 @@ export default function ReportsExportCenterPage() {
             </div>
             <div>
               <label>Source</label>
-              <Select value={identityFilters.source} onValueChange={(value) => setIdentityFilters((current) => ({ ...current, source: value }))}>
+              <Select value={identityFilters.source} onValueChange={(value: IdentityReportFilters["source"]) => setIdentityFilters((current) => ({ ...current, source: value }))}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
                   {identitySourceOptions.map((source) => (
@@ -2371,7 +2802,7 @@ export default function ReportsExportCenterPage() {
             </div>
             <div>
               <label>Attack Family</label>
-              <Select value={filters.attackFamily || "all"} onValueChange={(value) => setFilters((current) => ({ ...current, attackFamily: value === "all" ? "" : value }))}>
+              <Select value={filters.attackFamily || "all"} onValueChange={(value: string) => setFilters((current) => ({ ...current, attackFamily: value === "all" ? "" : value }))}>
                 <SelectTrigger><SelectValue placeholder="All" /></SelectTrigger>
                 <SelectContent>
                   {attackFamilyOptions.map((family) => (
@@ -2630,6 +3061,120 @@ export default function ReportsExportCenterPage() {
                     </Table>
                   </div>
                 )}
+              </div>
+            </div>
+          )}
+        </Card>
+
+        ) : activeReportModule === "vault" ? (
+        <Card className="reports-table-card" id="file-vault-activity-report">
+          <div className="reports-card-head">
+            <div>
+              <h2>File Vault Activity Summary</h2>
+              <p>Safe aggregate report from Encrypted File Vault documents and vault activity logs. File contents, hashes, salts, and encryption keys are not exposed.</p>
+            </div>
+            <Badge className="reports-badge reports-badge-blue">{formatNumber(vaultSummary.summary.total_documents)} documents</Badge>
+          </div>
+          {vaultLoading ? (
+            <div className="reports-empty-state">
+              <Loader2 className="h-6 w-6 animate-spin" />
+              Loading File Vault Activity Summary...
+            </div>
+          ) : vaultSummary.empty ? (
+            <div className="reports-evidence-list">
+              <div className="reports-empty-state">
+                <FolderLock className="h-6 w-6" />
+                No vault activity yet. Upload or use a vault file to populate this report.
+              </div>
+              <div className="reports-evidence-card">
+                <div className="reports-active-title-row">
+                  <h3>Minimum Data Needed</h3>
+                  <Badge className="reports-badge reports-badge-blue">Next step</Badge>
+                </div>
+                <div className="reports-summary-grid">
+                  <div className="reports-summary-item">
+                    <span>Start</span>
+                    <strong>Upload an encrypted vault file</strong>
+                  </div>
+                  <div className="reports-summary-item">
+                    <span>Then</span>
+                    <strong>Download, delete, or verify integrity</strong>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="reports-evidence-list">
+              <div className="reports-summary-grid">
+                <div className="reports-summary-item"><span>Total Documents</span><strong>{formatNumber(vaultSummary.summary.total_documents)}</strong></div>
+                <div className="reports-summary-item"><span>Uploaded</span><strong>{formatNumber(vaultSummary.summary.documents_uploaded)}</strong></div>
+                <div className="reports-summary-item"><span>Downloads</span><strong>{formatNumber(vaultSummary.summary.download_events)}</strong></div>
+                <div className="reports-summary-item"><span>Deletes</span><strong>{formatNumber(vaultSummary.summary.delete_events)}</strong></div>
+                <div className="reports-summary-item"><span>Failed Access</span><strong>{formatNumber(vaultSummary.summary.wrong_password_events + vaultSummary.summary.access_denied_events)}</strong></div>
+                <div className="reports-summary-item"><span>Integrity Failures</span><strong>{formatNumber(vaultSummary.summary.integrity_failures)}</strong></div>
+                <div className="reports-summary-item"><span>Offline Enabled</span><strong>{formatNumber(vaultSummary.summary.offline_enabled_documents)}</strong></div>
+                <div className="reports-summary-item"><span>Latest Activity</span><strong>{formatAdminPcapTime(vaultSummary.summary.latest_activity_at)}</strong></div>
+              </div>
+
+              <div className="reports-evidence-card">
+                <div className="reports-active-title-row">
+                  <h3>Action Distribution</h3>
+                  <Badge className="reports-badge reports-badge-success">Real vault logs</Badge>
+                </div>
+                <div className="reports-summary-grid">
+                  {Object.keys(filteredVaultActionDistribution).length === 0 ? (
+                    <div className="reports-summary-item"><span>Vault Actions</span><strong>No activity data for selected filters</strong></div>
+                  ) : Object.entries(filteredVaultActionDistribution).map(([action, count]) => (
+                    <div key={action} className="reports-summary-item"><span>{titleCase(action)}</span><strong>{formatNumber(count)}</strong></div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="reports-evidence-card">
+                <div className="reports-active-title-row">
+                  <h3>Recent Vault Activity</h3>
+                  <Badge className="reports-badge reports-badge-blue">{filteredVaultRecentActivity.length} items</Badge>
+                </div>
+                {filteredVaultRecentActivity.length === 0 ? (
+                  <p className="text-sm text-slate-300">No recent vault activity is available.</p>
+                ) : (
+                  <div className="reports-table-wrap">
+                    <Table className="min-w-[900px] table-fixed">
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead className="w-[180px]">Timestamp</TableHead>
+                          <TableHead className="w-[150px]">Action</TableHead>
+                          <TableHead className="w-[110px]">Status</TableHead>
+                          <TableHead className="w-[110px]">Severity</TableHead>
+                          <TableHead className="w-[240px]">Target</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {filteredVaultRecentActivity.map((item, index) => (
+                          <TableRow key={`${item.timestamp}-${item.action_type}-${index}`}>
+                            <TableCell className="text-slate-400">{formatAdminPcapTime(item.timestamp)}</TableCell>
+                            <TableCell className="text-white">{item.action}</TableCell>
+                            <TableCell><span className={statusBadgeClass(item.status)}>{titleCase(item.status)}</span></TableCell>
+                            <TableCell><span className={riskBadgeClass(item.severity)}>{titleCase(item.severity)}</span></TableCell>
+                            <TableCell className="break-words text-slate-300">{item.target_label || "Aggregate vault event"}</TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                )}
+              </div>
+
+              <div className="reports-evidence-card">
+                <div className="reports-active-title-row">
+                  <h3>Recommendations</h3>
+                  <Badge className="reports-badge reports-badge-blue">{vaultSummary.recommendations.length} items</Badge>
+                </div>
+                <div className="space-y-2">
+                  {vaultSummary.recommendations.map((item) => (
+                    <p key={item} className="text-sm text-slate-300">- {item}</p>
+                  ))}
+                </div>
               </div>
             </div>
           )}

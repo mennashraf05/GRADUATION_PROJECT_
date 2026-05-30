@@ -7,8 +7,8 @@ class VaultDocument(db.Model):
     __tablename__ = "vault_documents"
 
     id = db.Column(db.Integer, primary_key=True)
-    filename = db.Column(db.String(150), nullable=False)
-    stored_filename = db.Column(db.String(200), nullable=False)
+    filename = db.Column(db.String(255), nullable=False)
+    stored_filename = db.Column(db.String(255), nullable=False)
     upload_date = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
     user_id = db.Column(db.Integer, nullable=False)

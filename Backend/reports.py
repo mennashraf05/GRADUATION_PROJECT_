@@ -62,6 +62,107 @@ def _count_by_attr(items, attr_name: str) -> dict:
     return counts
 
 
+def _as_datetime(value) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _report_month_bounds(report_month: ReportingMonth) -> tuple[datetime, datetime]:
+    start = datetime(report_month.year, report_month.month, 1, tzinfo=UTC)
+    if report_month.month == 12:
+        end = datetime(report_month.year + 1, 1, 1, tzinfo=UTC)
+    else:
+        end = datetime(report_month.year, report_month.month + 1, 1, tzinfo=UTC)
+    return start, end
+
+
+def _in_report_month(value, report_month: ReportingMonth) -> bool:
+    timestamp = _as_datetime(value)
+    if timestamp is None:
+        return False
+    start, end = _report_month_bounds(report_month)
+    return start <= timestamp.astimezone(UTC) < end
+
+
+def _filter_items_for_report_month(items, report_month: ReportingMonth, *attrs: str) -> list:
+    filtered = []
+    for item in items or []:
+        for attr_name in attrs:
+            if _in_report_month(getattr(item, attr_name, None), report_month):
+                filtered.append(item)
+                break
+    return filtered
+
+
+def _safe_text(value, default: str = "") -> str:
+    text = str(value or "").strip()
+    return text or default
+
+
+def _vault_action_name(item) -> str:
+    raw = _safe_text(
+        getattr(item, "action_type", None)
+        or getattr(item, "action", None)
+        or getattr(item, "title", None),
+        "unknown",
+    ).lower()
+    raw = raw.replace("-", "_").replace(" ", "_")
+    mapping = {
+        "vault_file_uploaded": "upload",
+        "upload": "upload",
+        "vault_file_encrypted": "encrypt",
+        "encrypt": "encrypt",
+        "encrypted": "encrypt",
+        "vault_file_downloaded": "download",
+        "download": "download",
+        "vault_file_deleted": "delete",
+        "delete": "delete",
+        "vault_offline_enabled": "offline_enabled",
+        "offline_enabled": "offline_enabled",
+        "vault_offline_disabled": "offline_disabled",
+        "offline_disabled": "offline_disabled",
+        "vault_wrong_password": "wrong_password",
+        "wrong_password": "wrong_password",
+        "vault_access_denied": "access_denied",
+        "access_denied": "access_denied",
+        "vault_integrity_failed": "integrity_failed",
+        "integrity_failed": "integrity_failed",
+        "vault_integrity_verified": "integrity_verified",
+        "integrity_verified": "integrity_verified",
+        "vault_operation_failed": "operation_failed",
+        "operation_failed": "operation_failed",
+        "ai_vault_suspicious_behavior": "ai_suspicious_behavior",
+        "ai_vault_wrong_password_pattern": "ai_wrong_password_pattern",
+        "ai_vault_mass_download_pattern": "ai_mass_download_pattern",
+        "ai_vault_mass_delete_pattern": "ai_mass_delete_pattern",
+        "ai_vault_offline_risk_pattern": "ai_offline_risk_pattern",
+        "ai_vault_behavior_safe": "ai_behavior_safe",
+    }
+    return mapping.get(raw, raw or "unknown")
+
+
+def _count_vault_actions(items) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items or []:
+        action_name = _vault_action_name(item)
+        counts[action_name] = counts.get(action_name, 0) + 1
+    return counts
+
+
+def _is_vault_activity(item) -> bool:
+    module = _safe_text(getattr(item, "module", None)).lower().replace("-", "_").replace(" ", "_")
+    action = _safe_text(getattr(item, "action_type", None) or getattr(item, "action", None)).lower()
+    return module in {"vault", "file_vault", "encrypted_file_vault"} or action.startswith("vault_") or action.startswith("ai_vault_")
+
+
 def _first_present(*values, default=0):
     for value in values:
         if value is not None:
@@ -80,12 +181,35 @@ def build_monthly_security_report_data(
     password_check_query=None,
 ) -> dict:
     user_id = int(getattr(user, "id", 0) or 0)
-    pcap_alerts = list(pcap_alert_query(user_id) if callable(pcap_alert_query) else [])
-    activity_logs = list(activity_log_query(user_id) if callable(activity_log_query) else [])
-    password_checks = list(password_check_query(user_id) if callable(password_check_query) else [])
+    pcap_alerts = _filter_items_for_report_month(
+        list(pcap_alert_query(user_id) if callable(pcap_alert_query) else []),
+        report_month,
+        "event_at",
+        "created_at",
+    )
+    activity_logs = _filter_items_for_report_month(
+        list(activity_log_query(user_id) if callable(activity_log_query) else []),
+        report_month,
+        "created_at",
+    )
+    password_checks = _filter_items_for_report_month(
+        list(password_check_query(user_id) if callable(password_check_query) else []),
+        report_month,
+        "created_at",
+        "checked_at",
+    )
+    vault_logs = [item for item in activity_logs if _is_vault_activity(item)]
     recent_jobs = list(list_recent_jobs() if callable(list_recent_jobs) else [])
     severity_counts = _count_by_attr(pcap_alerts, "severity")
-    vault_action_counts = _count_by_attr(activity_logs, "action")
+    vault_action_counts = _count_vault_actions(vault_logs)
+    vault_file_counts: dict[str, int] = {}
+    vault_wrong_password_file_counts: dict[str, int] = {}
+    for item in vault_logs:
+        target_label = _safe_text(getattr(item, "target_label", None))
+        if target_label:
+            vault_file_counts[target_label] = vault_file_counts.get(target_label, 0) + 1
+            if _vault_action_name(item) == "wrong_password":
+                vault_wrong_password_file_counts[target_label] = vault_wrong_password_file_counts.get(target_label, 0) + 1
     weak_password_checks = [
         item
         for item in password_checks
@@ -102,7 +226,7 @@ def build_monthly_security_report_data(
         pcap_recommendations.append("No PCAP threats were recorded for this reporting month.")
 
     vault_recommendations = []
-    if activity_logs:
+    if vault_logs:
         vault_recommendations.append("Review vault activity and confirm unusual file access patterns.")
     else:
         vault_recommendations.append("No vault activity was recorded for this reporting month.")
@@ -129,7 +253,7 @@ def build_monthly_security_report_data(
         },
         "executive_summary": [
             f"{_safe_len(pcap_alerts)} PCAP alerts reviewed for this month.",
-            f"{_safe_len(activity_logs)} file vault events recorded.",
+            f"{_safe_len(vault_logs)} file vault events recorded.",
             f"{_safe_len(password_checks)} password checks included in the security snapshot.",
         ],
         "sections": {
@@ -152,13 +276,27 @@ def build_monthly_security_report_data(
                 "offline_enabled": vault_action_counts.get("offline_enabled", 0),
                 "offline_disabled": vault_action_counts.get("offline_disabled", 0),
                 "wrong_password": vault_action_counts.get("wrong_password", 0),
-                "total_events": _safe_len(activity_logs),
-                "unique_files": 0,
+                "total_events": _safe_len(vault_logs),
+                "unique_files": len(vault_file_counts),
                 "total_storage_bytes": 0,
                 "largest_file": None,
                 "largest_file_size_bytes": 0,
-                "most_active_file": None,
-                "most_failed_file": None,
+                "most_active_file": (
+                    {
+                        "filename": max(vault_file_counts.items(), key=lambda item: item[1])[0],
+                        "activity_count": max(vault_file_counts.values()),
+                    }
+                    if vault_file_counts
+                    else None
+                ),
+                "most_failed_file": (
+                    {
+                        "filename": max(vault_wrong_password_file_counts.items(), key=lambda item: item[1])[0],
+                        "wrong_password_attempts": max(vault_wrong_password_file_counts.values()),
+                    }
+                    if vault_wrong_password_file_counts
+                    else None
+                ),
                 "action_breakdown": [
                     {"name": name, "count": count}
                     for name, count in sorted(vault_action_counts.items(), key=lambda item: item[1], reverse=True)[:8]

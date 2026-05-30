@@ -35,17 +35,44 @@ import {
 import { useLanguage } from "../../contexts/LanguageContext";
 import {
   deleteOfflineFile,
+  decryptOfflineBlob,
+  encryptOfflineBlob,
   getOfflineFile,
   saveOfflineFile,
 } from "../../utils/offlineVault";
 
-const API_BASE_URL =
-  (import.meta as any).env?.VITE_API_BASE_URL || "http://localhost:5000";
+const API_BASE_URL = (() => {
+  const configured = String((import.meta as any).env?.VITE_API_BASE_URL || "")
+    .trim()
+    .replace(/\/+$/, "");
+  if (configured) return configured;
+  if (typeof window !== "undefined") {
+    const host =
+      window.location.hostname === "127.0.0.1" ? "127.0.0.1" : "localhost";
+    const protocol = window.location.protocol === "https:" ? "https:" : "http:";
+    return `${protocol}//${host}:5000`;
+  }
+  return "https://localhost:5000";
+})();
 
-const ALLOWED_EXTENSIONS = new Set([
+const SECURITY_BLOCKED_FILE_TYPE_MESSAGE =
+  "This file type is not allowed for security reasons.";
+
+const DEFAULT_ALLOWED_EXTENSIONS = new Set([
   "pdf",
+  "doc",
   "docx",
   "txt",
+  "xls",
+  "xlsx",
+  "ppt",
+  "pptx",
+  "jpg",
+  "jpeg",
+  "png",
+  "gif",
+  "webp",
+  "csv",
   "py",
   "js",
   "ts",
@@ -57,7 +84,6 @@ const ALLOWED_EXTENSIONS = new Set([
   "h",
   "hpp",
   "cs",
-  "php",
   "go",
   "rs",
   "html",
@@ -68,14 +94,40 @@ const ALLOWED_EXTENSIONS = new Set([
   "yml",
   "yaml",
   "md",
-  "sql",
-  "sh",
-  "bat",
-  "ps1",
-  "env",
   "ini",
   "cfg",
   "toml",
+]);
+
+const DEFAULT_BLOCKED_EXTENSIONS = new Set([
+  "exe",
+  "dll",
+  "bat",
+  "cmd",
+  "ps1",
+  "sh",
+  "php",
+  "jsp",
+  "asp",
+  "aspx",
+  "jar",
+  "vbs",
+  "scr",
+  "msi",
+  "com",
+  "pif",
+  "hta",
+  "cpl",
+  "reg",
+  "lnk",
+  "env",
+  "key",
+  "pem",
+  "p12",
+  "pfx",
+  "sqlite",
+  "db",
+  "sql",
 ]);
 
 const getAuthHeaders = (): Record<string, string> => {
@@ -104,6 +156,11 @@ type VaultFile = {
 
 type PasswordModalMode = "download" | "delete" | "offline";
 
+type VaultRules = {
+  allowed_extensions?: string[];
+  blocked_extensions?: string[];
+};
+
 export function FileVaultPage() {
   const { isRtl, formatDateTime } = useLanguage();
 
@@ -116,6 +173,12 @@ export function FileVaultPage() {
   const [vaultPassword, setVaultPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [fileSearch, setFileSearch] = useState("");
+  const [allowedExtensions, setAllowedExtensions] = useState(
+    DEFAULT_ALLOWED_EXTENSIONS
+  );
+  const [blockedExtensions, setBlockedExtensions] = useState(
+    DEFAULT_BLOCKED_EXTENSIONS
+  );
 
   const [passwordModalOpen, setPasswordModalOpen] = useState(false);
   const [passwordModalMode, setPasswordModalMode] =
@@ -158,6 +221,13 @@ export function FileVaultPage() {
     } catch {
       return { raw: text };
     }
+  };
+
+  const normalizeExtensions = (items: unknown): string[] => {
+    if (!Array.isArray(items)) return [];
+    return items
+      .map((item) => String(item || "").trim().toLowerCase().replace(/^\.+/, ""))
+      .filter(Boolean);
   };
 
   const refreshAuthSession = async (): Promise<boolean> => {
@@ -222,7 +292,10 @@ export function FileVaultPage() {
       const data = await parseResponse(res);
       if (!res.ok) {
         throw new Error(
-          data.error || data.raw || `Failed to load files (${res.status})`
+          data.message ||
+            data.error ||
+            data.raw ||
+            `Failed to load files (${res.status})`
         );
       }
       setFiles(
@@ -243,14 +316,39 @@ export function FileVaultPage() {
     }
   };
 
+  const loadVaultRules = async () => {
+    try {
+      const res = await vaultFetch(`${API_BASE_URL}/api/documents/rules`, {
+        credentials: "include",
+        headers: getAuthHeaders(),
+      });
+      const data = (await parseResponse(res)) as VaultRules;
+      if (!res.ok) return;
+
+      const allowed = normalizeExtensions(data.allowed_extensions);
+      const blocked = normalizeExtensions(data.blocked_extensions);
+      if (allowed.length > 0) setAllowedExtensions(new Set(allowed));
+      if (blocked.length > 0) setBlockedExtensions(new Set(blocked));
+    } catch {
+      // Keep the local deny-list fallback if the rules endpoint is unavailable.
+    }
+  };
+
   useEffect(() => {
+    loadVaultRules();
     loadFiles();
   }, []);
 
   const uploadSingleFile = async (file: File) => {
     const ext = getFileType(file.name);
-    if (ext !== "file" && !ALLOWED_EXTENSIONS.has(ext)) {
-      throw new Error(`File type ".${ext}" is not allowed`);
+    if (ext === "file") {
+      throw new Error("Files without an extension are not allowed.");
+    }
+    if (blockedExtensions.has(ext)) {
+      throw new Error(SECURITY_BLOCKED_FILE_TYPE_MESSAGE);
+    }
+    if (!allowedExtensions.has(ext)) {
+      throw new Error(`File type ".${ext}" is not allowed.`);
     }
 
     const password = vaultPassword.trim();
@@ -270,7 +368,10 @@ export function FileVaultPage() {
     const data = await parseResponse(res);
     if (!res.ok) {
       throw new Error(
-        data.error || data.raw || `Upload failed with status ${res.status}`
+        data.message ||
+          data.error ||
+          data.raw ||
+          `Upload failed with status ${res.status}`
       );
     }
 
@@ -343,15 +444,19 @@ export function FileVaultPage() {
       if (!downloadRes.ok) {
         const data = await parseResponse(downloadRes);
         throw new Error(
-          data.error || data.raw || `Offline cache failed (${downloadRes.status})`
+          data.message ||
+            data.error ||
+            data.raw ||
+            `Offline cache failed (${downloadRes.status})`
         );
       }
-      await saveOfflineFile({
+      const encryptedOfflineFile = await encryptOfflineBlob({
         id: file.id,
         name: file.name,
         blob: await downloadRes.blob(),
-        savedAt: new Date().toISOString(),
+        password,
       });
+      await saveOfflineFile(encryptedOfflineFile);
     } else {
       await deleteOfflineFile(file.id);
     }
@@ -364,8 +469,14 @@ export function FileVaultPage() {
     });
     const data = await parseResponse(res);
     if (!res.ok) {
+      if (nextValue) {
+        await deleteOfflineFile(file.id).catch(() => null);
+      }
       throw new Error(
-        data.error || data.raw || `Offline update failed (${res.status})`
+        data.message ||
+          data.error ||
+          data.raw ||
+          `Offline update failed (${res.status})`
       );
     }
 
@@ -376,28 +487,47 @@ export function FileVaultPage() {
     );
     setSuccessMsg(
       nextValue
-        ? "Offline copy saved on this device"
+        ? "Secure offline copy encrypted on this device"
         : "Offline copy removed from this device"
     );
   };
 
+  const downloadEncryptedOfflineCopy = async (
+    file: VaultFile,
+    password: string
+  ) => {
+    const offlineFile = await getOfflineFile(file.id);
+    if (!offlineFile) throw new Error("No offline copy found for this file");
+    const decrypted = await decryptOfflineBlob(offlineFile, password);
+    downloadBlob(decrypted, offlineFile.originalName || file.name);
+  };
+
   const performDownload = async (file: VaultFile, password: string) => {
     if (!navigator.onLine && file.offlineEnabled) {
-      const offlineFile = await getOfflineFile(file.id);
-      if (!offlineFile) throw new Error("No offline copy found for this file");
-      downloadBlob(offlineFile.blob, offlineFile.name);
+      await downloadEncryptedOfflineCopy(file, password);
       return;
     }
 
-    const res = await vaultFetch(`${API_BASE_URL}/api/documents/${file.id}/download`, {
-      method: "POST",
-      credentials: "include",
-      headers: { ...getAuthHeaders(), "Content-Type": "application/json" },
-      body: JSON.stringify({ password }),
-    });
+    let res: Response;
+    try {
+      res = await vaultFetch(`${API_BASE_URL}/api/documents/${file.id}/download`, {
+        method: "POST",
+        credentials: "include",
+        headers: { ...getAuthHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ password }),
+      });
+    } catch (err) {
+      if (file.offlineEnabled) {
+        await downloadEncryptedOfflineCopy(file, password);
+        return;
+      }
+      throw err;
+    }
     if (!res.ok) {
       const data = await parseResponse(res);
-      throw new Error(data.error || data.raw || `Download failed (${res.status})`);
+      throw new Error(
+        data.message || data.error || data.raw || `Download failed (${res.status})`
+      );
     }
     downloadBlob(await res.blob(), file.name);
   };
@@ -411,7 +541,9 @@ export function FileVaultPage() {
     });
     const data = await parseResponse(res);
     if (!res.ok) {
-      throw new Error(data.error || data.raw || `Delete failed (${res.status})`);
+      throw new Error(
+        data.message || data.error || data.raw || `Delete failed (${res.status})`
+      );
     }
     await deleteOfflineFile(file.id).catch(() => null);
     setFiles((prev) => prev.filter((item) => item.id !== file.id));
@@ -492,6 +624,9 @@ export function FileVaultPage() {
             <p className="mt-2 max-w-xl text-sm leading-6 text-slate-300">
               Upload sensitive files, encrypt them with a strong password, and
               manage secure offline access from one focused workspace.
+            </p>
+            <p className="mt-2 max-w-xl text-xs leading-5 text-cyan-100/75">
+              Offline files are encrypted locally and require your vault password to open.
             </p>
             <div className="mt-5 grid max-w-xl grid-cols-3 overflow-hidden rounded-xl border border-cyan-100/15 bg-slate-950/45 text-xs shadow-inner shadow-black/30">
               {[
@@ -811,14 +946,14 @@ export function FileVaultPage() {
                 ? `Enter file password to delete: ${passwordModalFile.name}`
                 : passwordModalFile.offlineEnabled
                 ? `Enter file password to disable offline access: ${passwordModalFile.name}`
-                : `Enter file password to save offline copy: ${passwordModalFile.name}`}
+                : `Enter file password to encrypt and save offline copy: ${passwordModalFile.name}`}
             </p>
 
             {!navigator.onLine &&
               passwordModalMode === "download" &&
               passwordModalFile.offlineEnabled && (
                 <div className="mb-4 rounded-xl border border-violet-500/30 bg-violet-500/10 p-3 text-sm text-violet-300">
-                  You are offline. The saved local copy will be used.
+                  You are offline. The encrypted local copy will be decrypted with this password.
                 </div>
               )}
 

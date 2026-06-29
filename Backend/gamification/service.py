@@ -469,7 +469,7 @@ class GamificationService:
                 continue
 
             total_points += int(event.points_awarded or 0)
-            if normalized_type in {"analysis_completed", "identity_scan_completed"}:
+            if normalized_type in {"analysis_completed", "identity_scan_completed", "phishing_scan_completed"}:
                 total_scans += 1
             elif normalized_type == "alert_reviewed":
                 total_reviewed_alerts += 1
@@ -969,6 +969,61 @@ class GamificationService:
             },
         )
 
+    def record_phishing_scan_completion(
+        self,
+        user_id: int,
+        scan_id: int,
+        url: str | None = None,
+        domain: str | None = None,
+        final_category: str | None = None,
+        final_risk_score: int | None = None,
+        occurred_at: Any | None = None,
+    ) -> dict[str, Any]:
+        category = safe_str(final_category).strip().lower() or "safe"
+        score = max(0, min(100, safe_int(final_risk_score, 0)))
+        if category not in {"safe", "suspicious", "dangerous"}:
+            if score >= 70:
+                category = "dangerous"
+            elif score >= 40:
+                category = "suspicious"
+            else:
+                category = "safe"
+
+        base_context = {
+            "phishing_scan_id": int(scan_id),
+            "url": safe_str(url),
+            "domain": safe_str(domain),
+            "final_category": category,
+            "final_risk_score": score,
+            "occurred_at": occurred_at,
+        }
+        results: dict[str, Any] = {
+            "phishing_scan_completed": self.process_event(
+                int(user_id),
+                "phishing_scan_completed",
+                base_context,
+            )
+        }
+
+        if category == "safe" or score <= 39:
+            results["phishing_safe_scan_completed"] = self.process_event(
+                int(user_id),
+                "phishing_safe_scan_completed",
+                base_context,
+            )
+        else:
+            risky_points = 10 if category == "dangerous" or score >= 70 else 8
+            results["phishing_risky_url_detected"] = self.process_event(
+                int(user_id),
+                "phishing_risky_url_detected",
+                {
+                    **base_context,
+                    "result_points_override": risky_points,
+                },
+            )
+
+        return results
+
     def backfill_identity_scan_completions(self, user_id: int, limit: int = 250) -> int:
         try:
             from services.identity_web_scraper.database import get_connection as get_identity_connection
@@ -1271,6 +1326,60 @@ class GamificationService:
                 points=int(POINTS[event_type]),
                 metadata=metadata,
                 job_id=f"identity-scan-{scan_id}",
+                event_type=event_type,
+            )
+
+        if event_type in {
+            "phishing_scan_completed",
+            "phishing_safe_scan_completed",
+            "phishing_risky_url_detected",
+        }:
+            scan_id = safe_int(context.get("phishing_scan_id"), 0)
+            if scan_id <= 0:
+                return PreparedEvent(False, "missing_context", None, 0, metadata, event_type=event_type)
+
+            final_category = safe_str(context.get("final_category")).strip().lower() or "safe"
+            final_risk_score = max(0, min(100, safe_int(context.get("final_risk_score"), 0)))
+            if final_category not in {"safe", "suspicious", "dangerous"}:
+                if final_risk_score >= 70:
+                    final_category = "dangerous"
+                elif final_risk_score >= 40:
+                    final_category = "suspicious"
+                else:
+                    final_category = "safe"
+
+            if event_type == "phishing_safe_scan_completed" and not (
+                final_category == "safe" or final_risk_score <= 39
+            ):
+                return PreparedEvent(False, "not_safe_phishing_scan", None, 0, metadata, event_type=event_type)
+            if event_type == "phishing_risky_url_detected" and not (
+                final_category in {"suspicious", "dangerous"} or final_risk_score >= 40
+            ):
+                return PreparedEvent(False, "not_risky_phishing_scan", None, 0, metadata, event_type=event_type)
+
+            metadata.update(
+                {
+                    "phishing_scan_id": scan_id,
+                    "url": compact_message(safe_str(context.get("url")), 280),
+                    "domain": safe_str(context.get("domain")),
+                    "final_category": final_category,
+                    "final_risk_score": final_risk_score,
+                    "category": "PHISHING",
+                }
+            )
+            points = int(POINTS[event_type])
+            if event_type == "phishing_risky_url_detected":
+                points = safe_int(context.get("result_points_override"), points)
+                if points <= 0:
+                    points = int(POINTS[event_type])
+
+            return PreparedEvent(
+                accepted=True,
+                reason=None,
+                event_key=build_event_key(event_type, f"user{user_id}", scan_id),
+                points=points,
+                metadata=metadata,
+                job_id=f"phishing-scan-{scan_id}",
                 event_type=event_type,
             )
 
@@ -1641,7 +1750,7 @@ class GamificationService:
             profile.total_points = int(profile.total_points or 0) + points
             today_stat.points_earned = int(today_stat.points_earned or 0) + points
 
-        if event.event_type in {"analysis_completed", "identity_scan_completed"}:
+        if event.event_type in {"analysis_completed", "identity_scan_completed", "phishing_scan_completed"}:
             profile.total_scans = int(profile.total_scans or 0) + 1
             today_stat.scans_completed = int(today_stat.scans_completed or 0) + 1
         elif event.event_type == "alert_reviewed":
@@ -1979,7 +2088,11 @@ class GamificationService:
 
         total_scan_events = int(profile.total_scans or 0)
         if total_scan_events <= 0:
-            total_scan_events = event_counts["analysis_completed"] + event_counts["identity_scan_completed"]
+            total_scan_events = (
+                event_counts["analysis_completed"]
+                + event_counts["identity_scan_completed"]
+                + event_counts["phishing_scan_completed"]
+            )
 
         weekly_completed_count = UserChallenge.query.filter_by(
             user_id=int(user_id),
@@ -2010,6 +2123,10 @@ class GamificationService:
             "vault_guardian": {"current": event_counts["vault_integrity_verified"], "target": 10},
             "vault_offline_ready": {"current": event_counts["vault_offline_enabled"], "target": 1},
             "vault_offline_manager": {"current": event_counts["vault_offline_disabled"], "target": 1},
+            "phishing_first_url_scan": {"current": event_counts["phishing_scan_completed"], "target": 1},
+            "phishing_safe_link_checker": {"current": event_counts["phishing_safe_scan_completed"], "target": 1},
+            "phishing_hunter": {"current": event_counts["phishing_risky_url_detected"], "target": 1},
+            "weekly_phishing_analyst": {"current": event_counts["phishing_scan_completed"], "target": 3},
         }
 
     def _serialize_challenges(self, challenges: list[UserChallenge]) -> list[dict[str, Any]]:
@@ -2063,6 +2180,12 @@ class GamificationService:
 
         if normalized_type == "weekly_goal_completed":
             return "You earned +15 points for completing all weekly goals."
+
+        if normalized_type == "phishing_risky_url_detected":
+            category = safe_str(metadata.get("final_category")).strip().lower()
+            if category == "dangerous":
+                return f"Phishing: Dangerous URL detected. You earned +{int(event.points_awarded or 0)} points."
+            return f"Phishing: Suspicious URL detected. You earned +{int(event.points_awarded or 0)} points."
 
         if normalized_type == "security_score_improved":
             delta = safe_float(metadata.get("score_delta"), 0.0)

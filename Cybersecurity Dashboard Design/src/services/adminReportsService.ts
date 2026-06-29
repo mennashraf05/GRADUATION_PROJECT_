@@ -10,7 +10,7 @@ import {
 } from "./adminPcapOverview";
 
 export type ReportExportFormat = "pdf" | "csv";
-export type ReportModule = "pcap" | "identity" | "password" | "monthly" | "activity" | "high-risk-users" | "security-incidents" | "vault";
+export type ReportModule = "pcap" | "identity" | "password" | "phishing" | "monthly" | "activity" | "high-risk-users" | "security-incidents" | "vault";
 export type PcapReportStatus = "completed" | "running" | "failed" | "queued" | "unknown";
 export type PcapReportRisk = "low" | "medium" | "high" | "critical" | "unknown";
 export type PcapReportAnalysisMode =
@@ -149,6 +149,64 @@ export interface PasswordRiskReportFilters {
   passwordRisk: "all" | PcapReportRisk;
   passwordStrength: string;
   breachStatus: "all" | "breached" | "not_breached";
+}
+
+export interface PhishingScanReportItem {
+  scan_id: string;
+  user_id: number | null;
+  timestamp: string | null;
+  url: string;
+  domain: string;
+  final_category: "safe" | "suspicious" | "dangerous" | string;
+  final_risk_score: number;
+  risk_level: PcapReportRisk;
+  ml_probability: number | string | null;
+  virustotal_status: string;
+  virustotal_malicious: number;
+  virustotal_suspicious: number;
+}
+
+export interface PhishingIncidentsReportSummary {
+  report_name: "Phishing Incidents Summary";
+  status: "active";
+  generated_at: string | null;
+  last_generated: string | null;
+  reporting_period: {
+    label: string;
+    start: string | null;
+    end: string | null;
+  };
+  data_source: "phishing_scanner";
+  summary: {
+    total_url_scans: number;
+    safe_urls: number;
+    suspicious_urls: number;
+    dangerous_urls: number;
+    risky_urls: number;
+    average_risk_score: number;
+    latest_scan_time: string | null;
+    virustotal_malicious_total: number;
+    virustotal_suspicious_total: number;
+  };
+  category_distribution: Record<string, number>;
+  risk_distribution: Record<string, number>;
+  highest_risk_scan: PhishingScanReportItem | null;
+  latest_scans: PhishingScanReportItem[];
+  recommendations: string[];
+  empty: boolean;
+  message: string;
+  supported_formats: ReportExportFormat[];
+  report_available: boolean;
+  evidence_available: boolean;
+  usingFallback: boolean;
+}
+
+export interface PhishingIncidentsReportFilters {
+  dateFrom: string;
+  dateTo: string;
+  riskLevel: "all" | PcapReportRisk;
+  category: "all" | "safe" | "suspicious" | "dangerous";
+  exportFormat: "all" | ReportExportFormat;
 }
 
 export interface UserActivityReportFilters {
@@ -1076,6 +1134,122 @@ export async function exportPasswordRiskReport(format: ReportExportFormat): Prom
   };
 }
 
+function normalizePhishingScanItem(item: any): PhishingScanReportItem {
+  return {
+    scan_id: String(item?.scan_id || ""),
+    user_id: item?.user_id === null || item?.user_id === undefined ? null : Number(item.user_id || 0),
+    timestamp: item?.timestamp ? String(item.timestamp) : null,
+    url: String(item?.url || ""),
+    domain: String(item?.domain || ""),
+    final_category: String(item?.final_category || "safe"),
+    final_risk_score: Number(item?.final_risk_score || 0),
+    risk_level: String(item?.risk_level || "unknown") as PcapReportRisk,
+    ml_probability: item?.ml_probability === undefined ? null : item.ml_probability,
+    virustotal_status: String(item?.virustotal_status || "clean"),
+    virustotal_malicious: Number(item?.virustotal_malicious || 0),
+    virustotal_suspicious: Number(item?.virustotal_suspicious || 0),
+  };
+}
+
+function normalizePhishingIncidentsReport(payload: any): PhishingIncidentsReportSummary {
+  const summary = payload?.summary && typeof payload.summary === "object" ? payload.summary : {};
+  const period = payload?.reporting_period && typeof payload.reporting_period === "object" ? payload.reporting_period : {};
+  return {
+    report_name: "Phishing Incidents Summary",
+    status: "active",
+    generated_at: payload?.generated_at ? String(payload.generated_at) : null,
+    last_generated: payload?.last_generated ? String(payload.last_generated) : null,
+    reporting_period: {
+      label: String(period.label || "All Time"),
+      start: period.start ? String(period.start) : null,
+      end: period.end ? String(period.end) : null,
+    },
+    data_source: "phishing_scanner",
+    summary: {
+      total_url_scans: Number(summary.total_url_scans || 0),
+      safe_urls: Number(summary.safe_urls || 0),
+      suspicious_urls: Number(summary.suspicious_urls || 0),
+      dangerous_urls: Number(summary.dangerous_urls || 0),
+      risky_urls: Number(summary.risky_urls || 0),
+      average_risk_score: Number(summary.average_risk_score || 0),
+      latest_scan_time: summary.latest_scan_time ? String(summary.latest_scan_time) : null,
+      virustotal_malicious_total: Number(summary.virustotal_malicious_total || 0),
+      virustotal_suspicious_total: Number(summary.virustotal_suspicious_total || 0),
+    },
+    category_distribution: normalizeNumberMap(payload?.category_distribution),
+    risk_distribution: normalizeNumberMap(payload?.risk_distribution),
+    highest_risk_scan: payload?.highest_risk_scan && typeof payload.highest_risk_scan === "object"
+      ? normalizePhishingScanItem(payload.highest_risk_scan)
+      : null,
+    latest_scans: Array.isArray(payload?.latest_scans)
+      ? payload.latest_scans.map(normalizePhishingScanItem)
+      : [],
+    recommendations: Array.isArray(payload?.recommendations)
+      ? payload.recommendations.map(String)
+      : [],
+    empty: Boolean(payload?.empty),
+    message: String(payload?.message || ""),
+    supported_formats: Array.isArray(payload?.supported_formats) ? payload.supported_formats.map(String) as ReportExportFormat[] : ["pdf", "csv"],
+    report_available: Boolean(payload?.report_available),
+    evidence_available: Boolean(payload?.evidence_available),
+    usingFallback: false,
+  };
+}
+
+export async function getPhishingIncidentsReportSummary(
+  filters?: Partial<PhishingIncidentsReportFilters>
+): Promise<PhishingIncidentsReportSummary> {
+  const response = await fetch(
+    `${ADMIN_PCAP_API_BASE}/api/admin/reports/phishing-incidents${buildQuery({
+      date_from: filters?.dateFrom || "",
+      date_to: filters?.dateTo || "",
+      risk_level: filters?.riskLevel || "all",
+      category: filters?.category || "all",
+      export_format: filters?.exportFormat || "all",
+    })}`,
+    buildAdminJsonFetchInit({ cache: "no-store" })
+  );
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload?.success === false) {
+    throw new Error(payload?.message || "Phishing Incidents Summary data could not be loaded.");
+  }
+  return normalizePhishingIncidentsReport(payload.report || payload);
+}
+
+export async function generatePhishingIncidentsReport(
+  filters?: Partial<PhishingIncidentsReportFilters>
+): Promise<PhishingIncidentsReportSummary> {
+  return getPhishingIncidentsReportSummary(filters);
+}
+
+export async function exportPhishingIncidentsReport(
+  format: ReportExportFormat,
+  filters?: Partial<PhishingIncidentsReportFilters>
+): Promise<ReportExportResult> {
+  if (format === "pdf") {
+    throw new Error("Phishing Incidents Summary PDF export is generated in the Reports & Export Center.");
+  }
+  const response = await fetch(
+    `${ADMIN_PCAP_API_BASE}/api/admin/reports/phishing-incidents/export${buildQuery({
+      format: "csv",
+      date_from: filters?.dateFrom || "",
+      date_to: filters?.dateTo || "",
+      risk_level: filters?.riskLevel || "all",
+      category: filters?.category || "all",
+    })}`,
+    buildAdminJsonFetchInit({ cache: "no-store" })
+  );
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload?.message || "Phishing Incidents Summary CSV export failed.");
+  }
+  return {
+    blob: await response.blob(),
+    filename: getDownloadFilename(response.headers.get("content-disposition"), "phishing-incidents-summary.csv"),
+    fallback: false,
+  };
+}
+
 function normalizeMonthlySecurityReport(payload: any): MonthlySecurityReportSummary {
   const summary = payload?.summary && typeof payload.summary === "object" ? payload.summary : {};
   const period = payload?.reporting_period && typeof payload.reporting_period === "object" ? payload.reporting_period : {};
@@ -1438,8 +1612,8 @@ export function getFutureReportCategories(): FutureReportCategory[] {
     {
       id: "phishing-incidents",
       title: "Phishing Incidents Summary",
-      badge: "Waiting for Module Integration",
-      description: "Prepared for scanner results, analyst decisions, and phishing evidence exports.",
+      badge: "Connected",
+      description: "Connected to Phishing Scanner results, URL risk decisions, ML probabilities, VirusTotal reputation, suspicious/dangerous detections, and export-ready phishing incident summaries.",
     },
     {
       id: "identity-leak",

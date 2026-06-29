@@ -2,6 +2,18 @@
 # =========================
 # Risk Scoring
 # =========================
+def _clamp(value, minimum, maximum):
+    return max(minimum, min(maximum, value))
+
+
+def category_from_score(score):
+    if score <= 39:
+        return "safe"
+    if score <= 69:
+        return "suspicious"
+    return "dangerous"
+
+
 def calculate_risk(ml_result):
     if ml_result.get("trusted_domain"):
         return {
@@ -9,21 +21,13 @@ def calculate_risk(ml_result):
             "category": "safe"
         }
 
-    if ml_result["risk"] == "dangerous":
-        return {
-            "risk_score": 80,
-            "category": "dangerous"
-        }
-    elif ml_result["risk"] == "suspicious":
-        return {
-            "risk_score": 50,
-            "category": "suspicious"
-        }
-    else:
-        return {
-            "risk_score": 20,
-            "category": "safe"
-        }
+    risk_score = int(_clamp(round(float(ml_result.get("probability", 0)) * 100), 0, 100))
+    category = category_from_score(risk_score)
+
+    return {
+        "risk_score": risk_score,
+        "category": category
+    }
 
 
 # =========================

@@ -2,6 +2,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
@@ -53,10 +54,16 @@ def _safe_len(value) -> int:
         return 0
 
 
+def _item_value(item, attr_name: str, default=None):
+    if isinstance(item, dict):
+        return item.get(attr_name, default)
+    return getattr(item, attr_name, default)
+
+
 def _count_by_attr(items, attr_name: str) -> dict:
     counts = {}
     for item in items or []:
-        value = getattr(item, attr_name, None) or "unknown"
+        value = _item_value(item, attr_name) or "unknown"
         key = str(value).strip() or "unknown"
         counts[key] = counts.get(key, 0) + 1
     return counts
@@ -96,7 +103,7 @@ def _filter_items_for_report_month(items, report_month: ReportingMonth, *attrs: 
     filtered = []
     for item in items or []:
         for attr_name in attrs:
-            if _in_report_month(getattr(item, attr_name, None), report_month):
+            if _in_report_month(_item_value(item, attr_name), report_month):
                 filtered.append(item)
                 break
     return filtered
@@ -170,6 +177,135 @@ def _first_present(*values, default=0):
     return default
 
 
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _phishing_category(item) -> str:
+    raw = _safe_text(
+        _first_present(
+            _item_value(item, "final_category"),
+            _item_value(item, "category"),
+            _item_value(item, "result"),
+            default="safe",
+        ),
+        "safe",
+    ).lower()
+    if raw in {"dangerous", "malicious", "phishing", "critical", "high"}:
+        return "dangerous"
+    if raw in {"suspicious", "warning", "medium"}:
+        return "suspicious"
+    return "safe"
+
+
+def _phishing_risk_score(item) -> int:
+    return max(
+        0,
+        min(
+            100,
+            _safe_int(
+                _first_present(
+                    _item_value(item, "final_risk_score"),
+                    _item_value(item, "risk_score"),
+                    _item_value(item, "risk"),
+                    default=0,
+                ),
+                0,
+            ),
+        ),
+    )
+
+
+def _domain_from_url(url: str) -> str:
+    safe_url = _safe_text(url)
+    parsed = urlparse(safe_url)
+    if not parsed.netloc and safe_url:
+        parsed = urlparse(f"//{safe_url}")
+    return parsed.netloc.lower() if parsed.netloc else ""
+
+
+def _build_phishing_section(phishing_scans) -> dict | None:
+    scans = list(phishing_scans or [])
+    if not scans:
+        return None
+
+    safe_count = 0
+    suspicious_count = 0
+    dangerous_count = 0
+    vt_malicious_total = 0
+    vt_suspicious_total = 0
+    total_risk = 0
+    latest_scans = []
+    highest = None
+
+    for item in scans:
+        category = _phishing_category(item)
+        risk_score = _phishing_risk_score(item)
+        total_risk += risk_score
+        if category == "dangerous":
+            dangerous_count += 1
+        elif category == "suspicious":
+            suspicious_count += 1
+        else:
+            safe_count += 1
+
+        url = _safe_text(_item_value(item, "url"))
+        domain = _safe_text(_item_value(item, "domain")) or _domain_from_url(url)
+        vt_malicious = _safe_int(_item_value(item, "virustotal_malicious"), 0)
+        vt_suspicious = _safe_int(_item_value(item, "virustotal_suspicious"), 0)
+        vt_malicious_total += vt_malicious
+        vt_suspicious_total += vt_suspicious
+        scan_payload = {
+            "module": "Phishing Scanner",
+            "scan_id": _first_present(_item_value(item, "scan_id"), _item_value(item, "id"), default=None),
+            "url": url,
+            "domain": domain,
+            "final_category": category,
+            "final_risk_score": risk_score,
+            "ml_probability": _item_value(item, "ml_probability"),
+            "virustotal_malicious": vt_malicious,
+            "virustotal_suspicious": vt_suspicious,
+            "timestamp": str(_first_present(_item_value(item, "timestamp"), _item_value(item, "created_at"), default="")),
+        }
+        latest_scans.append(scan_payload)
+        if highest is None or risk_score > int(highest.get("final_risk_score") or 0):
+            highest = scan_payload
+
+    if dangerous_count or suspicious_count:
+        analyst_summary = "Risky phishing activity was detected and should be reviewed."
+    else:
+        analyst_summary = "No risky phishing URLs were detected during this cycle."
+
+    return {
+        "total_phishing_scans": len(scans),
+        "safe_urls": safe_count,
+        "suspicious_urls": suspicious_count,
+        "dangerous_urls": dangerous_count,
+        "risky_urls": suspicious_count + dangerous_count,
+        "highest_risk_url": highest,
+        "average_phishing_risk_score": round(total_risk / len(scans), 2) if scans else 0,
+        "virustotal_malicious_total": vt_malicious_total,
+        "virustotal_suspicious_total": vt_suspicious_total,
+        "latest_scans": latest_scans[:10],
+        "analyst_summary": analyst_summary,
+        "recommendations": [
+            "Review suspicious or dangerous phishing scan results before visiting URLs."
+            if suspicious_count or dangerous_count
+            else "Continue scanning unfamiliar URLs before opening them."
+        ],
+    }
+
+
 def build_monthly_security_report_data(
     *,
     user,
@@ -179,6 +315,7 @@ def build_monthly_security_report_data(
     load_report_payload_for_job=None,
     activity_log_query=None,
     password_check_query=None,
+    phishing_scan_query=None,
 ) -> dict:
     user_id = int(getattr(user, "id", 0) or 0)
     pcap_alerts = _filter_items_for_report_month(
@@ -198,6 +335,13 @@ def build_monthly_security_report_data(
         "created_at",
         "checked_at",
     )
+    phishing_scans = _filter_items_for_report_month(
+        list(phishing_scan_query(user_id) if callable(phishing_scan_query) else []),
+        report_month,
+        "timestamp",
+        "created_at",
+    )
+    phishing_section = _build_phishing_section(phishing_scans)
     vault_logs = [item for item in activity_logs if _is_vault_activity(item)]
     recent_jobs = list(list_recent_jobs() if callable(list_recent_jobs) else [])
     severity_counts = _count_by_attr(pcap_alerts, "severity")
@@ -237,6 +381,77 @@ def build_monthly_security_report_data(
     else:
         password_recommendations.append("No risky password checks were recorded for this reporting month.")
 
+    sections = {
+        "pcap": {
+            "files_analyzed": _safe_len(recent_jobs),
+            "threats_detected": _safe_len(pcap_alerts),
+            "high_alerts": severity_counts.get("high", 0),
+            "critical_alerts": severity_counts.get("critical", 0),
+            "score_change": None,
+            "top_threat_types": [
+                {"name": name, "count": count}
+                for name, count in sorted(severity_counts.items(), key=lambda item: item[1], reverse=True)[:6]
+            ],
+            "recommendations": pcap_recommendations,
+        },
+        "vault": {
+            "uploads": vault_action_counts.get("upload", 0),
+            "downloads": vault_action_counts.get("download", 0),
+            "deletes": vault_action_counts.get("delete", 0),
+            "offline_enabled": vault_action_counts.get("offline_enabled", 0),
+            "offline_disabled": vault_action_counts.get("offline_disabled", 0),
+            "wrong_password": vault_action_counts.get("wrong_password", 0),
+            "total_events": _safe_len(vault_logs),
+            "unique_files": len(vault_file_counts),
+            "total_storage_bytes": 0,
+            "largest_file": None,
+            "largest_file_size_bytes": 0,
+            "most_active_file": (
+                {
+                    "filename": max(vault_file_counts.items(), key=lambda item: item[1])[0],
+                    "activity_count": max(vault_file_counts.values()),
+                }
+                if vault_file_counts
+                else None
+            ),
+            "most_failed_file": (
+                {
+                    "filename": max(vault_wrong_password_file_counts.items(), key=lambda item: item[1])[0],
+                    "wrong_password_attempts": max(vault_wrong_password_file_counts.values()),
+                }
+                if vault_wrong_password_file_counts
+                else None
+            ),
+            "action_breakdown": [
+                {"name": name, "count": count}
+                for name, count in sorted(vault_action_counts.items(), key=lambda item: item[1], reverse=True)[:8]
+            ],
+            "recommendations": vault_recommendations,
+        },
+        "identity": {
+            "total_identity_scans": 0,
+            "total_findings": 0,
+            "total_alerts": 0,
+            "monitored_assets_count": 0,
+            "risky_assets_count": 0,
+            "confirmed_breach_count": 0,
+            "confirmed_exposure_count": 0,
+            "possible_exposure_count": 0,
+            "public_mention_count": 0,
+            "high_risk_scans": 0,
+            "critical_risk_scans": 0,
+            "leakcheck_confirmed_breaches": 0,
+            "source_coverage": {},
+            "risk_summary": {},
+            "category_summary": {},
+            "recent_alerts": [],
+            "recent_high_risk_scans": [],
+            "recommendations": ["Run identity scans to enrich future monthly reports."],
+        },
+    }
+    if phishing_section:
+        sections["phishing"] = phishing_section
+
     return {
         "report_month": report_month.month_key,
         "generated_at": datetime.now(UTC).isoformat(),
@@ -250,80 +465,19 @@ def build_monthly_security_report_data(
             "activity_events": _safe_len(activity_logs),
             "password_checks": _safe_len(password_checks),
             "recent_jobs": _safe_len(recent_jobs),
+            "phishing_scans": _safe_len(phishing_scans),
         },
         "executive_summary": [
             f"{_safe_len(pcap_alerts)} PCAP alerts reviewed for this month.",
             f"{_safe_len(vault_logs)} file vault events recorded.",
             f"{_safe_len(password_checks)} password checks included in the security snapshot.",
+            (
+                f"{_safe_len(phishing_scans)} phishing scanner results reviewed."
+                if phishing_section
+                else "No phishing scans were recorded during this cycle."
+            ),
         ],
-        "sections": {
-            "pcap": {
-                "files_analyzed": _safe_len(recent_jobs),
-                "threats_detected": _safe_len(pcap_alerts),
-                "high_alerts": severity_counts.get("high", 0),
-                "critical_alerts": severity_counts.get("critical", 0),
-                "score_change": None,
-                "top_threat_types": [
-                    {"name": name, "count": count}
-                    for name, count in sorted(severity_counts.items(), key=lambda item: item[1], reverse=True)[:6]
-                ],
-                "recommendations": pcap_recommendations,
-            },
-            "vault": {
-                "uploads": vault_action_counts.get("upload", 0),
-                "downloads": vault_action_counts.get("download", 0),
-                "deletes": vault_action_counts.get("delete", 0),
-                "offline_enabled": vault_action_counts.get("offline_enabled", 0),
-                "offline_disabled": vault_action_counts.get("offline_disabled", 0),
-                "wrong_password": vault_action_counts.get("wrong_password", 0),
-                "total_events": _safe_len(vault_logs),
-                "unique_files": len(vault_file_counts),
-                "total_storage_bytes": 0,
-                "largest_file": None,
-                "largest_file_size_bytes": 0,
-                "most_active_file": (
-                    {
-                        "filename": max(vault_file_counts.items(), key=lambda item: item[1])[0],
-                        "activity_count": max(vault_file_counts.values()),
-                    }
-                    if vault_file_counts
-                    else None
-                ),
-                "most_failed_file": (
-                    {
-                        "filename": max(vault_wrong_password_file_counts.items(), key=lambda item: item[1])[0],
-                        "wrong_password_attempts": max(vault_wrong_password_file_counts.values()),
-                    }
-                    if vault_wrong_password_file_counts
-                    else None
-                ),
-                "action_breakdown": [
-                    {"name": name, "count": count}
-                    for name, count in sorted(vault_action_counts.items(), key=lambda item: item[1], reverse=True)[:8]
-                ],
-                "recommendations": vault_recommendations,
-            },
-            "identity": {
-                "total_identity_scans": 0,
-                "total_findings": 0,
-                "total_alerts": 0,
-                "monitored_assets_count": 0,
-                "risky_assets_count": 0,
-                "confirmed_breach_count": 0,
-                "confirmed_exposure_count": 0,
-                "possible_exposure_count": 0,
-                "public_mention_count": 0,
-                "high_risk_scans": 0,
-                "critical_risk_scans": 0,
-                "leakcheck_confirmed_breaches": 0,
-                "source_coverage": {},
-                "risk_summary": {},
-                "category_summary": {},
-                "recent_alerts": [],
-                "recent_high_risk_scans": [],
-                "recommendations": ["Run identity scans to enrich future monthly reports."],
-            },
-        },
+        "sections": sections,
         "password_checker_summary": {
             "status": "Assessed" if password_checks else "Not Assessed",
             "current_score": None,
@@ -365,6 +519,7 @@ def build_monthly_security_report_summary(payload: dict, report_record=None) -> 
     pcap = sections.get("pcap") if isinstance(sections.get("pcap"), dict) else {}
     vault = sections.get("vault") if isinstance(sections.get("vault"), dict) else {}
     identity = sections.get("identity") if isinstance(sections.get("identity"), dict) else {}
+    phishing = sections.get("phishing") if isinstance(sections.get("phishing"), dict) else {}
     report_month = payload.get("report_month") or getattr(report_record, "report_month", None)
     pdf_path = getattr(report_record, "pdf_path", None)
     available_sections = [
@@ -389,8 +544,27 @@ def build_monthly_security_report_summary(payload: dict, report_record=None) -> 
         "latest_identity_alert_count": int(identity.get("total_alerts") or 0),
         "latest_identity_confirmed_breach_count": int(identity.get("confirmed_breach_count") or 0),
         "latest_identity_risky_asset_count": int(identity.get("risky_assets_count") or 0),
+        "latest_phishing_scan_count": int(phishing.get("total_phishing_scans") or summary.get("phishing_scans") or 0),
+        "latest_phishing_risky_url_count": int(phishing.get("risky_urls") or 0),
+        "latest_phishing_dangerous_url_count": int(phishing.get("dangerous_urls") or 0),
         "summary": summary,
     }
+
+
+def _pdf_text(pdf, x: int, y: int, text: str, max_chars: int = 92) -> int:
+    safe = str(text or "")
+    if len(safe) > max_chars:
+        safe = f"{safe[: max_chars - 3]}..."
+    pdf.drawString(x, y, safe)
+    return y - 18
+
+
+def _pdf_new_page_if_needed(pdf, y: int, min_y: int = 72) -> int:
+    if y >= min_y:
+        return y
+    pdf.showPage()
+    pdf.setFont("Helvetica", 10)
+    return letter[1] - 72
 
 
 def render_monthly_security_report_pdf(payload: dict, output_path: Path) -> Path:
@@ -412,6 +586,53 @@ def render_monthly_security_report_pdf(payload: dict, output_path: Path) -> Path
     for key, value in summary.items():
         pdf.drawString(72, y, f"{key.replace('_', ' ').title()}: {value}")
         y -= 18
+    sections = payload.get("sections") if isinstance(payload.get("sections"), dict) else {}
+    phishing = sections.get("phishing") if isinstance(sections.get("phishing"), dict) else None
+    if phishing:
+        y -= 14
+        y = _pdf_new_page_if_needed(pdf, y)
+        pdf.setFont("Helvetica-Bold", 13)
+        y = _pdf_text(pdf, 72, y, "Phishing Scanner")
+        pdf.setFont("Helvetica", 10)
+        for label, key in (
+            ("Total Phishing Scans", "total_phishing_scans"),
+            ("Safe URLs", "safe_urls"),
+            ("Suspicious URLs", "suspicious_urls"),
+            ("Dangerous URLs", "dangerous_urls"),
+            ("Average Risk Score", "average_phishing_risk_score"),
+            ("VirusTotal Malicious Total", "virustotal_malicious_total"),
+            ("VirusTotal Suspicious Total", "virustotal_suspicious_total"),
+        ):
+            y = _pdf_new_page_if_needed(pdf, y)
+            y = _pdf_text(pdf, 72, y, f"{label}: {phishing.get(key, 0)}")
+        highest = phishing.get("highest_risk_url") if isinstance(phishing.get("highest_risk_url"), dict) else {}
+        if highest:
+            y = _pdf_new_page_if_needed(pdf, y)
+            y = _pdf_text(
+                pdf,
+                72,
+                y,
+                f"Highest Risk: {highest.get('domain') or highest.get('url')} ({highest.get('final_risk_score', 0)})",
+            )
+        y = _pdf_new_page_if_needed(pdf, y)
+        y = _pdf_text(pdf, 72, y, f"Analyst Summary: {phishing.get('analyst_summary', '')}")
+        latest_scans = phishing.get("latest_scans") if isinstance(phishing.get("latest_scans"), list) else []
+        if latest_scans:
+            y -= 6
+            pdf.setFont("Helvetica-Bold", 11)
+            y = _pdf_text(pdf, 72, y, "Latest Phishing Scans")
+            pdf.setFont("Helvetica", 9)
+            for item in latest_scans[:10]:
+                if not isinstance(item, dict):
+                    continue
+                y = _pdf_new_page_if_needed(pdf, y)
+                y = _pdf_text(
+                    pdf,
+                    82,
+                    y,
+                    f"{item.get('timestamp', '')} | {item.get('final_category', '')} | {item.get('final_risk_score', 0)} | {item.get('url', '')}",
+                    max_chars=108,
+                )
     pdf.showPage()
     pdf.save()
     return output_path
@@ -431,6 +652,7 @@ def generate_and_store_monthly_security_report(
     create_notification=None,
     activity_log_query=None,
     password_check_query=None,
+    phishing_scan_query=None,
 ) :
     normalized = report_month if isinstance(report_month, ReportingMonth) else normalize_report_month(report_month)
     if normalized is None:
@@ -444,6 +666,7 @@ def generate_and_store_monthly_security_report(
         load_report_payload_for_job=load_report_payload_for_job,
         activity_log_query=activity_log_query,
         password_check_query=password_check_query,
+        phishing_scan_query=phishing_scan_query,
     )
 
     output_path = Path(base_dir) / "reports" / "monthly" / f"sentinel-monthly-security-report-{normalized.month_key}.pdf"

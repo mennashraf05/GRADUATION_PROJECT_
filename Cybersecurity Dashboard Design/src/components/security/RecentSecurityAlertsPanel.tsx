@@ -125,6 +125,13 @@ type DashboardAlertWithSource = DashboardPcapAlert & {
   window_minutes?: number;
   identity_scan_id?: number;
   identity_email_status?: string;
+  url?: string | null;
+  domain?: string | null;
+  final_category?: string | null;
+  final_risk_score?: number;
+  ml_probability?: number | string | null;
+  virustotal_malicious?: number;
+  virustotal_suspicious?: number;
 };
 
 type AlertVisual = {
@@ -507,9 +514,19 @@ function normalizeNotificationAlert(
   const metadata =
     raw.metadata && typeof raw.metadata === "object" ? raw.metadata : {};
   const notificationType = String(raw.type ?? "").trim().toLowerCase();
+  const moduleKey = String(
+    raw.module || metadata.module_key || metadata.module || metadata.source_module || ""
+  )
+    .trim()
+    .toLowerCase();
+  const isPhishingNotification =
+    moduleKey === "phishing" ||
+    moduleKey === "phishing_scanner" ||
+    moduleKey === "phishing scanner";
   const isThreatNotification =
     notificationType === "critical_detected" ||
-    notificationType === "suspicious_detected";
+    notificationType === "suspicious_detected" ||
+    isPhishingNotification;
 
   if (!isThreatNotification) {
     return null;
@@ -521,16 +538,33 @@ function normalizeNotificationAlert(
       job_id: raw.job_id ?? null,
       type: "pcap_alert",
       status: raw.is_read ? "reviewed" : "new",
-      title: String(raw.title ?? "PCAP security notification"),
-      message: String(raw.message ?? raw.body ?? "PCAP activity requires review."),
+      title: String(raw.title ?? (isPhishingNotification ? "Phishing security notification" : "PCAP security notification")),
+      message: String(raw.message ?? raw.body ?? (isPhishingNotification ? "Phishing activity requires review." : "PCAP activity requires review.")),
       severity: normalizeNotificationAlertSeverity(raw.severity, notificationType),
       created_at: String(raw.created_at ?? ""),
-      source_type: "notification",
+      source: isPhishingNotification ? "phishing" : undefined,
+      source_type: isPhishingNotification ? "phishing_scanner" : "notification",
+      risk_label: isPhishingNotification ? "phishing" : undefined,
+      module: isPhishingNotification ? "Phishing Scanner" : undefined,
+      url: metadata.url,
+      domain: metadata.domain,
+      final_category: metadata.final_category,
+      final_risk_score: metadata.final_risk_score,
+      ml_probability: metadata.ml_probability,
+      virustotal_malicious: metadata.virustotal_malicious,
+      virustotal_suspicious: metadata.virustotal_suspicious,
+      metadata,
       attack_type:
-        metadata.top_attack_type != null
+        isPhishingNotification
+          ? "Link Review"
+          : metadata.top_attack_type != null
           ? String(metadata.top_attack_type)
           : undefined,
-      protocol: metadata.protocol != null ? String(metadata.protocol) : undefined,
+      protocol: isPhishingNotification
+        ? "URL"
+        : metadata.protocol != null
+          ? String(metadata.protocol)
+          : undefined,
       src_ip:
         metadata.top_src_ip != null ? String(metadata.top_src_ip) : undefined,
       dst_ip:
@@ -1281,6 +1315,17 @@ function buildMetadataChips(alert: DashboardPcapAlert) {
     return chips.slice(0, 4);
   }
 
+  if (isPhishingAlert(alert)) {
+    const phishingAlert = alert as DashboardAlertWithSource;
+    chips.push("Phishing Scanner");
+    if (phishingAlert.domain) chips.push(phishingAlert.domain);
+    if (typeof phishingAlert.final_risk_score === "number") {
+      chips.push(`Risk ${phishingAlert.final_risk_score}/100`);
+    }
+    if (phishingAlert.final_category) chips.push(phishingAlert.final_category);
+    return chips.slice(0, 4);
+  }
+
   if (alert.attack_type && !summaryResult) {
     chips.push(alert.attack_type.replace(/[_-]+/g, " "));
   }
@@ -1404,6 +1449,40 @@ function buildAlertMetadataItems(alert: DashboardPcapAlert): AlertMetadataItem[]
     return items.slice(0, 4);
   }
 
+  if (isPhishingAlert(alert)) {
+    const phishingAlert = alert as DashboardAlertWithSource;
+
+    items.push({
+      label: "Module",
+      value: "Phishing Scanner",
+    });
+
+    if (phishingAlert.domain) {
+      items.push({
+        label: "Domain",
+        value: phishingAlert.domain,
+        monospace: true,
+      });
+    }
+
+    if (typeof phishingAlert.final_risk_score === "number") {
+      items.push({
+        label: "Risk",
+        value: `${phishingAlert.final_risk_score}/100`,
+      });
+    }
+
+    if (phishingAlert.url) {
+      items.push({
+        label: "URL",
+        value: phishingAlert.url,
+        monospace: true,
+      });
+    }
+
+    return items.slice(0, 4);
+  }
+
   const routeLabel =
     alert.src_ip && alert.dst_ip
       ? `${alert.src_ip} -> ${alert.dst_ip}`
@@ -1472,6 +1551,28 @@ function isSummaryAnalysisResult(alert: DashboardPcapAlert) {
   return isSummaryAlertSummary(alert);
 }
 
+function isPhishingAlert(alert: DashboardPcapAlert) {
+  const typedAlert = alert as DashboardAlertWithSource;
+  const metadata = alert.metadata && typeof alert.metadata === "object" ? alert.metadata : {};
+  const values = [
+    alert.source,
+    typedAlert.source_type,
+    alert.risk_label,
+    metadata.module,
+    metadata.module_key,
+    metadata.source_module,
+  ]
+    .map((value) => String(value ?? "").trim().toLowerCase())
+    .filter(Boolean);
+
+  return values.some(
+    (value) =>
+      value === "phishing" ||
+      value === "phishing_scanner" ||
+      value === "phishing scanner"
+  );
+}
+
 function formatPasswordAlertLabel(value: unknown) {
   const normalized = String(value || "").trim().toLowerCase();
   if (normalized === "passwords") return "Passwords";
@@ -1495,6 +1596,7 @@ function alertStateBadgeClass(status?: DashboardPcapAlert["status"]) {
 
 function alertSourceLabel(alert: DashboardPcapAlert) {
   const sourceType = String((alert as DashboardAlertWithSource).source_type || "").toLowerCase();
+  if (isPhishingAlert(alert)) return "PHISHING";
   if (sourceType === "vault_ai") return "VAULT AI";
   if (sourceType === "identity") return "IDENTITY";
   if (sourceType === "password_checker") return "PASSWORDS";

@@ -17,6 +17,7 @@ services:
       SSL_CERT_FILE: certs/localhost.pem
       SSL_KEY_FILE: certs/localhost-key.pem
       WAF_BASE_URL: https://nginx-waf:8081
+      VIRUSTOTAL_API_KEY: ${VIRUSTOTAL_API_KEY:-}
       OLLAMA_ENABLED: "true"
       OLLAMA_BASE_URL: http://host.docker.internal:11434
       OLLAMA_MODEL: qwen2.5:7b
@@ -35,7 +36,7 @@ services:
       context: .
       dockerfile: Dockerfile.frontend
       args:
-        VITE_API_BASE_URL: https://localhost:8081
+        VITE_API_BASE_URL: https://localhost:5000
         VITE_SUPPORT_EMAIL: ${VITE_SUPPORT_EMAIL:-support@example.com}
     image: sentinel-ai-frontend:local
     ports:

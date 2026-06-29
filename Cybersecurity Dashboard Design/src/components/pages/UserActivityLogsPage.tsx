@@ -49,7 +49,7 @@ import {
 import "./MonthlyReportsPage.css";
 import "./UserActivityLogsPage.css";
 
-type ActivityModule = "auth" | "pcap" | "vault" | "identity" | "password";
+type ActivityModule = "auth" | "pcap" | "vault" | "identity" | "password" | "phishing";
 type ActivityStatus = "success" | "failed" | "warning" | "info";
 type ActivitySeverity = "low" | "medium" | "high" | "critical";
 
@@ -106,6 +106,8 @@ const suspiciousActionTypes = new Set([
   "identity_confirmed_breach_detected",
   "password_breach_detected",
   "weak_password_detected",
+  "phishing_suspicious_url_reviewed",
+  "phishing_dangerous_url_detected",
 ]);
 
 function normalizeModuleLabel(event: ActivityLogItem) {
@@ -114,6 +116,7 @@ function normalizeModuleLabel(event: ActivityLogItem) {
   if (event.module === "vault") return "Encrypted File Vault";
   if (event.module === "identity") return "Identity Leak Monitor";
   if (event.module === "password") return "Password Checker";
+  if (event.module === "phishing") return "Phishing Scanner";
   return event.module_label || "Activity";
 }
 
@@ -181,6 +184,7 @@ function isSuspicious(event: ActivityLogItem) {
   if (event.module === "vault" && event.status === "failed") return true;
   if (event.module === "identity" && ["high", "critical"].includes(event.severity)) return true;
   if (event.module === "password" && ["high", "critical"].includes(event.severity)) return true;
+  if (event.module === "phishing" && ["medium", "high", "critical"].includes(event.severity)) return true;
 
   return Boolean(
     event.is_suspicious &&
@@ -233,6 +237,11 @@ function activityIcon(event: ActivityLogItem) {
     if (event.action_type.includes("breach") || event.action_type.includes("weak")) return ShieldAlert;
     if (event.action_type.includes("history")) return Eye;
     return Lock;
+  }
+
+  if (event.module === "phishing") {
+    if (event.action_type.includes("dangerous") || event.action_type.includes("suspicious")) return ShieldAlert;
+    return Globe;
   }
 
   if (event.action_type.includes("password")) return Lock;
@@ -288,6 +297,14 @@ function eventSupportingLine(event: ActivityLogItem) {
     if (event.metadata?.breached === true) parts.push("Breach exposure");
   }
 
+  if (event.module === "phishing") {
+    if (event.metadata?.domain) parts.push(String(event.metadata.domain));
+    if (event.metadata?.final_category) parts.push(humanize(String(event.metadata.final_category)));
+    if (event.metadata?.final_risk_score != null) {
+      parts.push(`Risk ${String(event.metadata.final_risk_score)}`);
+    }
+  }
+
   return parts.join(" | ") || event.action_label || event.title;
 }
 
@@ -338,6 +355,17 @@ function detailItems(event: ActivityLogItem) {
       ["Risk level", String(metadata.risk_level || humanize(event.severity))],
       ["Strength", metadataValue(metadata.strength_label)],
     ];
+  } else if (event.module === "phishing") {
+    target = [
+      ["Target", "Phishing"],
+      ["Scan ID", String(metadata.scan_id || event.target_id || "Unavailable")],
+      ["URL", String(metadata.url || "Unavailable")],
+      ["Domain", String(metadata.domain || "Unavailable")],
+      ["Final category", String(metadata.final_category || humanize(event.severity))],
+      ["Final risk score", metadataValue(metadata.final_risk_score ?? event.risk_score)],
+      ["VirusTotal malicious", metadataValue(metadata.virustotal_malicious)],
+      ["VirusTotal suspicious", metadataValue(metadata.virustotal_suspicious)],
+    ];
   } else {
     target = [
       ["Device", String(metadata.device_label || metadata.device || "Unavailable")],
@@ -373,6 +401,14 @@ function detailItems(event: ActivityLogItem) {
     "risk_level",
     "total_findings",
     "sources_checked",
+    "module",
+    "url",
+    "domain",
+    "final_category",
+    "final_risk_score",
+    "ml_probability",
+    "virustotal_malicious",
+    "virustotal_suspicious",
   ]);
 
   const metadataEntries = Object.entries(metadata).filter(([key]) => !reservedKeys.has(key));
@@ -723,6 +759,9 @@ export function UserActivityLogsPage() {
       "weak_password_detected",
       "password_history_viewed",
       "password_history_cleared",
+      "phishing_scan_completed",
+      "phishing_suspicious_url_reviewed",
+      "phishing_dangerous_url_detected",
     ].forEach((x) => set.add(x));
 
     return Array.from(set).filter(Boolean).sort();
@@ -807,12 +846,12 @@ export function UserActivityLogsPage() {
       icon: Eye,
       title: "Visibility",
       value: "Unified audit stream",
-      note: "Auth, PCAP, Vault, and Identity activity in one place.",
+      note: "Auth, PCAP, Vault, Identity, and Phishing activity in one place.",
     },
     {
       icon: Cpu,
       title: "Scope",
-      value: "Auth + PCAP + Vault + Identity",
+      value: "Auth + PCAP + Vault + Identity + Phishing",
       note: "Built to scale without redesigning the data model.",
     },
     {
@@ -978,6 +1017,7 @@ export function UserActivityLogsPage() {
                     <SelectItem value="vault">Encrypted File Vault</SelectItem>
                     <SelectItem value="password">Password Checker</SelectItem>
                     <SelectItem value="identity">Identity Leak Monitor</SelectItem>
+                    <SelectItem value="phishing">Phishing Scanner</SelectItem>
                   </SelectContent>
                 </Select>
 
@@ -1272,6 +1312,8 @@ export function UserActivityLogsPage() {
                         ? HardDrive
                         : selectedEvent.module === "password"
                         ? Lock
+                        : selectedEvent.module === "phishing"
+                        ? Globe
                         : selectedEvent.module === "identity"
                         ? Globe
                         : Globe

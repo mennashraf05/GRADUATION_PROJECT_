@@ -44,6 +44,8 @@ import {
   PcapReportSummary,
   PasswordRiskReportFilters,
   PasswordRiskReportSummary,
+  PhishingIncidentsReportFilters,
+  PhishingIncidentsReportSummary,
   SecurityIncidentsReportFilters,
   SecurityIncidentsReportSummary,
   UserActivityReportFilters,
@@ -58,6 +60,7 @@ import {
   generateMonthlySecurityReport,
   generatePcapReport,
   generatePasswordRiskReport,
+  generatePhishingIncidentsReport,
   generateSecurityIncidentsReport,
   generateUserActivityReport,
   getFutureReportCategories,
@@ -66,6 +69,7 @@ import {
   getMonthlySecurityReportSummary,
   getPcapReportSummary,
   getPasswordRiskReportSummary,
+  getPhishingIncidentsReportSummary,
   getSecurityIncidentsReportSummary,
   getUserActivityReportSummary,
   getRecentPcapReports,
@@ -99,6 +103,14 @@ const DEFAULT_PASSWORD_FILTERS: PasswordRiskReportFilters = {
   passwordRisk: "all",
   passwordStrength: "all",
   breachStatus: "all",
+};
+
+const DEFAULT_PHISHING_FILTERS: PhishingIncidentsReportFilters = {
+  dateFrom: "",
+  dateTo: "",
+  riskLevel: "all",
+  category: "all",
+  exportFormat: "all",
 };
 
 const DEFAULT_MONTHLY_FILTERS: MonthlySecurityReportFilters = {
@@ -610,6 +622,41 @@ const EMPTY_PASSWORD_SUMMARY: PasswordRiskReportSummary = {
   usingFallback: false,
 };
 
+const EMPTY_PHISHING_SUMMARY: PhishingIncidentsReportSummary = {
+  report_name: "Phishing Incidents Summary",
+  status: "active",
+  generated_at: null,
+  last_generated: null,
+  reporting_period: {
+    label: "All Time",
+    start: null,
+    end: null,
+  },
+  data_source: "phishing_scanner",
+  summary: {
+    total_url_scans: 0,
+    safe_urls: 0,
+    suspicious_urls: 0,
+    dangerous_urls: 0,
+    risky_urls: 0,
+    average_risk_score: 0,
+    latest_scan_time: null,
+    virustotal_malicious_total: 0,
+    virustotal_suspicious_total: 0,
+  },
+  category_distribution: { safe: 0, suspicious: 0, dangerous: 0 },
+  risk_distribution: { low: 0, medium: 0, high: 0, unknown: 0 },
+  highest_risk_scan: null,
+  latest_scans: [],
+  recommendations: [],
+  empty: true,
+  message: "",
+  supported_formats: ["pdf", "csv"],
+  report_available: true,
+  evidence_available: false,
+  usingFallback: false,
+};
+
 const EMPTY_MONTHLY_SUMMARY: MonthlySecurityReportSummary = {
   report_name: "Monthly Security Report",
   status: "active",
@@ -1090,7 +1137,7 @@ function isVaultReportCategory(category: FutureReportCategory): boolean {
   );
 }
 
-type ActiveReportModule = "pcap" | "identity" | "password" | "monthly" | "activity" | "highRisk" | "incidents" | "vault";
+type ActiveReportModule = "pcap" | "identity" | "password" | "phishing" | "monthly" | "activity" | "highRisk" | "incidents" | "vault";
 
 export default function ReportsExportCenterPage() {
   const [activeReportModule, setActiveReportModule] = useState<ActiveReportModule>("pcap");
@@ -1099,6 +1146,7 @@ export default function ReportsExportCenterPage() {
   const [reports, setReports] = useState<RecentPcapReport[]>([]);
   const [identitySummary, setIdentitySummary] = useState<IdentityReportSummary>(EMPTY_IDENTITY_SUMMARY);
   const [passwordSummary, setPasswordSummary] = useState<PasswordRiskReportSummary>(EMPTY_PASSWORD_SUMMARY);
+  const [phishingSummary, setPhishingSummary] = useState<PhishingIncidentsReportSummary>(EMPTY_PHISHING_SUMMARY);
   const [monthlySummary, setMonthlySummary] = useState<MonthlySecurityReportSummary>(EMPTY_MONTHLY_SUMMARY);
   const [activitySummary, setActivitySummary] = useState<UserActivityReportSummary>(EMPTY_ACTIVITY_SUMMARY);
   const [highRiskSummary, setHighRiskSummary] = useState<HighRiskUsersReportSummary>(EMPTY_HIGH_RISK_SUMMARY);
@@ -1111,6 +1159,8 @@ export default function ReportsExportCenterPage() {
   const [appliedIdentityFilters, setAppliedIdentityFilters] = useState<IdentityReportFilters>(DEFAULT_IDENTITY_FILTERS);
   const [passwordFilters, setPasswordFilters] = useState<PasswordRiskReportFilters>(DEFAULT_PASSWORD_FILTERS);
   const [appliedPasswordFilters, setAppliedPasswordFilters] = useState<PasswordRiskReportFilters>(DEFAULT_PASSWORD_FILTERS);
+  const [phishingFilters, setPhishingFilters] = useState<PhishingIncidentsReportFilters>(DEFAULT_PHISHING_FILTERS);
+  const [appliedPhishingFilters, setAppliedPhishingFilters] = useState<PhishingIncidentsReportFilters>(DEFAULT_PHISHING_FILTERS);
   const [monthlyFilters, setMonthlyFilters] = useState<MonthlySecurityReportFilters>(DEFAULT_MONTHLY_FILTERS);
   const [appliedMonthlyFilters, setAppliedMonthlyFilters] = useState<MonthlySecurityReportFilters>(DEFAULT_MONTHLY_FILTERS);
   const [activityFilters, setActivityFilters] = useState<UserActivityReportFilters>(DEFAULT_ACTIVITY_FILTERS);
@@ -1124,6 +1174,7 @@ export default function ReportsExportCenterPage() {
   const [loading, setLoading] = useState(true);
   const [identityLoading, setIdentityLoading] = useState(true);
   const [passwordLoading, setPasswordLoading] = useState(true);
+  const [phishingLoading, setPhishingLoading] = useState(true);
   const [monthlyLoading, setMonthlyLoading] = useState(true);
   const [activityLoading, setActivityLoading] = useState(true);
   const [highRiskLoading, setHighRiskLoading] = useState(true);
@@ -1132,6 +1183,7 @@ export default function ReportsExportCenterPage() {
   const [error, setError] = useState<string | null>(null);
   const [identityError, setIdentityError] = useState<string | null>(null);
   const [passwordError, setPasswordError] = useState<string | null>(null);
+  const [phishingError, setPhishingError] = useState<string | null>(null);
   const [monthlyError, setMonthlyError] = useState<string | null>(null);
   const [activityError, setActivityError] = useState<string | null>(null);
   const [highRiskError, setHighRiskError] = useState<string | null>(null);
@@ -1146,6 +1198,7 @@ export default function ReportsExportCenterPage() {
   const pcapReportRequestId = useRef(0);
   const identityReportRequestId = useRef(0);
   const passwordReportRequestId = useRef(0);
+  const phishingReportRequestId = useRef(0);
   const monthlyReportRequestId = useRef(0);
   const activityReportRequestId = useRef(0);
   const highRiskReportRequestId = useRef(0);
@@ -1164,8 +1217,8 @@ export default function ReportsExportCenterPage() {
     monthlySummary.summary.total_events > 0
   );
   const usingFallback = overview.usingFallback || summary.usingFallback;
-  const activeLoading = activeReportModule === "pcap" ? loading : activeReportModule === "identity" ? identityLoading : activeReportModule === "password" ? passwordLoading : activeReportModule === "monthly" ? monthlyLoading : activeReportModule === "activity" ? activityLoading : activeReportModule === "highRisk" ? highRiskLoading : activeReportModule === "incidents" ? incidentsLoading : vaultLoading;
-  const activeError = activeReportModule === "pcap" ? error : activeReportModule === "identity" ? identityError : activeReportModule === "password" ? passwordError : activeReportModule === "monthly" ? monthlyError : activeReportModule === "activity" ? activityError : activeReportModule === "highRisk" ? highRiskError : activeReportModule === "incidents" ? incidentsError : vaultError;
+  const activeLoading = activeReportModule === "pcap" ? loading : activeReportModule === "identity" ? identityLoading : activeReportModule === "password" ? passwordLoading : activeReportModule === "phishing" ? phishingLoading : activeReportModule === "monthly" ? monthlyLoading : activeReportModule === "activity" ? activityLoading : activeReportModule === "highRisk" ? highRiskLoading : activeReportModule === "incidents" ? incidentsLoading : vaultLoading;
+  const activeError = activeReportModule === "pcap" ? error : activeReportModule === "identity" ? identityError : activeReportModule === "password" ? passwordError : activeReportModule === "phishing" ? phishingError : activeReportModule === "monthly" ? monthlyError : activeReportModule === "activity" ? activityError : activeReportModule === "highRisk" ? highRiskError : activeReportModule === "incidents" ? incidentsError : vaultError;
 
   const attackFamilyOptions = useMemo(() => {
     const families = Array.from(
@@ -1181,6 +1234,12 @@ export default function ReportsExportCenterPage() {
     [identitySummary.sources_used],
   );
   const passwordHasData = passwordSummary.summary.total_checks > 0;
+  const phishingSummaryHasLoaded = Boolean(
+    phishingSummary.generated_at ||
+    phishingSummary.last_generated ||
+    phishingSummary.report_available ||
+    phishingSummary.summary.total_url_scans > 0
+  );
   const activitySummaryHasLoaded = Boolean(
     activitySummary.generated_at ||
     activitySummary.report_available ||
@@ -1319,6 +1378,27 @@ export default function ReportsExportCenterPage() {
     }
   };
 
+  const loadPhishingReport = async (nextFilters = appliedPhishingFilters, showToast = false) => {
+    const requestId = phishingReportRequestId.current + 1;
+    phishingReportRequestId.current = requestId;
+    setPhishingLoading(true);
+    setPhishingError(null);
+    try {
+      const result = await getPhishingIncidentsReportSummary(nextFilters);
+      if (requestId !== phishingReportRequestId.current) return;
+      setPhishingSummary(result);
+      if (showToast) toast.success("Phishing Incidents Summary refreshed");
+    } catch (loadError) {
+      if (requestId !== phishingReportRequestId.current) return;
+      setPhishingError(loadError instanceof Error ? loadError.message : "Phishing Incidents Summary could not be loaded.");
+      toast.error("Phishing Incidents Summary could not be loaded.");
+    } finally {
+      if (requestId === phishingReportRequestId.current) {
+        setPhishingLoading(false);
+      }
+    }
+  };
+
   const loadMonthlyReport = async (nextFilters = appliedMonthlyFilters, showToast = false) => {
     const safeFilters = normalizeMonthlyReportFilters(nextFilters);
     const requestId = monthlyReportRequestId.current + 1;
@@ -1446,6 +1526,7 @@ export default function ReportsExportCenterPage() {
     void loadReports(DEFAULT_FILTERS);
     void loadIdentityReports(DEFAULT_IDENTITY_FILTERS);
     void loadPasswordReport();
+    void loadPhishingReport(DEFAULT_PHISHING_FILTERS);
     void loadMonthlyReport(DEFAULT_MONTHLY_FILTERS);
     void loadActivityReport(DEFAULT_ACTIVITY_FILTERS);
     void loadHighRiskReport(DEFAULT_HIGH_RISK_FILTERS);
@@ -1469,6 +1550,11 @@ export default function ReportsExportCenterPage() {
       setAppliedPasswordFilters(selectedPasswordFilters);
       updatePasswordReportFilterQueryParams(selectedPasswordFilters);
       void loadPasswordReport(selectedPasswordFilters, true);
+      return;
+    }
+    if (activeReportModule === "phishing") {
+      setAppliedPhishingFilters(phishingFilters);
+      void loadPhishingReport(phishingFilters, true);
       return;
     }
     if (activeReportModule === "monthly") {
@@ -1544,6 +1630,16 @@ export default function ReportsExportCenterPage() {
       void loadPasswordReport(DEFAULT_PASSWORD_FILTERS, true);
       return;
     }
+    if (activeReportModule === "phishing") {
+      const alreadyDefault = JSON.stringify(phishingFilters) === JSON.stringify(DEFAULT_PHISHING_FILTERS) && JSON.stringify(appliedPhishingFilters) === JSON.stringify(DEFAULT_PHISHING_FILTERS);
+      setPhishingFilters(DEFAULT_PHISHING_FILTERS);
+      setAppliedPhishingFilters(DEFAULT_PHISHING_FILTERS);
+      if ((alreadyDefault && phishingSummaryHasLoaded) || (alreadyDefault && phishingLoading)) {
+        return;
+      }
+      void loadPhishingReport(DEFAULT_PHISHING_FILTERS, true);
+      return;
+    }
     if (activeReportModule === "monthly") {
       const alreadyDefault = areMonthlyReportFiltersDefault(monthlyFilters) && areMonthlyReportFiltersDefault(appliedMonthlyFilters);
       setMonthlyFilters(DEFAULT_MONTHLY_FILTERS);
@@ -1615,6 +1711,13 @@ export default function ReportsExportCenterPage() {
         toast.success("Password Risk Summary refreshed from Password Checker data");
         return;
       }
+      if (activeReportModule === "phishing") {
+        const nextSummary = await generatePhishingIncidentsReport(appliedPhishingFilters);
+        setPhishingSummary(nextSummary);
+        await loadPhishingReport(appliedPhishingFilters);
+        toast.success("Phishing Incidents Summary refreshed from Phishing Scanner data");
+        return;
+      }
       if (activeReportModule === "monthly") {
         const nextSummary = await generateMonthlySecurityReport();
         setMonthlySummary(nextSummary);
@@ -1663,7 +1766,7 @@ export default function ReportsExportCenterPage() {
 
   const handleExport = async (reportId: string, format: ReportExportFormat) => {
     if (exporting || !activeReportActionsEnabled) return;
-    const exportKey = activeReportModule === "identity" ? `identity-${format}` : activeReportModule === "password" ? `password-${format}` : activeReportModule === "monthly" ? `monthly-${format}` : activeReportModule === "activity" ? `activity-${format}` : activeReportModule === "highRisk" ? `high-risk-${format}` : activeReportModule === "vault" ? `vault-${format}` : `${reportId}-${format}`;
+    const exportKey = activeReportModule === "identity" ? `identity-${format}` : activeReportModule === "password" ? `password-${format}` : activeReportModule === "phishing" ? `phishing-${format}` : activeReportModule === "monthly" ? `monthly-${format}` : activeReportModule === "activity" ? `activity-${format}` : activeReportModule === "highRisk" ? `high-risk-${format}` : activeReportModule === "vault" ? `vault-${format}` : `${reportId}-${format}`;
     setExporting(exportKey);
     try {
       if (activeReportModule !== "pcap") {
@@ -1696,6 +1799,9 @@ export default function ReportsExportCenterPage() {
     }
     if (module === "password" && !passwordSummary.generated_at && !passwordLoading) {
       void loadPasswordReport();
+    }
+    if (module === "phishing" && !phishingSummary.generated_at && !phishingLoading) {
+      void loadPhishingReport(appliedPhishingFilters);
     }
     if (module === "monthly" && !monthlySummary.generated_at && !monthlyLoading) {
       void loadMonthlyReport(appliedMonthlyFilters);
@@ -1733,6 +1839,8 @@ export default function ReportsExportCenterPage() {
       ? "Identity Leak Summary"
       : activeReportModule === "password"
         ? "Password Risk Summary"
+        : activeReportModule === "phishing"
+          ? "Phishing Incidents Summary"
         : activeReportModule === "monthly"
           ? "Monthly Security Report"
           : activeReportModule === "activity"
@@ -1749,6 +1857,8 @@ export default function ReportsExportCenterPage() {
       ? "Identity Reporting Active"
       : activeReportModule === "password"
         ? "Password Reporting Active"
+        : activeReportModule === "phishing"
+          ? "Phishing Reporting Active"
         : activeReportModule === "monthly"
           ? "Monthly Reporting Active"
           : activeReportModule === "activity"
@@ -1765,6 +1875,8 @@ export default function ReportsExportCenterPage() {
       ? "Identity report generation based on live identity scans, exposure findings, source summaries, severity distribution, timestamps, and safe evidence availability."
       : activeReportModule === "password"
         ? "Password Risk Summary uses safe aggregate Password Checker data only: breach counts, strength distribution, risk distribution, timestamps, and recommendations."
+        : activeReportModule === "phishing"
+          ? "Phishing Incidents Summary uses real Phishing Scanner results, URL risk decisions, ML probabilities, VirusTotal reputation, category distribution, and safe export-ready incident rows."
         : activeReportModule === "monthly"
           ? "Monthly Security Report uses safe aggregate records from connected security modules for a consolidated current-month overview."
           : activeReportModule === "activity"
@@ -1803,6 +1915,21 @@ export default function ReportsExportCenterPage() {
             ["Exposure Count", formatNumber(passwordSummary.breach_summary.total_exposure_count)],
             ["Evidence / Report", `${passwordSummary.evidence_available ? "Risk evidence" : "No risk evidence"} / ${passwordSummary.report_available ? "Report ready" : "Report pending"}`],
           ]
+        : activeReportModule === "phishing"
+          ? [
+              ["Report Name", phishingSummary.report_name],
+              ["Generated At", formatAdminPcapTime(phishingSummary.generated_at)],
+              ["Latest Scan", formatAdminPcapTime(phishingSummary.summary.latest_scan_time)],
+              ["Supported Formats", phishingSummary.supported_formats.map((format) => format.toUpperCase()).join(" / ")],
+              ["Total URL Scans", formatNumber(phishingSummary.summary.total_url_scans)],
+              ["Safe URLs", formatNumber(phishingSummary.summary.safe_urls)],
+              ["Suspicious URLs", formatNumber(phishingSummary.summary.suspicious_urls)],
+              ["Dangerous URLs", formatNumber(phishingSummary.summary.dangerous_urls)],
+              ["Risky URLs", formatNumber(phishingSummary.summary.risky_urls)],
+              ["Average Risk Score", formatNumber(phishingSummary.summary.average_risk_score)],
+              ["Highest Risk", phishingSummary.highest_risk_scan ? `${phishingSummary.highest_risk_scan.domain || phishingSummary.highest_risk_scan.url} (${phishingSummary.highest_risk_scan.final_risk_score}/100)` : "No scans yet"],
+              ["Evidence / Report", `${phishingSummary.evidence_available ? "Risk evidence" : "No risk evidence"} / ${phishingSummary.report_available ? "Report ready" : "Report ready"}`],
+            ]
         : activeReportModule === "monthly"
           ? [
               ["Report Name", monthlySummary.report_name],
@@ -1881,6 +2008,8 @@ export default function ReportsExportCenterPage() {
       ? Boolean(identitySummary.last_generated || identitySummary.total_scans > 0 || identitySummary.report_available)
       : activeReportModule === "password"
         ? passwordSummaryHasLoaded
+        : activeReportModule === "phishing"
+          ? phishingSummaryHasLoaded
         : activeReportModule === "monthly"
           ? monthlySummaryHasLoaded
           : activeReportModule === "activity"
@@ -1911,6 +2040,15 @@ export default function ReportsExportCenterPage() {
         ["Password Risk", titleCase(appliedPasswordFilters.passwordRisk)],
         ["Password Strength", titleCase(appliedPasswordFilters.passwordStrength)],
         ["Breach Status", titleCase(appliedPasswordFilters.breachStatus)],
+      ];
+    }
+    if (activeReportModule === "phishing") {
+      return [
+        ["Date From", appliedPhishingFilters.dateFrom || "All"],
+        ["Date To", appliedPhishingFilters.dateTo || "All"],
+        ["Risk Level", titleCase(appliedPhishingFilters.riskLevel)],
+        ["Category", titleCase(appliedPhishingFilters.category)],
+        ["Export Format", titleCase(appliedPhishingFilters.exportFormat)],
       ];
     }
     if (activeReportModule === "monthly") {
@@ -2005,6 +2143,26 @@ export default function ReportsExportCenterPage() {
       rows.push(sectionRow("Breach Summary", "Latest Check", "", "", passwordSummary.summary.latest_check_at || ""));
       passwordSummary.recommendations.forEach((recommendation, index) => rows.push(sectionRow("Recommendations", `Recommendation ${index + 1}`, recommendation)));
       return { filename: "password-risk-summary.csv", blob: csvBlob(rows) };
+    }
+    if (activeReportModule === "phishing") {
+      return {
+        filename: "phishing-incidents-summary.csv",
+        blob: csvBlob([
+          ["scan_id", "timestamp", "url", "domain", "final_category", "final_risk_score", "ml_probability", "virustotal_status", "virustotal_malicious", "virustotal_suspicious"],
+          ...phishingSummary.latest_scans.map((item) => [
+            item.scan_id,
+            item.timestamp || "",
+            item.url,
+            item.domain,
+            item.final_category,
+            item.final_risk_score,
+            item.ml_probability ?? "",
+            item.virustotal_status,
+            item.virustotal_malicious,
+            item.virustotal_suspicious,
+          ]),
+        ]),
+      };
     }
     if (activeReportModule === "monthly") {
       const rows: unknown[][] = [
@@ -2129,6 +2287,16 @@ export default function ReportsExportCenterPage() {
       passwordSummary.recommendations.slice(0, 6).forEach((item, index) => rows.push([`Recommendation ${index + 1}`, item]));
       return { filename: "password-risk-summary.pdf", blob: buildSimplePdfBlob("Password Risk Summary", "Safe aggregate password report export", rows) };
     }
+    if (activeReportModule === "phishing") {
+      Object.entries(phishingSummary.category_distribution).forEach(([category, count]) => rows.push([`Category: ${titleCase(category)}`, count]));
+      Object.entries(phishingSummary.risk_distribution).forEach(([risk, count]) => rows.push([`Risk Level: ${titleCase(risk)}`, count]));
+      if (phishingSummary.highest_risk_scan) {
+        rows.push(["Highest Risk URL / Domain", `${phishingSummary.highest_risk_scan.url} / ${phishingSummary.highest_risk_scan.domain || "Unknown"} (${phishingSummary.highest_risk_scan.final_risk_score}/100)`]);
+      }
+      phishingSummary.latest_scans.slice(0, 8).forEach((item, index) => rows.push([`Latest Scan ${index + 1}`, `${titleCase(item.final_category)} - ${item.domain || item.url} - ${item.final_risk_score}/100`]));
+      phishingSummary.recommendations.slice(0, 6).forEach((item, index) => rows.push([`Recommendation ${index + 1}`, item]));
+      return { filename: "phishing-incidents-summary.pdf", blob: buildSimplePdfBlob("Phishing Incidents Summary", "Safe phishing scanner incident summary export", rows) };
+    }
     if (activeReportModule === "monthly") {
       Object.entries(monthlySummary.severity_distribution).forEach(([severity, count]) => rows.push([`Severity: ${titleCase(severity)}`, count]));
       Object.entries(monthlySummary.module_distribution).forEach(([module, count]) => rows.push([`Module: ${titleCase(module)}`, count]));
@@ -2203,6 +2371,13 @@ export default function ReportsExportCenterPage() {
             </Button>
             <Button
               variant="outline"
+              className={activeReportModule === "phishing" ? "reports-module-button-active" : "reports-action-button"}
+              onClick={() => switchReportModule("phishing")}
+            >
+              Phishing Incidents Summary
+            </Button>
+            <Button
+              variant="outline"
               className={activeReportModule === "monthly" ? "reports-module-button-active" : "reports-action-button"}
               onClick={() => switchReportModule("monthly")}
             >
@@ -2243,13 +2418,13 @@ export default function ReportsExportCenterPage() {
             <span />
             {activeReportLabel}
           </Badge>
-          <Button variant="outline" className="reports-action-button" disabled={activeLoading} onClick={() => activeReportModule === "identity" ? void loadIdentityReports(appliedIdentityFilters, true) : activeReportModule === "password" ? void loadPasswordReport(appliedPasswordFilters, true) : activeReportModule === "monthly" ? void loadMonthlyReport(appliedMonthlyFilters, true) : activeReportModule === "activity" ? void loadActivityReport(appliedActivityFilters, true) : activeReportModule === "highRisk" ? void loadHighRiskReport(appliedHighRiskFilters, true) : activeReportModule === "incidents" ? void loadIncidentsReport(appliedIncidentsFilters, true) : activeReportModule === "vault" ? void loadVaultReport(true) : void loadReports(appliedFilters, true)}>
+          <Button variant="outline" className="reports-action-button" disabled={activeLoading} onClick={() => activeReportModule === "identity" ? void loadIdentityReports(appliedIdentityFilters, true) : activeReportModule === "password" ? void loadPasswordReport(appliedPasswordFilters, true) : activeReportModule === "phishing" ? void loadPhishingReport(appliedPhishingFilters, true) : activeReportModule === "monthly" ? void loadMonthlyReport(appliedMonthlyFilters, true) : activeReportModule === "activity" ? void loadActivityReport(appliedActivityFilters, true) : activeReportModule === "highRisk" ? void loadHighRiskReport(appliedHighRiskFilters, true) : activeReportModule === "incidents" ? void loadIncidentsReport(appliedIncidentsFilters, true) : activeReportModule === "vault" ? void loadVaultReport(true) : void loadReports(appliedFilters, true)}>
             {activeLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
             Refresh Report
           </Button>
           <Button className="reports-primary-button" onClick={handleGenerate} disabled={generating}>
             {generating ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
-            {activeReportModule === "identity" ? "Generate Identity Report" : activeReportModule === "password" ? "Generate Password Report" : activeReportModule === "monthly" ? "Refresh Monthly Report" : activeReportModule === "activity" ? "Refresh User Activity Report" : activeReportModule === "highRisk" ? "Refresh High-Risk Users Report" : activeReportModule === "incidents" ? "Refresh Security Incidents Report" : activeReportModule === "vault" ? "Refresh Vault Report" : "Generate PCAP Report"}
+            {activeReportModule === "identity" ? "Generate Identity Report" : activeReportModule === "password" ? "Generate Password Report" : activeReportModule === "phishing" ? "Generate Phishing Report" : activeReportModule === "monthly" ? "Refresh Monthly Report" : activeReportModule === "activity" ? "Refresh User Activity Report" : activeReportModule === "highRisk" ? "Refresh High-Risk Users Report" : activeReportModule === "incidents" ? "Refresh Security Incidents Report" : activeReportModule === "vault" ? "Refresh Vault Report" : "Generate PCAP Report"}
           </Button>
           <Button
             variant="outline"
@@ -2292,6 +2467,13 @@ export default function ReportsExportCenterPage() {
             <KpiCard title="Breached Findings" value={passwordLoading ? "..." : formatNumber(passwordSummary.summary.breached_findings)} detail="Checks found in breach data" icon={ShieldAlert} tone="red" />
             <KpiCard title="Weak Findings" value={passwordLoading ? "..." : formatNumber(passwordSummary.summary.weak_findings)} detail="Weak or very weak results" icon={XCircle} tone="purple" />
             <KpiCard title="Strong Safe Checks" value={passwordLoading ? "..." : formatNumber(passwordSummary.summary.strong_safe_checks)} detail="Strong non-breached results" icon={CheckCircle2} tone="green" />
+          </>
+        ) : activeReportModule === "phishing" ? (
+          <>
+            <KpiCard title="Total URL Scans" value={phishingLoading ? "..." : formatNumber(phishingSummary.summary.total_url_scans)} detail="Successful Phishing Scanner rows" icon={FileSearch} tone="blue" />
+            <KpiCard title="Risky URLs" value={phishingLoading ? "..." : formatNumber(phishingSummary.summary.risky_urls)} detail="Suspicious plus dangerous URLs" icon={ShieldAlert} tone="red" />
+            <KpiCard title="Average Risk Score" value={phishingLoading ? "..." : formatNumber(phishingSummary.summary.average_risk_score)} detail="Average final URL risk score" icon={AlertTriangle} tone="purple" />
+            <KpiCard title="Latest Scan" value={phishingLoading ? "..." : formatAdminPcapTime(phishingSummary.summary.latest_scan_time)} detail="Most recent phishing scan timestamp" icon={Clock} tone="green" />
           </>
         ) : activeReportModule === "monthly" ? (
           <>
@@ -2350,7 +2532,7 @@ export default function ReportsExportCenterPage() {
             </div>
             <div className="reports-document-visual" aria-hidden="true">
               <FileBarChart className="h-16 w-16" />
-              <span>{activeReportModule === "identity" ? "IDENTITY" : activeReportModule === "password" ? "PASSWORD" : activeReportModule === "monthly" ? "MONTHLY" : activeReportModule === "activity" ? "ACTIVITY" : activeReportModule === "highRisk" ? "RISK" : activeReportModule === "incidents" ? "INCIDENTS" : activeReportModule === "vault" ? "VAULT" : "PCAP"}</span>
+              <span>{activeReportModule === "identity" ? "IDENTITY" : activeReportModule === "password" ? "PASSWORD" : activeReportModule === "phishing" ? "PHISHING" : activeReportModule === "monthly" ? "MONTHLY" : activeReportModule === "activity" ? "ACTIVITY" : activeReportModule === "highRisk" ? "RISK" : activeReportModule === "incidents" ? "INCIDENTS" : activeReportModule === "vault" ? "VAULT" : "PCAP"}</span>
             </div>
           </div>
 
@@ -2366,7 +2548,7 @@ export default function ReportsExportCenterPage() {
           <div className="reports-active-actions">
             <Button className="reports-primary-button" onClick={handleGenerate} disabled={generating}>
               {generating ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
-              {activeReportModule === "identity" ? "Generate Identity Report" : activeReportModule === "password" ? "Generate Password Report" : activeReportModule === "monthly" ? "Refresh Monthly Report" : activeReportModule === "activity" ? "Refresh User Activity Report" : activeReportModule === "highRisk" ? "Refresh High-Risk Users Report" : activeReportModule === "incidents" ? "Refresh Security Incidents Report" : activeReportModule === "vault" ? "Refresh Vault Report" : "Generate Report"}
+              {activeReportModule === "identity" ? "Generate Identity Report" : activeReportModule === "password" ? "Generate Password Report" : activeReportModule === "phishing" ? "Generate Phishing Report" : activeReportModule === "monthly" ? "Refresh Monthly Report" : activeReportModule === "activity" ? "Refresh User Activity Report" : activeReportModule === "highRisk" ? "Refresh High-Risk Users Report" : activeReportModule === "incidents" ? "Refresh Security Incidents Report" : activeReportModule === "vault" ? "Refresh Vault Report" : "Generate Report"}
             </Button>
             <Button
               variant="outline"
@@ -2392,7 +2574,7 @@ export default function ReportsExportCenterPage() {
               variant="outline"
               className="reports-action-button"
               onClick={() => {
-                const table = document.getElementById(activeReportModule === "identity" ? "recent-identity-reports" : activeReportModule === "password" ? "password-risk-report" : activeReportModule === "monthly" ? "monthly-security-report" : activeReportModule === "activity" ? "user-activity-report" : activeReportModule === "highRisk" ? "high-risk-users-report" : activeReportModule === "incidents" ? "security-incidents-report" : activeReportModule === "vault" ? "file-vault-activity-report" : "recent-pcap-reports");
+                const table = document.getElementById(activeReportModule === "identity" ? "recent-identity-reports" : activeReportModule === "password" ? "password-risk-report" : activeReportModule === "phishing" ? "phishing-incidents-report" : activeReportModule === "monthly" ? "monthly-security-report" : activeReportModule === "activity" ? "user-activity-report" : activeReportModule === "highRisk" ? "high-risk-users-report" : activeReportModule === "incidents" ? "security-incidents-report" : activeReportModule === "vault" ? "file-vault-activity-report" : "recent-pcap-reports");
                 table?.scrollIntoView({ behavior: "smooth", block: "start" });
               }}
               disabled={!activeReportActionsEnabled}
@@ -2449,6 +2631,8 @@ export default function ReportsExportCenterPage() {
                       ? () => switchReportModule("incidents")
                       : category.id === "password-risk"
                         ? () => switchReportModule("password")
+                      : category.id === "phishing-incidents"
+                        ? () => switchReportModule("phishing")
                         : undefined
                   }
                 />
@@ -2462,8 +2646,8 @@ export default function ReportsExportCenterPage() {
         <Card className="reports-filter-card">
           <div className="reports-card-head">
             <div>
-              <h2>{activeReportModule === "identity" ? "Identity Report Filters" : activeReportModule === "password" ? "Password Report Scope" : activeReportModule === "monthly" ? "Monthly Report Scope" : activeReportModule === "activity" ? "User Activity Report Filters" : activeReportModule === "highRisk" ? "High-Risk Users Report Filters" : activeReportModule === "incidents" ? "Security Incidents Report Filters" : activeReportModule === "vault" ? "File Vault Report Scope" : "PCAP Report Filters"}</h2>
-              <p>{activeReportModule === "identity" ? "Refine identity scans by risk, source, status, date, and findings." : activeReportModule === "password" ? "Password Risk Summary is aggregate-only and uses all safe Password Checker records." : activeReportModule === "monthly" ? "Monthly Security Report summarizes safe current-month aggregates only." : activeReportModule === "activity" ? "Refine safe user activity by period, role, activity type, and source." : activeReportModule === "highRisk" ? "Refine high-risk users by period, risk level, source, and role." : activeReportModule === "incidents" ? "Refine real security incidents by period, severity, source, type, and status." : activeReportModule === "vault" ? "File Vault report uses the current reporting period and safe aggregate vault records only." : "Refine the recent PCAP jobs list by report-ready fields."}</p>
+              <h2>{activeReportModule === "identity" ? "Identity Report Filters" : activeReportModule === "password" ? "Password Report Scope" : activeReportModule === "phishing" ? "Phishing Report Filters" : activeReportModule === "monthly" ? "Monthly Report Scope" : activeReportModule === "activity" ? "User Activity Report Filters" : activeReportModule === "highRisk" ? "High-Risk Users Report Filters" : activeReportModule === "incidents" ? "Security Incidents Report Filters" : activeReportModule === "vault" ? "File Vault Report Scope" : "PCAP Report Filters"}</h2>
+              <p>{activeReportModule === "identity" ? "Refine identity scans by risk, source, status, date, and findings." : activeReportModule === "password" ? "Password Risk Summary is aggregate-only and uses all safe Password Checker records." : activeReportModule === "phishing" ? "Refine phishing scanner results by date, risk level, category, and export format." : activeReportModule === "monthly" ? "Monthly Security Report summarizes safe current-month aggregates only." : activeReportModule === "activity" ? "Refine safe user activity by period, role, activity type, and source." : activeReportModule === "highRisk" ? "Refine high-risk users by period, risk level, source, and role." : activeReportModule === "incidents" ? "Refine real security incidents by period, severity, source, type, and status." : activeReportModule === "vault" ? "File Vault report uses the current reporting period and safe aggregate vault records only." : "Refine the recent PCAP jobs list by report-ready fields."}</p>
             </div>
             <Filter className="h-5 w-5 text-blue-300" />
           </div>
@@ -2695,6 +2879,37 @@ export default function ReportsExportCenterPage() {
               <Select value={highRiskFilters.role} onValueChange={(value: HighRiskUsersReportFilters["role"]) => setHighRiskFilters((current) => ({ ...current, role: value }))}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent><SelectItem value="all">All</SelectItem><SelectItem value="admin">Admin</SelectItem><SelectItem value="user">User</SelectItem></SelectContent>
+              </Select>
+            </div>
+          </div>
+          ) : activeReportModule === "phishing" ? (
+          <div className="reports-filter-grid">
+            <div className="reports-filter-span">
+              <label>Date Range</label>
+              <div className="reports-date-row">
+                <Input type="date" value={phishingFilters.dateFrom} onChange={(event) => setPhishingFilters((current) => ({ ...current, dateFrom: event.target.value }))} />
+                <Input type="date" value={phishingFilters.dateTo} onChange={(event) => setPhishingFilters((current) => ({ ...current, dateTo: event.target.value }))} />
+              </div>
+            </div>
+            <div>
+              <label>Risk Level</label>
+              <Select value={phishingFilters.riskLevel} onValueChange={(value: PhishingIncidentsReportFilters["riskLevel"]) => setPhishingFilters((current) => ({ ...current, riskLevel: value }))}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent><SelectItem value="all">All</SelectItem><SelectItem value="low">Low</SelectItem><SelectItem value="medium">Medium</SelectItem><SelectItem value="high">High</SelectItem></SelectContent>
+              </Select>
+            </div>
+            <div>
+              <label>Status / Category</label>
+              <Select value={phishingFilters.category} onValueChange={(value: PhishingIncidentsReportFilters["category"]) => setPhishingFilters((current) => ({ ...current, category: value }))}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent><SelectItem value="all">All</SelectItem><SelectItem value="safe">Safe</SelectItem><SelectItem value="suspicious">Suspicious</SelectItem><SelectItem value="dangerous">Dangerous</SelectItem></SelectContent>
+              </Select>
+            </div>
+            <div>
+              <label>Export Format</label>
+              <Select value={phishingFilters.exportFormat} onValueChange={(value: PhishingIncidentsReportFilters["exportFormat"]) => setPhishingFilters((current) => ({ ...current, exportFormat: value }))}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent><SelectItem value="all">All</SelectItem><SelectItem value="pdf">PDF</SelectItem><SelectItem value="csv">CSV</SelectItem></SelectContent>
               </Select>
             </div>
           </div>
@@ -3425,6 +3640,93 @@ export default function ReportsExportCenterPage() {
                 </div>
                 <div className="space-y-2">
                   {monthlySummary.recommendations.map((item) => (
+                    <p key={item} className="text-sm text-slate-300">- {item}</p>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+        </Card>
+        ) : activeReportModule === "phishing" ? (
+        <Card className="reports-table-card" id="phishing-incidents-report">
+          <div className="reports-card-head">
+            <div>
+              <h2>Recent Phishing Scanner Results</h2>
+              <p>Latest phishing URL scans and export-ready incident summaries available to the admin workspace.</p>
+            </div>
+            <Badge className="reports-badge reports-badge-blue">{formatNumber(phishingSummary.latest_scans.length)} results</Badge>
+          </div>
+          {phishingSummary.highest_risk_scan ? (
+            <div className="reports-selected-report">
+              <div><span>Selected Scan</span><strong>#{phishingSummary.highest_risk_scan.scan_id}</strong></div>
+              <div><span>URL / Domain</span><strong>{phishingSummary.highest_risk_scan.domain || phishingSummary.highest_risk_scan.url}</strong></div>
+              <div><span>Final Category</span><strong>{titleCase(phishingSummary.highest_risk_scan.final_category)}</strong></div>
+              <div><span>Final Risk Score</span><strong>{phishingSummary.highest_risk_scan.final_risk_score}/100</strong></div>
+              <div><span>Scanned</span><strong>{formatAdminPcapTime(phishingSummary.highest_risk_scan.timestamp)}</strong></div>
+            </div>
+          ) : null}
+          {phishingLoading ? (
+            <div className="reports-empty-state">
+              <Loader2 className="h-6 w-6 animate-spin" />
+              Loading phishing scanner results...
+            </div>
+          ) : phishingSummary.latest_scans.length === 0 ? (
+            <div className="reports-empty-state">
+              <FileSearch className="h-6 w-6" />
+              No phishing incidents available yet.
+            </div>
+          ) : (
+            <div className="reports-evidence-list">
+              <div className="reports-summary-grid">
+                <div className="reports-summary-item"><span>Total URL Scans</span><strong>{formatNumber(phishingSummary.summary.total_url_scans)}</strong></div>
+                <div className="reports-summary-item"><span>Safe URLs</span><strong>{formatNumber(phishingSummary.summary.safe_urls)}</strong></div>
+                <div className="reports-summary-item"><span>Suspicious URLs</span><strong>{formatNumber(phishingSummary.summary.suspicious_urls)}</strong></div>
+                <div className="reports-summary-item"><span>Dangerous URLs</span><strong>{formatNumber(phishingSummary.summary.dangerous_urls)}</strong></div>
+                <div className="reports-summary-item"><span>Risky URLs</span><strong>{formatNumber(phishingSummary.summary.risky_urls)}</strong></div>
+                <div className="reports-summary-item"><span>Average Risk Score</span><strong>{formatNumber(phishingSummary.summary.average_risk_score)}</strong></div>
+                <div className="reports-summary-item"><span>VT Malicious Total</span><strong>{formatNumber(phishingSummary.summary.virustotal_malicious_total)}</strong></div>
+                <div className="reports-summary-item"><span>VT Suspicious Total</span><strong>{formatNumber(phishingSummary.summary.virustotal_suspicious_total)}</strong></div>
+              </div>
+              <div className="reports-table-wrap">
+                <Table className="min-w-[1100px] table-fixed">
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-[300px]">URL / Domain</TableHead>
+                      <TableHead className="w-[130px]">Category</TableHead>
+                      <TableHead className="w-[110px]">Risk Score</TableHead>
+                      <TableHead className="w-[190px]">VirusTotal</TableHead>
+                      <TableHead className="w-[160px]">Scanned At</TableHead>
+                      <TableHead className="w-[130px]">ML Probability</TableHead>
+                      <TableHead className="w-[100px]">Malicious</TableHead>
+                      <TableHead className="w-[100px]">Suspicious</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {phishingSummary.latest_scans.map((item) => (
+                      <TableRow key={`${item.scan_id}-${item.timestamp || item.url}`}>
+                        <TableCell className="break-words font-medium text-white">
+                          {item.url}
+                          <div className="text-xs text-slate-400">{item.domain || "Unknown domain"}</div>
+                        </TableCell>
+                        <TableCell><span className={riskBadgeClass(item.risk_level)}>{titleCase(item.final_category)}</span></TableCell>
+                        <TableCell className="font-semibold text-white">{item.final_risk_score}/100</TableCell>
+                        <TableCell className="text-slate-300">{titleCase(item.virustotal_status)} ({item.virustotal_malicious} malicious / {item.virustotal_suspicious} suspicious)</TableCell>
+                        <TableCell className="text-slate-400">{formatAdminPcapTime(item.timestamp)}</TableCell>
+                        <TableCell className="text-slate-300">{item.ml_probability ?? "N/A"}</TableCell>
+                        <TableCell className="text-slate-300">{formatNumber(item.virustotal_malicious)}</TableCell>
+                        <TableCell className="text-slate-300">{formatNumber(item.virustotal_suspicious)}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+              <div className="reports-evidence-card">
+                <div className="reports-active-title-row">
+                  <h3>Recommendations</h3>
+                  <Badge className="reports-badge reports-badge-blue">{phishingSummary.recommendations.length} items</Badge>
+                </div>
+                <div className="space-y-2">
+                  {phishingSummary.recommendations.map((item) => (
                     <p key={item} className="text-sm text-slate-300">- {item}</p>
                   ))}
                 </div>

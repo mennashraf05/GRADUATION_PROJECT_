@@ -26,6 +26,8 @@ import { cn } from "./ui/utils";
 const DEFAULT_LOCAL_API_BASE = "http://127.0.0.1:5000";
 const VAULT_AI_NOTIFICATION_INTERVAL_MS = 15000;
 const VAULT_AI_MIN_NOTIFY_SCORE = 80;
+const NOTIFICATIONS_UPDATED_EVENT = "sentinel:notifications-updated";
+const NOTIFICATIONS_UPDATED_AT_KEY = "sentinel_notifications_updated_at";
 
 function normalizeApiBase(raw: string) {
   const trimmed = String(raw || "").trim().replace(/\/$/, "");
@@ -334,9 +336,16 @@ function normalizeNotificationItem(raw: NotificationItem): NotificationItem {
   const message = String(raw.message || raw.body || "").trim();
   const jobId = String(raw.job_id || metadata.job_id || "").trim() || null;
   const scanId = raw.scan_id || metadata.scan_id || null;
+  const moduleKey = String(
+    raw.module || metadata.module_key || metadata.module || metadata.source_module || ""
+  ).trim().toLowerCase();
+  const fallbackScanUrl =
+    scanId && (moduleKey.includes("identity") || normalizedType === "identity_leak")
+      ? `/identityleak-monitor?scan_id=${encodeURIComponent(String(scanId))}`
+      : null;
   const actionUrl =
     String(raw.action_url || metadata.action_url || "").trim() ||
-    (scanId ? `/identityleak-monitor?scan_id=${encodeURIComponent(String(scanId))}` : null);
+    fallbackScanUrl;
 
   return {
     ...raw,
@@ -870,7 +879,7 @@ export function NotificationCenter() {
       return;
     }
 
-    const handleRecentPcapUpdated = () => {
+    const handleNotificationsUpdated = () => {
       if (isOpen) {
         void fetchNotifications(false);
       } else {
@@ -879,16 +888,21 @@ export function NotificationCenter() {
     };
 
     const handleStorageEvent = (event: StorageEvent) => {
-      if (event.key === RECENT_PCAP_ALERT_UPDATED_AT_KEY) {
-        handleRecentPcapUpdated();
+      if (
+        event.key === RECENT_PCAP_ALERT_UPDATED_AT_KEY ||
+        event.key === NOTIFICATIONS_UPDATED_AT_KEY
+      ) {
+        handleNotificationsUpdated();
       }
     };
 
-    window.addEventListener(RECENT_PCAP_ALERT_EVENT, handleRecentPcapUpdated);
+    window.addEventListener(RECENT_PCAP_ALERT_EVENT, handleNotificationsUpdated);
+    window.addEventListener(NOTIFICATIONS_UPDATED_EVENT, handleNotificationsUpdated);
     window.addEventListener("storage", handleStorageEvent);
 
     return () => {
-      window.removeEventListener(RECENT_PCAP_ALERT_EVENT, handleRecentPcapUpdated);
+      window.removeEventListener(RECENT_PCAP_ALERT_EVENT, handleNotificationsUpdated);
+      window.removeEventListener(NOTIFICATIONS_UPDATED_EVENT, handleNotificationsUpdated);
       window.removeEventListener("storage", handleStorageEvent);
     };
   }, [isOpen]);

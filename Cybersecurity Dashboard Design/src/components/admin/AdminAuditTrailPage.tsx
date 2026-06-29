@@ -166,6 +166,7 @@ const REAL_ADMIN_MODULE_OPTIONS: AuditFilterOption[] = [
   { value: 'reports_center', label: 'Reports Center' },
   { value: 'settings', label: 'Settings' },
   { value: 'password_checker', label: 'Password Checker' },
+  { value: 'phishing_scanner', label: 'Phishing Scanner' },
   { value: 'file_vault', label: 'File Vault' },
   { value: 'identity_leak', label: 'Identity Leak Monitor' },
 ];
@@ -195,6 +196,8 @@ const MODULE_LABELS_BY_KEY: Record<string, string> = {
   settings: 'Settings',
   password_checker: 'Password Checker',
   password: 'Password Checker',
+  phishing_scanner: 'Phishing Scanner',
+  phishing: 'Phishing Scanner',
   file_vault: 'File Vault',
   vault: 'File Vault',
   encrypted_file_vault: 'File Vault',
@@ -273,6 +276,7 @@ function severityClass(severity: string) {
 
 function moduleClass(module: string) {
   if (module.includes('PCAP')) return 'border-cyan-400/30 bg-cyan-500/12 text-cyan-100';
+  if (module.includes('Phishing')) return 'border-sky-400/30 bg-sky-500/12 text-sky-100';
   if (module.includes('Users')) return 'border-blue-400/30 bg-blue-500/12 text-blue-100';
   if (module.includes('Threat')) return 'border-orange-400/30 bg-orange-500/12 text-orange-100';
   return 'border-slate-500/30 bg-slate-500/12 text-slate-100';
@@ -765,7 +769,9 @@ export default function AdminAuditTrailPage() {
                       <div className={`mt-1 h-2.5 w-2.5 rounded-full ${item.severity === 'critical' ? 'bg-red-400' : 'bg-orange-400'}`} />
                       <div className="min-w-0 flex-1">
                         <p className="truncate text-sm font-medium text-white">{item.action_label}</p>
-                        <p className="mt-1 truncate text-xs text-slate-400">{item.actor_name} - {formatRelativeTime(item.created_at)}</p>
+                        <p className="mt-1 truncate text-xs text-slate-400">
+                          {item.actor_name} - {formatRelativeTime(item.created_at)} - {getAuditModuleLabel(item.module, item.module_label)}
+                        </p>
                       </div>
                     </div>
                   </button>

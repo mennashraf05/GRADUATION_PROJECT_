@@ -466,34 +466,46 @@ export function PasswordCheckerPage() {
                 {isArabic ? 'نصائح أمنية' : 'Security Tips'}
               </CardTitle>
             </CardHeader>
-            <CardContent className="space-y-3 px-4 pb-4 sm:px-5">
-              <div className="space-y-2.5">
-                <div className="rounded-lg border border-blue-500/20 bg-blue-500/10 p-2.5">
-                  <h4 className="text-blue-400 font-medium">{isArabic ? 'استخدم كلمات مرور قوية' : 'Use Strong Passwords'}</h4>
-                  <p className="text-gray-400 text-sm mt-1">
+            <CardContent className="px-4 pb-4 pt-2 sm:px-5">
+              <div className="space-y-3">
+                <div className="flex gap-3 rounded-xl border border-white/10 bg-white/[0.035] p-3">
+                  <Circle className="mt-1 h-2.5 w-2.5 shrink-0 fill-blue-400 text-blue-400" />
+                  <div className="min-w-0">
+                    <h4 className="text-sm font-semibold leading-5 text-blue-300">{isArabic ? 'استخدم كلمات مرور قوية' : 'Use Strong Passwords'}</h4>
+                    <p className="mt-1 text-sm leading-6 text-gray-400">
                     {isArabic ? 'أنشئ كلمات مرور فريدة من 12 حرفًا أو أكثر وتتضمن أرقامًا ورموزًا.' : 'Create unique passwords with 12+ characters, including numbers and symbols.'}
-                  </p>
+                    </p>
+                  </div>
                 </div>
 
-                <div className="rounded-lg border border-green-500/20 bg-green-500/10 p-2.5">
-                  <h4 className="text-green-400 font-medium">{isArabic ? 'فعّل المصادقة الثنائية' : 'Enable 2FA'}</h4>
-                  <p className="text-gray-400 text-sm mt-1">
+                <div className="flex gap-3 rounded-xl border border-white/10 bg-white/[0.035] p-3">
+                  <Circle className="mt-1 h-2.5 w-2.5 shrink-0 fill-emerald-400 text-emerald-400" />
+                  <div className="min-w-0">
+                    <h4 className="text-sm font-semibold leading-5 text-emerald-300">{isArabic ? 'فعّل المصادقة الثنائية' : 'Enable 2FA'}</h4>
+                    <p className="mt-1 text-sm leading-6 text-gray-400">
                     {isArabic ? 'تضيف المصادقة الثنائية طبقة أمان إضافية.' : 'Two-factor authentication adds an extra layer of security.'}
-                  </p>
+                    </p>
+                  </div>
                 </div>
 
-                <div className="rounded-lg border border-purple-500/20 bg-purple-500/10 p-2.5">
-                  <h4 className="text-purple-400 font-medium">{isArabic ? 'استخدم مدير كلمات المرور' : 'Use Password Manager'}</h4>
-                  <p className="text-gray-400 text-sm mt-1">
+                <div className="flex gap-3 rounded-xl border border-white/10 bg-white/[0.035] p-3">
+                  <Circle className="mt-1 h-2.5 w-2.5 shrink-0 fill-purple-400 text-purple-400" />
+                  <div className="min-w-0">
+                    <h4 className="text-sm font-semibold leading-5 text-purple-300">{isArabic ? 'استخدم مدير كلمات المرور' : 'Use Password Manager'}</h4>
+                    <p className="mt-1 text-sm leading-6 text-gray-400">
                     {isArabic ? 'دع مدير كلمات المرور ينشئ كلمات مرور فريدة ويحفظها لك.' : 'Let a password manager generate and store unique passwords.'}
-                  </p>
+                    </p>
+                  </div>
                 </div>
 
-                <div className="rounded-lg border border-yellow-500/20 bg-yellow-500/10 p-2.5">
-                  <h4 className="text-yellow-400 font-medium">{isArabic ? 'فحوصات منتظمة' : 'Regular Checks'}</h4>
-                  <p className="text-gray-400 text-sm mt-1">
+                <div className="flex gap-3 rounded-xl border border-white/10 bg-white/[0.035] p-3">
+                  <Circle className="mt-1 h-2.5 w-2.5 shrink-0 fill-amber-400 text-amber-400" />
+                  <div className="min-w-0">
+                    <h4 className="text-sm font-semibold leading-5 text-amber-300">{isArabic ? 'فحوصات منتظمة' : 'Regular Checks'}</h4>
+                    <p className="mt-1 text-sm leading-6 text-gray-400">
                     {isArabic ? 'افحص التسريبات شهريًا لتبقى على اطلاع بحالة أمانك.' : 'Check for breaches monthly to stay informed about your security.'}
-                  </p>
+                    </p>
+                  </div>
                 </div>
               </div>
             </CardContent>

@@ -17,6 +17,7 @@ MODULE_AI = "ai"
 MODULE_IDENTITY = "identity"
 MODULE_PASSWORD = "password"
 MODULE_SETTINGS = "settings"
+MODULE_PHISHING = "phishing"
 
 STATUS_SUCCESS = "success"
 STATUS_FAILED = "failed"
@@ -106,6 +107,12 @@ PASSWORD_EVENT_TYPES = {
     "password_history_cleared",
 }
 
+PHISHING_EVENT_TYPES = {
+    "phishing_scan_completed",
+    "phishing_suspicious_url_detected",
+    "phishing_dangerous_url_detected",
+}
+
 SETTINGS_EVENT_TYPES = {
     "profile_settings_updated",
     "security_settings_updated",
@@ -124,6 +131,7 @@ VALID_ACTIVITY_EVENT_TYPES = (
     | AI_EVENT_TYPES
     | IDENTITY_EVENT_TYPES
     | PASSWORD_EVENT_TYPES
+    | PHISHING_EVENT_TYPES
     | SETTINGS_EVENT_TYPES
 )
 
@@ -135,6 +143,7 @@ VALID_ACTIVITY_MODULES = {
     MODULE_IDENTITY,
     MODULE_PASSWORD,
     MODULE_SETTINGS,
+    MODULE_PHISHING,
 }
 
 VALID_ACTIVITY_STATUSES = {
@@ -177,6 +186,9 @@ NEVER_DEDUPE_AUDIT_ACTION_TYPES = {
     "user_deleted",
     "password_breach_detected",
     "password_check_completed",
+    "phishing_scan_completed",
+    "phishing_suspicious_url_detected",
+    "phishing_dangerous_url_detected",
     "vault_access_denied",
     "vault_file_uploaded",
     "vault_file_deleted",
@@ -258,6 +270,9 @@ USER_ACTIVITY_LABELS = {
     "weak_password_detected": "Weak password detected",
     "password_history_viewed": "Password history viewed",
     "password_history_cleared": "Password history cleared",
+    "phishing_scan_completed": "Phishing URL scan completed",
+    "phishing_suspicious_url_detected": "Suspicious phishing URL detected",
+    "phishing_dangerous_url_detected": "Dangerous phishing URL detected",
     "profile_settings_updated": "Profile settings updated",
     "security_settings_updated": "Security settings updated",
     "notification_setting_changed": "Notification setting changed",

@@ -1,8 +1,10 @@
 import sqlite3
 import os
 
-DB_PATH = os.path.join("data", "scans.db")
-os.makedirs("data", exist_ok=True)
+BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(BACKEND_DIR, "data")
+DB_PATH = os.path.join(DATA_DIR, "scans.db")
+os.makedirs(DATA_DIR, exist_ok=True)
 
 conn = sqlite3.connect(DB_PATH)
 c = conn.cursor()

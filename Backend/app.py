@@ -130,6 +130,7 @@ from services.identity_web_scraper.database import (
     update_asset_scan_result as update_identity_asset_scan_result,
 )
 from phishing_scanner.scan import scan_bp
+from phishing_scanner.risk import get_user_guidance
 from gamification import (
     GamificationService,
     ensure_gamification_schema_initialized,
@@ -154,6 +155,7 @@ from activity_logs import (
     MODULE_AI,
     MODULE_IDENTITY,
     MODULE_PASSWORD,
+    MODULE_PHISHING,
     MODULE_SETTINGS,
     STATUS_FAILED,
     STATUS_INFO,
@@ -281,6 +283,7 @@ VAULT_EMAIL_ALERTS_ENABLED = _env_truthy("VAULT_EMAIL_ALERTS_ENABLED", True)
 VAULT_EMAIL_MIN_RISK_SCORE = _env_positive_int("VAULT_EMAIL_MIN_RISK_SCORE", 80)
 VAULT_EMAIL_ALERT_COOLDOWN_MINUTES = _env_positive_int("VAULT_EMAIL_ALERT_COOLDOWN_MINUTES", 30)
 VAULT_EMAIL_ALERT_TO = str(os.getenv("VAULT_EMAIL_ALERT_TO") or "").strip()
+ADMIN_ALERT_EMAIL_TO = str(os.getenv("ADMIN_ALERT_EMAIL_TO") or "").strip()
 
 # Password Checker notification settings
 PASSWORD_NOTIFICATION_COOLDOWN_MINUTES = _env_positive_int("PASSWORD_NOTIFICATION_COOLDOWN_MINUTES", 30)
@@ -904,6 +907,9 @@ _pcap_log_throttle_state: dict[str, float] = {}
 
 _vault_email_alert_lock = threading.Lock()
 _vault_email_alert_state: dict[str, float] = {}
+
+_admin_alert_email_lock = threading.Lock()
+_admin_alert_email_dedupe_keys: set[str] = set()
 
 _password_email_alert_lock = threading.Lock()
 _password_email_alert_state: dict[str, float] = {}
@@ -5124,6 +5130,8 @@ def _serialize_pcap_alert_record(alert: "PcapAlertRecord") -> dict[str, object]:
     else:
         timestamp = None
 
+    metadata = _pcap_alert_metadata_from_json(getattr(alert, "metadata_json", None))
+
     # Compute relative time (safe because created_at_utc is now UTC-aware)
     created = created_at_utc or now
     delta = now - created
@@ -5158,7 +5166,7 @@ def _serialize_pcap_alert_record(alert: "PcapAlertRecord") -> dict[str, object]:
     ):
         serialized_type = "pcap_alert"
 
-    return {
+    serialized = {
         "id": str(alert.id),
         "user_id": int(alert.user_id),
         "job_id": _safe_str(alert.job_id) or "",
@@ -5182,6 +5190,26 @@ def _serialize_pcap_alert_record(alert: "PcapAlertRecord") -> dict[str, object]:
         "created_at": timestamp,
         "relative_time": relative_time,
     }
+
+    if _safe_str(alert.source_type) == "phishing_scanner":
+        serialized.update(
+            {
+                "source": "phishing",
+                "module": "Phishing Scanner",
+                "module_key": "phishing",
+                "url": _safe_str(metadata.get("url")) or None,
+                "domain": _safe_str(metadata.get("domain")) or None,
+                "risk_score": _safe_int(metadata.get("final_risk_score"), 0),
+                "final_category": _safe_str(metadata.get("final_category")) or None,
+                "final_risk_score": _safe_int(metadata.get("final_risk_score"), 0),
+                "ml_probability": metadata.get("ml_probability"),
+                "virustotal_malicious": _safe_int(metadata.get("virustotal_malicious"), 0),
+                "virustotal_suspicious": _safe_int(metadata.get("virustotal_suspicious"), 0),
+                "metadata": metadata,
+            }
+        )
+
+    return serialized
 
 
 def _pcap_alert_metadata_from_json(raw_value) -> dict:
@@ -5519,6 +5547,9 @@ def list_pcap_alerts():
     backfilled_count = _backfill_pcap_alert_records_for_user(
         ctx, limit_jobs=max(limit * 4, 24)
     )
+    phishing_backfilled_count = _backfill_phishing_alert_records_for_user(
+        ctx.user, limit_scans=max(limit * 4, 24)
+    )
     alerts = _list_user_pcap_alert_records(
         ctx.owner_user_id,
         owner_user_scope=ctx.owner_user_scope,
@@ -5543,7 +5574,7 @@ def list_pcap_alerts():
             ctx.owner_user_id,
             limit,
             len(alerts),
-            backfilled_count,
+            backfilled_count + phishing_backfilled_count,
             getattr(latest_job, "job_id", None) if latest_job else None,
             getattr(latest_job, "finished_at", None) if latest_job else None,
             alerts[0].get("job_id") if alerts else None,
@@ -6729,6 +6760,8 @@ def _serialize_notification(notification: UserNotification) -> dict:
     message = str(getattr(notification, "body", "") or "").strip()
     if job_id and not metadata.get("job_id"):
         metadata = {**metadata, "job_id": job_id}
+    action_url = str(metadata.get("action_url") or "").strip() or None
+    scan_id = metadata.get("scan_id") or metadata.get("source_id") or None
 
     # Safely handle created_at which may be naive or aware
     created_at_str = None
@@ -6743,9 +6776,13 @@ def _serialize_notification(notification: UserNotification) -> dict:
         "type": normalized_type,
         "severity": severity,
         "title": notification.title,
+        "module": metadata.get("module") or metadata.get("source_module") or None,
+        "source": metadata.get("module_key") or metadata.get("source_type") or metadata.get("source_module") or None,
         "message": message,
         "body": message,
         "job_id": job_id,
+        "scan_id": scan_id,
+        "action_url": action_url,
         "metadata": _sanitize_for_json(metadata),
         "is_read": bool(notification.is_read),
         "created_at": created_at_str,
@@ -10671,6 +10708,7 @@ def _serialize_user_activity_log(
             MODULE_AI: "AI Threat Detector",
             MODULE_IDENTITY: "Identity Leak Monitor",
             MODULE_PASSWORD: "Password Checker",
+            MODULE_PHISHING: "Phishing Scanner",
             MODULE_SETTINGS: "Settings",
         }.get(record.module, "Activity"),
     }
@@ -11741,6 +11779,7 @@ ADMIN_AUDIT_REAL_MODULE_LABELS = {
     "reports_center": "Reports Center",
     "settings": "Settings",
     "password_checker": "Password Checker",
+    "phishing_scanner": "Phishing Scanner",
     "file_vault": "File Vault",
     "identity_leak": "Identity Leak Monitor",
 }
@@ -11766,6 +11805,8 @@ ADMIN_AUDIT_MODULE_ALIASES = {
     "report_exports": "reports_center",
     "password": "password_checker",
     "passwords": "password_checker",
+    "phishing": "phishing_scanner",
+    "phishing_scanner": "phishing_scanner",
     "vault": "file_vault",
     "encrypted_file_vault": "file_vault",
     "encrypted_vault": "file_vault",
@@ -11786,12 +11827,14 @@ ADMIN_AUDIT_TRUSTED_MODULE_OPTIONS = [
     "reports_center",
     "settings",
     "password_checker",
+    "phishing_scanner",
     "file_vault",
     "identity_leak",
 ]
 
 ADMIN_AUDIT_USER_ACTIVITY_MODULES = {
     "password_checker": MODULE_PASSWORD,
+    "phishing_scanner": MODULE_PHISHING,
     "file_vault": MODULE_VAULT,
     "identity_leak": MODULE_IDENTITY,
     "pcap_analysis": MODULE_PCAP,
@@ -12066,7 +12109,10 @@ def _normalize_admin_threat_module(raw_value) -> str:
         "pcap": "PCAP Analyzer",
         "pcap analyzer": "PCAP Analyzer",
         "phishing": "Phishing Scanner",
+        "phishing_scanner": "Phishing Scanner",
         "phishing scanner": "Phishing Scanner",
+        "phishing scan": "Phishing Scanner",
+        "url scan": "Phishing Scanner",
         "password": "Password Checker",
         "passwords": "Password Checker",
         "password_checker": "Password Checker",
@@ -12080,6 +12126,25 @@ def _normalize_admin_threat_module(raw_value) -> str:
         "identity leak monitor": "Identity Leak Monitor",
     }
     return mapping.get(normalized, "")
+
+
+def _admin_threat_has_phishing_signal(*values) -> bool:
+    content = " ".join(_safe_str(value) for value in values if _safe_str(value)).lower()
+    if not content:
+        return False
+    return any(
+        marker in content
+        for marker in (
+            "phishing_scanner",
+            "phishing scanner",
+            "phishing-scan",
+            "phishing scan",
+            "phishing url",
+            "url scan completed",
+            "suspicious url detected",
+            "dangerous phishing risk detected",
+        )
+    )
 
 
 def _admin_threat_has_password_signal(*values) -> bool:
@@ -12330,20 +12395,66 @@ def _serialize_admin_pcap_threat(
         metadata.get("password_check_id"),
     ):
         source_module = "Password Checker"
+    if not source_module and _admin_threat_has_phishing_signal(
+        serialized.get("source_type"),
+        serialized.get("job_id"),
+        serialized.get("risk_label"),
+        serialized.get("top_pattern"),
+        serialized.get("title"),
+        serialized.get("message"),
+        metadata.get("source_module"),
+        metadata.get("module"),
+        metadata.get("module_key"),
+        metadata.get("url"),
+        metadata.get("final_category"),
+    ):
+        source_module = "Phishing Scanner"
     source_module = source_module or "PCAP Analyzer"
-    evidence = _sanitize_for_json(
-        {
-            "Matched Rules Count": threats_count or None,
-            "Suspicious Indicators": threats_count or None,
-            "Protocol": _safe_str(serialized.get("protocol")) or None,
-            "Job ID": _safe_str(serialized.get("job_id")) or None,
-            "Evidence Reference": _safe_str(serialized.get("filename") or serialized.get("top_pattern")) or None,
-        }
-    )
+    if source_module == "Phishing Scanner":
+        risk_score = _safe_int(
+            metadata.get("final_risk_score") or serialized.get("final_risk_score"),
+            0,
+        )
+        confidence = min(99, max(42, risk_score or confidence))
+        evidence = _sanitize_for_json(
+            {
+                "Module": "Phishing Scanner",
+                "Scan ID": _safe_int(metadata.get("scan_id") or metadata.get("source_id"), 0) or None,
+                "URL": _safe_str(metadata.get("url") or serialized.get("url")) or None,
+                "Domain": _safe_str(metadata.get("domain") or serialized.get("domain")) or None,
+                "Final Category": _safe_str(metadata.get("final_category") or serialized.get("final_category")) or None,
+                "Final Risk Score": risk_score,
+                "ML Probability": metadata.get("ml_probability") or serialized.get("ml_probability"),
+                "VirusTotal Malicious": _safe_int(
+                    metadata.get("virustotal_malicious") or serialized.get("virustotal_malicious"),
+                    0,
+                ),
+                "VirusTotal Suspicious": _safe_int(
+                    metadata.get("virustotal_suspicious") or serialized.get("virustotal_suspicious"),
+                    0,
+                ),
+                "Job ID": _safe_str(serialized.get("job_id")) or None,
+                "Timestamp": timestamp,
+            }
+        )
+    else:
+        evidence = _sanitize_for_json(
+            {
+                "Matched Rules Count": threats_count or None,
+                "Suspicious Indicators": threats_count or None,
+                "Protocol": _safe_str(serialized.get("protocol")) or None,
+                "Job ID": _safe_str(serialized.get("job_id")) or None,
+                "Evidence Reference": _safe_str(serialized.get("filename") or serialized.get("top_pattern")) or None,
+            }
+        )
     user_email = _safe_str(getattr(user, "email", None))
     threat_detected = severity in {"Critical", "High"} or threats_count > 0
+    alert_id = f"pcap-{serialized.get('id')}"
+    if source_module == "Phishing Scanner":
+        scan_id = _safe_int(metadata.get("scan_id") or metadata.get("source_id"), 0)
+        alert_id = f"phishing-scanner:{user_id}:{scan_id}" if user_id > 0 and scan_id > 0 else alert_id
     return {
-        "id": f"pcap-{serialized.get('id')}",
+        "id": alert_id,
         "title": _safe_str(serialized.get("title"), "Suspicious PCAP Activity"),
         "description": _safe_str(serialized.get("message"), "Potentially malicious traffic was surfaced by PCAP analysis."),
         "module": source_module,
@@ -12374,6 +12485,48 @@ def _serialize_admin_pcap_threat(
             }
         ],
     }
+
+
+def _admin_phishing_scan_key(user_id, scan_id) -> str:
+    normalized_user_id = _safe_int(user_id, 0)
+    normalized_scan_id = _safe_int(scan_id, 0)
+    if normalized_user_id <= 0 or normalized_scan_id <= 0:
+        return ""
+    return f"phishing-scanner:{normalized_user_id}:{normalized_scan_id}"
+
+
+def _admin_phishing_notification_scan_key(notification: UserNotification, metadata: dict) -> str:
+    if not _admin_threat_has_phishing_signal(
+        getattr(notification, "type", None),
+        getattr(notification, "title", None),
+        getattr(notification, "body", None),
+        metadata.get("module"),
+        metadata.get("source_module"),
+        metadata.get("module_key"),
+        metadata.get("url"),
+        metadata.get("final_category"),
+    ):
+        return ""
+    scan_id = metadata.get("scan_id") or metadata.get("source_id")
+    return _admin_phishing_scan_key(getattr(notification, "user_id", None), scan_id)
+
+
+def _admin_phishing_alert_scan_key(alert: PcapAlertRecord, metadata: dict) -> str:
+    if _safe_str(getattr(alert, "source_type", None)) != "phishing_scanner" and not _admin_threat_has_phishing_signal(
+        getattr(alert, "source_type", None),
+        getattr(alert, "job_id", None),
+        getattr(alert, "risk_label", None),
+        getattr(alert, "top_pattern", None),
+        getattr(alert, "title", None),
+        metadata.get("source_module"),
+        metadata.get("module"),
+        metadata.get("module_key"),
+        metadata.get("url"),
+        metadata.get("final_category"),
+    ):
+        return ""
+    scan_id = metadata.get("scan_id") or metadata.get("source_id")
+    return _admin_phishing_scan_key(getattr(alert, "user_id", None), scan_id)
 
 
 def _list_admin_identity_threats(
@@ -12860,6 +13013,17 @@ def _build_admin_threat_feed() -> list[dict[str, object]]:
 
     alerts: list[dict[str, object]] = []
     represented_password_check_ids: set[int] = set()
+    pcap_alerts = (
+        PcapAlertRecord.query.order_by(PcapAlertRecord.event_at.desc(), PcapAlertRecord.created_at.desc(), PcapAlertRecord.id.desc())
+        .limit(60)
+        .all()
+    )
+    represented_phishing_scan_keys: set[str] = set()
+    for alert in pcap_alerts:
+        metadata = _pcap_alert_metadata_from_json(getattr(alert, "metadata_json", None))
+        phishing_key = _admin_phishing_alert_scan_key(alert, metadata)
+        if phishing_key:
+            represented_phishing_scan_keys.add(phishing_key)
 
     notifications = (
         UserNotification.query.order_by(UserNotification.created_at.desc(), UserNotification.id.desc())
@@ -12869,6 +13033,9 @@ def _build_admin_threat_feed() -> list[dict[str, object]]:
     for notification in notifications:
         metadata = _notification_metadata_from_json(getattr(notification, "metadata_json", None))
         if not _is_notification_threat_candidate(notification, metadata):
+            continue
+        phishing_key = _admin_phishing_notification_scan_key(notification, metadata)
+        if phishing_key and phishing_key in represented_phishing_scan_keys:
             continue
         serialized_alert = _serialize_admin_notification_threat(
             notification, user_by_id, linked_accounts_by_user_id
@@ -12893,11 +13060,6 @@ def _build_admin_threat_feed() -> list[dict[str, object]]:
     alerts.extend(_list_admin_identity_threats(user_by_id, linked_accounts_by_user_id))
     alerts.extend(_list_admin_identity_finding_threats(user_by_id))
 
-    pcap_alerts = (
-        PcapAlertRecord.query.order_by(PcapAlertRecord.event_at.desc(), PcapAlertRecord.created_at.desc(), PcapAlertRecord.id.desc())
-        .limit(60)
-        .all()
-    )
     for alert in pcap_alerts:
         metadata = _pcap_alert_metadata_from_json(getattr(alert, "metadata_json", None))
         password_check_id = _safe_int(metadata.get("password_check_id") or metadata.get("source_id"), 0)
@@ -13523,7 +13685,26 @@ def send_notification_email_best_effort(user, notification) -> bool:
         if not recipient:
             app.logger.warning("[NotificationEmail] Notification email skipped: user.email is missing")
             return False
+        subject = _notification_email_subject(getattr(notification, "title", None))
+        text_body, html_body = _build_notification_email_bodies(notification)
+
         if smtp_password_is_placeholder:
+            if _mail_is_configured():
+                app.logger.warning(
+                    "[NotificationEmail] SMTP_PASSWORD is placeholder; using existing MAIL_* send_email path | "
+                    "notification_id=%s user_id=%s recipient=%s",
+                    getattr(notification, "id", None),
+                    getattr(user, "id", None),
+                    masked_recipient,
+                )
+                send_email(recipient, subject, html_body, text_body)
+                app.logger.warning(
+                    "[NotificationEmail] email sent successfully via MAIL_* fallback | notification_id=%s user_id=%s recipient=%s",
+                    getattr(notification, "id", None),
+                    getattr(user, "id", None),
+                    masked_recipient,
+                )
+                return True
             app.logger.warning("[NotificationEmail] Notification email skipped: SMTP_PASSWORD appears to be placeholder")
             return False
         if not _notification_email_smtp_configured():
@@ -13542,10 +13723,24 @@ def send_notification_email_best_effort(user, notification) -> bool:
                 "[NotificationEmail] Notification email skipped: missing SMTP config | missing=%s",
                 ",".join(missing_keys) or "unknown",
             )
+            if _mail_is_configured():
+                app.logger.warning(
+                    "[NotificationEmail] using existing MAIL_* send_email path after missing SMTP_* config | "
+                    "notification_id=%s user_id=%s recipient=%s",
+                    getattr(notification, "id", None),
+                    getattr(user, "id", None),
+                    masked_recipient,
+                )
+                send_email(recipient, subject, html_body, text_body)
+                app.logger.warning(
+                    "[NotificationEmail] email sent successfully via MAIL_* fallback | notification_id=%s user_id=%s recipient=%s",
+                    getattr(notification, "id", None),
+                    getattr(user, "id", None),
+                    masked_recipient,
+                )
+                return True
             return False
 
-        subject = _notification_email_subject(getattr(notification, "title", None))
-        text_body, html_body = _build_notification_email_bodies(notification)
         safe_from_name = re.sub(r"[\r\n<>]+", "", SMTP_FROM_NAME).strip()[:80] or "Sentinel AI"
         safe_from_email = re.sub(r"[\r\n]+", "", SMTP_FROM_EMAIL).strip()
         safe_recipient = re.sub(r"[\r\n]+", "", recipient).strip()
@@ -13676,6 +13871,101 @@ def _build_report_alert_signal_context(report) -> dict:
     }
 
 
+def _send_pcap_admin_alert_email(job_state, report) -> tuple[bool, str]:
+    signal_context = _build_report_alert_signal_context(report)
+    risk_level = _safe_str(signal_context.get("risk_level"), "Normal")
+    normalized_risk = risk_level.lower()
+    high_critical_count = _safe_int(signal_context.get("high_count"), 0) + _safe_int(
+        signal_context.get("critical_count"), 0
+    )
+    if normalized_risk not in {"high", "critical"} and high_critical_count <= 0:
+        return False, "safe_or_not_high_risk"
+
+    alerts = report.get("alerts") if isinstance(report, dict) else []
+    alerts = alerts if isinstance(alerts, list) else []
+    clusters = report.get("clusters") if isinstance(report, dict) else []
+    clusters = clusters if isinstance(clusters, list) else []
+    candidates = [item for item in [*alerts, *clusters] if isinstance(item, dict)]
+    severity_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "normal": 0}
+    candidates.sort(
+        key=lambda item: (
+            severity_rank.get(_safe_str(item.get("severity") or item.get("verdict")).lower(), 0),
+            _safe_float(item.get("confidence") or item.get("max_confidence") or item.get("max_threat_confidence"), 0.0),
+        ),
+        reverse=True,
+    )
+    top = candidates[0] if candidates else {}
+    attack_family = _safe_str(
+        top.get("attack_type")
+        or top.get("label")
+        or top.get("prediction")
+        or top.get("top_pattern")
+        or risk_level
+    )
+    if attack_family.lower() in {"benign", "normal", "safe", "no significant threats"}:
+        return False, "safe_or_not_high_risk"
+
+    severity = _safe_str(top.get("severity") or top.get("verdict") or risk_level).lower()
+    if severity == "danger":
+        severity = "high"
+    if severity not in {"high", "critical"}:
+        severity = "critical" if normalized_risk == "critical" else "high"
+
+    user = None
+    owner_user_id = _safe_int(getattr(job_state, "owner_user_id", None), 0)
+    if owner_user_id > 0:
+        try:
+            user = db.session.get(User, owner_user_id)
+        except Exception:
+            user = None
+    job_id = _safe_str(getattr(job_state, "job_id", None))
+    admin_alert_id = "summary"
+    if job_id:
+        try:
+            persisted_alert = (
+                PcapAlertRecord.query.filter_by(job_id=job_id)
+                .filter(PcapAlertRecord.severity.in_(["high", "critical"]))
+                .order_by(PcapAlertRecord.event_at.desc(), PcapAlertRecord.id.desc())
+                .first()
+            )
+            if persisted_alert is not None:
+                admin_alert_id = str(getattr(persisted_alert, "id", "") or "summary")
+        except Exception:
+            admin_alert_id = "summary"
+    filename = (
+        Path(job_state.upload_path).name
+        if getattr(job_state, "upload_path", None)
+        else _safe_str(getattr(job_state, "upload_name", None), "PCAP capture")
+    )
+    confidence = _safe_float(
+        top.get("confidence") or top.get("max_confidence") or top.get("max_threat_confidence"),
+        0.0,
+    )
+    summary_text = build_analysis_notification_summary(report)
+    return send_admin_alert_email_best_effort(
+        module="PCAP Analyzer",
+        title="Critical Network Threat Detected" if severity == "critical" else "High-Risk Network Threat Detected",
+        message=summary_text,
+        severity=severity,
+        source_id=f"{job_id}:{admin_alert_id}" if job_id else admin_alert_id,
+        affected_user_email=_safe_str(getattr(user, "email", None)) or f"user_id:{owner_user_id}",
+        metadata={
+            "job_id": job_id,
+            "file_name": filename,
+            "attack_family": attack_family,
+            "severity": severity,
+            "confidence": f"{confidence:.2f}",
+            "risk_level": risk_level,
+            "alerts_count": signal_context.get("alerts_count"),
+            "suspicious_count": signal_context.get("suspicious_count"),
+            "malicious_count": signal_context.get("malicious_count"),
+            "risk_summary": summary_text,
+            "recommended_action": "Review the PCAP job, investigate affected hosts, and contain confirmed malicious traffic.",
+        },
+        dedupe_key=f"pcap-admin-email:{job_id}:{admin_alert_id}",
+    )
+
+
 def create_user_notification(
     user_id,
     type,
@@ -13685,6 +13975,7 @@ def create_user_notification(
     severity=NOTIFICATION_SEVERITY_INFO,
     job_id=None,
     metadata=None,
+    send_email_side_effect=True,
 ):
     if not user_id:
         return None
@@ -13739,25 +14030,294 @@ def create_user_notification(
         normalized_type,
         notification_module,
     )
-    try:
-        owner = db.session.get(User, int(user_id))
-        app.logger.warning(
-            "[NotificationEmail] calling send_notification_email_best_effort | notification_id=%s user_id=%s type=%s module=%s",
-            getattr(notification, "id", None),
-            user_id,
-            normalized_type,
-            notification_module,
-        )
-        send_notification_email_best_effort(owner, notification)
-    except Exception as exc:
-        app.logger.warning(
-            "[NotificationEmail] email side effect failed safely | notification_id=%s user_id=%s exception_class=%s safe_message=%s",
-            getattr(notification, "id", None),
-            user_id,
-            exc.__class__.__name__,
-            _friendly_smtp_error(exc),
-        )
+    notification._email_side_effect_sent = False
+    notification._email_side_effect_reason = "email_side_effect_disabled"
+    if send_email_side_effect:
+        try:
+            owner = db.session.get(User, int(user_id))
+            app.logger.warning(
+                "[NotificationEmail] calling send_notification_email_best_effort | notification_id=%s user_id=%s type=%s module=%s",
+                getattr(notification, "id", None),
+                user_id,
+                normalized_type,
+                notification_module,
+            )
+            notification._email_side_effect_sent = bool(send_notification_email_best_effort(owner, notification))
+            notification._email_side_effect_reason = (
+                "sent" if notification._email_side_effect_sent else "send_notification_email_best_effort_returned_false"
+            )
+        except Exception as exc:
+            notification._email_side_effect_reason = "send_notification_email_best_effort_exception"
+            app.logger.warning(
+                "[NotificationEmail] email side effect failed safely | notification_id=%s user_id=%s exception_class=%s safe_message=%s",
+                getattr(notification, "id", None),
+                user_id,
+                exc.__class__.__name__,
+                _friendly_smtp_error(exc),
+            )
     return notification
+
+
+def create_phishing_scan_notification(
+    user_id,
+    *,
+    title,
+    body,
+    severity,
+    job_id=None,
+    metadata=None,
+    send_email_side_effect=False,
+):
+    """Create a Phishing Scanner notification through the standard app email path."""
+    normalized_severity = str(severity or "").strip().lower()
+    if normalized_severity == NOTIFICATION_SEVERITY_CRITICAL:
+        notification_type = NOTIFICATION_TYPE_CRITICAL_DETECTED
+    elif normalized_severity == NOTIFICATION_SEVERITY_WARNING:
+        notification_type = NOTIFICATION_TYPE_SUSPICIOUS_DETECTED
+    else:
+        notification_type = NOTIFICATION_TYPE_JOB_COMPLETED
+    return create_user_notification(
+        user_id,
+        notification_type,
+        title,
+        body,
+        severity=severity,
+        job_id=job_id,
+        metadata=metadata,
+        send_email_side_effect=send_email_side_effect,
+    )
+
+
+def _phishing_email_probability_text(value) -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "Unavailable"
+    if numeric <= 1:
+        numeric *= 100
+    return f"{max(0.0, min(100.0, numeric)):.2f}%"
+
+
+def _phishing_email_required(final_category, final_risk_score) -> bool:
+    normalized_category = _safe_str(final_category).strip().lower()
+    score = _safe_int(final_risk_score, 0)
+    return normalized_category in {"suspicious", "dangerous"} or score >= 50
+
+
+def _phishing_email_recommended_action(final_category) -> str:
+    normalized_category = _safe_str(final_category).strip().lower()
+    if normalized_category == "dangerous":
+        return "Do not open the URL. Report it to admin."
+    return "Review carefully before visiting."
+
+
+def _build_phishing_scan_email_payload(
+    *,
+    url,
+    domain,
+    final_category,
+    final_risk_score,
+    ml_probability=None,
+    virustotal_reputation=None,
+    virustotal_malicious=0,
+    virustotal_suspicious=0,
+) -> tuple[str, str, str]:
+    category = _safe_str(final_category).strip().lower() or "unknown"
+    score = max(0, min(100, _safe_int(final_risk_score, 0)))
+    safe_url = _safe_str(url) or "Unavailable"
+    safe_domain = _safe_str(domain) or "Unavailable"
+    vt_status = _safe_str(virustotal_reputation) or "Unavailable"
+    malicious = _safe_int(virustotal_malicious, 0)
+    suspicious = _safe_int(virustotal_suspicious, 0)
+    ml_text = _phishing_email_probability_text(ml_probability)
+    action = _phishing_email_recommended_action(category)
+    subject = f"[Sentinel AI] Phishing scan alert: {category}"
+
+    text_body = (
+        "Sentinel AI detected a risky Phishing Scanner result.\n\n"
+        "Module: Phishing Scanner\n"
+        f"Scanned URL: {safe_url}\n"
+        f"Domain: {safe_domain}\n"
+        f"Final Risk Category: {category}\n"
+        f"Final Risk Score: {score}/100\n"
+        f"ML Probability: {ml_text}\n"
+        f"VirusTotal status/reputation: {vt_status}\n"
+        f"Malicious detections: {malicious}\n"
+        f"Suspicious detections: {suspicious}\n"
+        f"Recommended action: {action}\n\n"
+        "Open Sentinel AI to review the scan details."
+    )
+
+    rows = [
+        ("Module", "Phishing Scanner"),
+        ("Scanned URL", safe_url),
+        ("Domain", safe_domain),
+        ("Final Risk Category", category),
+        ("Final Risk Score", f"{score}/100"),
+        ("ML Probability", ml_text),
+        ("VirusTotal status/reputation", vt_status),
+        ("Malicious detections", str(malicious)),
+        ("Suspicious detections", str(suspicious)),
+        ("Recommended action", action),
+    ]
+    rows_html = "".join(
+        "<tr>"
+        f"<td style=\"padding:10px 12px;color:#94a3b8;border-bottom:1px solid rgba(148,163,184,0.14);\">{escape(label)}</td>"
+        f"<td style=\"padding:10px 12px;color:#e2e8f0;border-bottom:1px solid rgba(148,163,184,0.14);word-break:break-word;\">{escape(value)}</td>"
+        "</tr>"
+        for label, value in rows
+    )
+    html_body = f"""
+    <div style="margin:0;padding:24px;background:#020817;font-family:Arial,sans-serif;color:#e2e8f0;">
+      <div style="max-width:720px;margin:0 auto;background:#0f172a;border:1px solid rgba(148,163,184,0.16);border-radius:18px;overflow:hidden;">
+        <div style="padding:24px 28px;background:#7f1d1d;">
+          <div style="font-size:13px;letter-spacing:0.16em;text-transform:uppercase;color:#fecaca;">Sentinel AI</div>
+          <div style="margin-top:8px;font-size:24px;font-weight:700;color:#ffffff;">Phishing Scanner Alert</div>
+        </div>
+        <div style="padding:24px 28px;">
+          <p style="margin:0 0 18px;color:#cbd5e1;font-size:15px;line-height:1.6;">
+            A risky URL scan was completed. Review the details below before interacting with the link.
+          </p>
+          <table style="width:100%;border-collapse:collapse;background:#111c2f;border:1px solid rgba(148,163,184,0.14);border-radius:12px;overflow:hidden;">
+            {rows_html}
+          </table>
+          <p style="margin:22px 0 0;color:#94a3b8;font-size:12px;line-height:1.6;">
+            This automated email contains safe scan metadata only. It does not include API keys, SMTP credentials, or raw secrets.
+          </p>
+        </div>
+      </div>
+    </div>
+    """.strip()
+
+    return subject, html_body, text_body
+
+
+def send_phishing_scan_email_alert(
+    user,
+    *,
+    url,
+    domain,
+    final_category,
+    final_risk_score,
+    ml_probability=None,
+    virustotal_reputation=None,
+    virustotal_malicious=0,
+    virustotal_suspicious=0,
+) -> tuple[bool, str]:
+    trigger_passed = _phishing_email_required(final_category, final_risk_score)
+    user_id_exists = bool(getattr(user, "id", None))
+    recipient = _safe_str(getattr(user, "email", None)).strip() if user else ""
+    recipient_exists = bool(recipient)
+    log_context = (
+        "[phishing-email] trigger_passed=%s final_category=%s final_risk_score=%s "
+        "user_id_exists=%s recipient_exists=%s helper_called=%s sent=%s reason=%s"
+    )
+
+    if not trigger_passed:
+        logging.info(
+            log_context,
+            False,
+            _safe_str(final_category) or "unknown",
+            _safe_int(final_risk_score, 0),
+            user_id_exists,
+            recipient_exists,
+            False,
+            False,
+            "safe_scan_no_email",
+        )
+        return False, "safe_scan_no_email"
+    if not user_id_exists:
+        logging.info(
+            log_context,
+            True,
+            _safe_str(final_category) or "unknown",
+            _safe_int(final_risk_score, 0),
+            False,
+            recipient_exists,
+            False,
+            False,
+            "user_id_missing",
+        )
+        return False, "user_id_missing"
+    if not recipient_exists:
+        logging.info(
+            log_context,
+            True,
+            _safe_str(final_category) or "unknown",
+            _safe_int(final_risk_score, 0),
+            True,
+            False,
+            False,
+            False,
+            "recipient_missing",
+        )
+        return False, "recipient_missing"
+    if not _is_email_notification_enabled_for_user(user):
+        logging.info(
+            log_context,
+            True,
+            _safe_str(final_category) or "unknown",
+            _safe_int(final_risk_score, 0),
+            True,
+            True,
+            False,
+            False,
+            "user_email_notifications_disabled",
+        )
+        return False, "user_email_notifications_disabled"
+    if not _mail_is_configured():
+        logging.info(
+            log_context,
+            True,
+            _safe_str(final_category) or "unknown",
+            _safe_int(final_risk_score, 0),
+            True,
+            True,
+            False,
+            False,
+            "mail_not_configured",
+        )
+        return False, "mail_not_configured"
+
+    subject, html_body, text_body = _build_phishing_scan_email_payload(
+        url=url,
+        domain=domain,
+        final_category=final_category,
+        final_risk_score=final_risk_score,
+        ml_probability=ml_probability,
+        virustotal_reputation=virustotal_reputation,
+        virustotal_malicious=virustotal_malicious,
+        virustotal_suspicious=virustotal_suspicious,
+    )
+    try:
+        send_email(recipient, subject, html_body, text_body)
+    except Exception as exc:
+        reason = _friendly_smtp_error(exc)
+        logging.warning(
+            log_context,
+            True,
+            _safe_str(final_category) or "unknown",
+            _safe_int(final_risk_score, 0),
+            True,
+            True,
+            True,
+            False,
+            reason,
+        )
+        return False, reason
+
+    logging.info(
+        log_context,
+        True,
+        _safe_str(final_category) or "unknown",
+        _safe_int(final_risk_score, 0),
+        True,
+        True,
+        True,
+        True,
+        "sent",
+    )
+    return True, "sent"
 
 
 def _password_notification_now() -> datetime:
@@ -13846,17 +14406,28 @@ def _should_send_password_email_alert(user_id: int, event_type: str) -> bool:
         return True
 
 
-def _send_password_security_email(user, event_type: str, title: str, body: str) -> bool:
-    if EMAIL_NOTIFICATIONS_ENABLED:
+def _send_password_security_email(user, event_type: str, title: str, body: str, *, force: bool = False) -> bool:
+    if EMAIL_NOTIFICATIONS_ENABLED and not force:
+        logging.info("[password-email] sent=false reason=generic_notification_email_enabled")
         return False
     if not PASSWORD_EMAIL_ALERTS_ENABLED:
+        logging.info("[password-email] sent=false reason=password_email_alerts_disabled")
         return False
     if not _is_email_notification_enabled_for_user(user):
+        logging.info(
+            "[password-email] sent=false reason=user_email_notifications_disabled user_id_exists=%s",
+            bool(getattr(user, "id", None)),
+        )
         return False
     recipient = _safe_str(getattr(user, "email", None)).lower()
     if not recipient:
+        logging.info(
+            "[password-email] sent=false reason=recipient_missing user_id_exists=%s",
+            bool(getattr(user, "id", None)),
+        )
         return False
     if not _should_send_password_email_alert(int(user.id), event_type):
+        logging.info("[password-email] sent=false reason=cooldown user_id_exists=true recipient_exists=true")
         return False
 
     detected_at = _password_notification_now().strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -13881,7 +14452,13 @@ def _send_password_security_email(user, event_type: str, title: str, body: str) 
       </p>
     </div>
     """
-    return _send_email_message(recipient, subject, text_body, html_body)
+    sent = _send_email_message(recipient, subject, text_body, html_body)
+    logging.info(
+        "[password-email] trigger_passed=true user_id_exists=true recipient_exists=true helper_called=true sent=%s reason=%s",
+        bool(sent),
+        "sent" if sent else "send_email_message_returned_false",
+    )
+    return sent
 
 
 def _create_password_security_notification(
@@ -13923,6 +14500,11 @@ def _create_password_security_notification(
     if isinstance(extra_metadata, dict):
         metadata.update(extra_metadata)
 
+    email_required = event_type in {
+        "breached_password_detected",
+        "very_weak_password_score",
+        "repeated_risky_password_behavior",
+    }
     notification = create_user_notification(
         user_id,
         NOTIFICATION_TYPE_PASSWORD_SECURITY,
@@ -13930,6 +14512,28 @@ def _create_password_security_notification(
         body,
         severity=notification_severity,
         metadata=metadata,
+        send_email_side_effect=email_required,
+    )
+    generic_email_sent = bool(getattr(notification, "_email_side_effect_sent", False)) if notification else False
+    if notification and email_required and not generic_email_sent:
+        fallback_sent = _send_password_security_email(user, event_type, title, body, force=True)
+        notification._email_side_effect_sent = bool(fallback_sent)
+        notification._email_side_effect_reason = (
+            "sent_via_password_fallback"
+            if fallback_sent
+            else "password_fallback_returned_false"
+        )
+    elif notification and not email_required:
+        notification._email_side_effect_sent = False
+        notification._email_side_effect_reason = "safe_password_no_email"
+    logging.info(
+        "[password-email] trigger_passed=%s user_id_exists=%s recipient_exists=%s helper_called=%s sent=%s reason=%s",
+        bool(email_required),
+        bool(user_id),
+        bool(_safe_str(getattr(user, "email", None))),
+        bool(notification),
+        bool(getattr(notification, "_email_side_effect_sent", False)) if notification else False,
+        getattr(notification, "_email_side_effect_reason", "notification_not_created") if notification else "notification_not_created",
     )
 
     return notification
@@ -14137,11 +14741,293 @@ def create_password_checker_security_alert(user, record) -> Optional[PcapAlertRe
         )
         db.session.add(alert_record)
         db.session.commit()
+        vt_malicious = _safe_int(virustotal_malicious, 0)
+        vt_suspicious = _safe_int(virustotal_suspicious, 0)
+        admin_trigger = category == "dangerous" or risk_score >= 70 or vt_malicious > 0
+        if admin_trigger:
+            admin_sent, admin_reason = send_admin_alert_email_best_effort(
+                module="Phishing Scanner",
+                title="Dangerous Phishing Risk Detected",
+                message=_phishing_alert_message(category, risk_score),
+                severity="critical" if category == "dangerous" or vt_malicious > 0 else "high",
+                source_id=str(normalized_scan_id),
+                affected_user_email=_safe_str(getattr(user, "email", None)) or f"user_id:{user_id}",
+                metadata={
+                    "url": normalized_url,
+                    "domain": domain_value,
+                    "final_category": category,
+                    "final_risk_score": risk_score,
+                    "ml_probability": ml_probability,
+                    "virustotal_status": (
+                        "malicious" if vt_malicious > 0 else "suspicious" if vt_suspicious > 0 else "clean_or_unavailable"
+                    ),
+                    "virustotal_malicious": vt_malicious,
+                    "virustotal_suspicious": vt_suspicious,
+                    "recommended_action": "Block or avoid the URL and review related user activity.",
+                },
+                dedupe_key=f"phishing-admin-email:{user_id}:{normalized_scan_id}",
+            )
+            setattr(alert_record, "_admin_email_alert_sent", bool(admin_sent))
+            setattr(alert_record, "_admin_email_alert_reason", admin_reason)
+        else:
+            setattr(alert_record, "_admin_email_alert_sent", False)
+            setattr(alert_record, "_admin_email_alert_reason", "safe_or_not_high_risk")
         return alert_record
     except Exception:
         db.session.rollback()
         logging.exception("Failed to create password checker security alert")
         return None
+
+
+def _normalize_phishing_alert_category(category, risk_score) -> str:
+    normalized = _safe_str(category).strip().lower()
+    if normalized in {"safe", "suspicious", "dangerous"}:
+        return normalized
+    if normalized in {"phishing", "malicious"}:
+        return "dangerous"
+
+    score = _safe_int(risk_score, 0)
+    if score >= 70:
+        return "dangerous"
+    if score >= 40:
+        return "suspicious"
+    return "safe"
+
+
+def _phishing_alert_severity(category: str, risk_score) -> str:
+    normalized = _normalize_phishing_alert_category(category, risk_score)
+    if normalized == "dangerous":
+        return "critical"
+    if normalized == "suspicious":
+        return "medium"
+    return "low"
+
+
+def _phishing_alert_title(category: str, risk_score) -> str:
+    normalized = _normalize_phishing_alert_category(category, risk_score)
+    if normalized == "dangerous":
+        return "Dangerous Phishing Risk Detected"
+    if normalized == "suspicious":
+        return "Suspicious URL Detected"
+    return "URL Scan Completed"
+
+
+def _phishing_alert_message(category: str, risk_score) -> str:
+    normalized = _normalize_phishing_alert_category(category, risk_score)
+    if normalized == "dangerous":
+        return "Dangerous phishing risk detected. Do not open this URL."
+    if normalized == "suspicious":
+        return "The scanned URL looks suspicious. Review before opening."
+    return "The scanned URL appears safe."
+
+
+def _phishing_domain_from_url(url: str) -> str:
+    try:
+        return _safe_str(urlparse(url).netloc).lower()
+    except Exception:
+        return ""
+
+
+def create_phishing_scanner_security_alert(
+    user,
+    *,
+    scan_id,
+    url,
+    domain=None,
+    final_category=None,
+    final_risk_score=None,
+    ml_probability=None,
+    virustotal_malicious=0,
+    virustotal_suspicious=0,
+    event_at=None,
+    metadata=None,
+) -> Optional[PcapAlertRecord]:
+    """Best-effort Recent Security Alerts entry for a completed phishing scan."""
+    if not user:
+        return None
+
+    try:
+        user_id = int(getattr(user, "id", 0) or 0)
+        normalized_scan_id = int(scan_id)
+    except (TypeError, ValueError):
+        return None
+
+    normalized_url = _safe_str(url)
+    if user_id <= 0 or normalized_scan_id <= 0 or not normalized_url:
+        return None
+
+    category = _normalize_phishing_alert_category(final_category, final_risk_score)
+    risk_score = max(0, min(100, _safe_int(final_risk_score, 0)))
+    domain_value = _safe_str(domain) or _phishing_domain_from_url(normalized_url)
+
+    try:
+        _ensure_pcap_alert_schema_initialized()
+
+        alert_key = f"phishing-scanner:{user_id}:{normalized_scan_id}"
+        existing = PcapAlertRecord.query.filter_by(
+            user_id=user_id,
+            alert_key=alert_key,
+        ).first()
+        if existing:
+            return existing
+
+        owner_scope = _build_authenticated_user_scope(user)
+        if not owner_scope:
+            return None
+
+        event_at_utc = _coerce_utc_datetime(event_at)
+        if event_at_utc is None and isinstance(event_at, datetime):
+            event_at_utc = _as_utc_datetime(event_at)
+        event_at_utc = event_at_utc or datetime.now(UTC)
+        normalized_metadata = metadata.copy() if isinstance(metadata, dict) else {}
+        normalized_metadata.update(
+            {
+                "owner_scope": owner_scope,
+                "source": "phishing_scanner",
+                "source_module": "phishing_scanner",
+                "display_module": "Phishing Scanner",
+                "module": "Phishing Scanner",
+                "module_key": "phishing",
+                "source_id": normalized_scan_id,
+                "scan_id": normalized_scan_id,
+                "url": normalized_url,
+                "domain": domain_value,
+                "final_category": category,
+                "final_risk_score": risk_score,
+                "ml_probability": ml_probability,
+                "virustotal_malicious": _safe_int(virustotal_malicious, 0),
+                "virustotal_suspicious": _safe_int(virustotal_suspicious, 0),
+            }
+        )
+
+        alert_record = PcapAlertRecord(
+            user_id=user_id,
+            job_id=f"phishing-scan-{normalized_scan_id}",
+            alert_key=alert_key,
+            source_type="phishing_scanner",
+            type="pcap_alert",
+            title=_phishing_alert_title(category, risk_score),
+            message=_phishing_alert_message(category, risk_score),
+            severity=_phishing_alert_severity(category, risk_score),
+            status="new",
+            risk_label="phishing",
+            threats_count=1 if category != "safe" else 0,
+            flows_analyzed=0,
+            top_pattern="Phishing Scanner",
+            filename=None,
+            attack_type="Link Review",
+            protocol="URL",
+            src_ip=domain_value or None,
+            dst_ip=None,
+            event_at=event_at_utc,
+            metadata_json=json.dumps(_sanitize_for_json(normalized_metadata)),
+        )
+        db.session.add(alert_record)
+        db.session.commit()
+        if severity in {"Critical", "High"}:
+            admin_sent, admin_reason = send_admin_alert_email_best_effort(
+                module="Password Checker",
+                title=title,
+                message=message,
+                severity=severity.lower(),
+                source_id=str(password_check_id),
+                affected_user_email=_safe_str(getattr(user, "email", None)) or f"user_id:{user_id}",
+                metadata={
+                    "event_type": "breached_password_detected" if breached else "very_weak_password_detected",
+                    "risk_reason": "breached_password" if breached else "very_weak_password",
+                    "strength_label": strength_label or "Unavailable",
+                    "breach_count": breach_count,
+                    "recommendation": "Change the password immediately and avoid reuse.",
+                },
+                dedupe_key=f"password-admin-email:{user_id}:{password_check_id}",
+            )
+            setattr(alert_record, "_admin_email_alert_sent", bool(admin_sent))
+            setattr(alert_record, "_admin_email_alert_reason", admin_reason)
+        return alert_record
+    except Exception:
+        db.session.rollback()
+        logging.exception("Failed to create phishing scanner security alert")
+        return None
+
+
+def _phishing_scans_db_path() -> Path:
+    return BASE_DIR / "data" / "scans.db"
+
+
+def _backfill_phishing_alert_records_for_user(user, *, limit_scans: int = 24) -> int:
+    user_id = _safe_int(getattr(user, "id", None), 0)
+    db_path = _phishing_scans_db_path()
+    if user_id <= 0 or not db_path.exists():
+        return 0
+
+    created_count = 0
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(scans)").fetchall()
+            }
+            if not {"id", "user_id", "url"}.issubset(columns):
+                return 0
+
+            select_columns = [
+                "id",
+                "user_id",
+                "url",
+                "risk" if "risk" in columns else "NULL AS risk",
+                "risk_score" if "risk_score" in columns else "NULL AS risk_score",
+                "result" if "result" in columns else "NULL AS result",
+                "category" if "category" in columns else "NULL AS category",
+                "final_category" if "final_category" in columns else "NULL AS final_category",
+                "final_risk_score" if "final_risk_score" in columns else "NULL AS final_risk_score",
+                "domain" if "domain" in columns else "NULL AS domain",
+                "timestamp" if "timestamp" in columns else "NULL AS timestamp",
+                "created_at" if "created_at" in columns else "NULL AS created_at",
+                "ml_probability" if "ml_probability" in columns else "NULL AS ml_probability",
+                "virustotal_malicious" if "virustotal_malicious" in columns else "NULL AS virustotal_malicious",
+                "virustotal_suspicious" if "virustotal_suspicious" in columns else "NULL AS virustotal_suspicious",
+            ]
+            rows = conn.execute(
+                f"""
+                SELECT {", ".join(select_columns)}
+                FROM scans
+                WHERE user_id = ?
+                ORDER BY COALESCE(timestamp, created_at) DESC, id DESC
+                LIMIT ?
+                """,
+                (user_id, max(1, int(limit_scans))),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        for row in rows:
+            final_score = row["final_risk_score"] if row["final_risk_score"] is not None else row["risk_score"]
+            if final_score is None:
+                final_score = row["risk"]
+            final_category = row["final_category"] or row["category"] or row["result"]
+            before_id = PcapAlertRecord.query.filter_by(
+                user_id=user_id,
+                alert_key=f"phishing-scanner:{user_id}:{row['id']}",
+            ).first()
+            alert = create_phishing_scanner_security_alert(
+                user,
+                scan_id=row["id"],
+                url=row["url"],
+                domain=row["domain"],
+                final_category=final_category,
+                final_risk_score=final_score,
+                ml_probability=row["ml_probability"],
+                virustotal_malicious=row["virustotal_malicious"],
+                virustotal_suspicious=row["virustotal_suspicious"],
+                event_at=row["timestamp"] or row["created_at"],
+            )
+            if alert and before_id is None:
+                created_count += 1
+    except Exception:
+        logging.exception("Failed to backfill phishing scanner security alerts")
+    return created_count
 
 
 def create_security_audit_log(user_id, action, details=None):
@@ -14237,47 +15123,58 @@ def _create_job_started_notification(job_state):
         severity=NOTIFICATION_SEVERITY_INFO,
         job_id=getattr(job_state, "job_id", None),
         metadata=_build_job_notification_metadata(job_state),
+        send_email_side_effect=False,
     )
 
 
 def _create_job_completed_notifications(job_state, report):
     if not getattr(job_state, "owner_user_id", None):
-        return
+        logging.info("[pcap-email] trigger_passed=false reason=owner_user_id_missing")
+        return []
 
+    notifications = []
     summary_text = build_analysis_notification_summary(report)
     signal_context = _build_report_alert_signal_context(report)
     metadata = _build_job_notification_metadata(job_state, report, extra=signal_context)
     job_id = getattr(job_state, "job_id", None)
 
-    create_user_notification(
-        job_state.owner_user_id,
-        NOTIFICATION_TYPE_JOB_COMPLETED,
-        "PCAP analysis completed",
-        summary_text,
-        severity=NOTIFICATION_SEVERITY_SUCCESS,
-        job_id=job_id,
-        metadata=metadata,
+    notifications.append(
+        create_user_notification(
+            job_state.owner_user_id,
+            NOTIFICATION_TYPE_JOB_COMPLETED,
+            "PCAP analysis completed",
+            summary_text,
+            severity=NOTIFICATION_SEVERITY_SUCCESS,
+            job_id=job_id,
+            metadata=metadata,
+        )
     )
 
-    create_user_notification(
-        job_state.owner_user_id,
-        NOTIFICATION_TYPE_REPORT_READY,
-        "PCAP report ready",
-        "Report JSON is ready for export.",
-        severity=NOTIFICATION_SEVERITY_SUCCESS,
-        job_id=job_id,
-        metadata={**metadata, "artifact_type": "report"},
+    notifications.append(
+        create_user_notification(
+            job_state.owner_user_id,
+            NOTIFICATION_TYPE_REPORT_READY,
+            "PCAP report ready",
+            "Report JSON is ready for export.",
+            severity=NOTIFICATION_SEVERITY_SUCCESS,
+            job_id=job_id,
+            metadata={**metadata, "artifact_type": "report"},
+            send_email_side_effect=False,
+        )
     )
 
     if bool(getattr(job_state, "evidence_dir", None)):
-        create_user_notification(
-            job_state.owner_user_id,
-            NOTIFICATION_TYPE_EVIDENCE_READY,
-            "PCAP evidence ready",
-            "Zeek evidence bundle is ready for export.",
-            severity=NOTIFICATION_SEVERITY_INFO,
-            job_id=job_id,
-            metadata={**metadata, "artifact_type": "evidence"},
+        notifications.append(
+            create_user_notification(
+                job_state.owner_user_id,
+                NOTIFICATION_TYPE_EVIDENCE_READY,
+                "PCAP evidence ready",
+                "Zeek evidence bundle is ready for export.",
+                severity=NOTIFICATION_SEVERITY_INFO,
+                job_id=job_id,
+                metadata={**metadata, "artifact_type": "evidence"},
+                send_email_side_effect=False,
+            )
         )
 
     critical_detected = _safe_int(signal_context.get("critical_count"), 0) > 0 or (
@@ -14290,14 +15187,17 @@ def _create_job_completed_notifications(job_state, report):
     )
 
     if critical_detected:
-        create_user_notification(
-            job_state.owner_user_id,
-            NOTIFICATION_TYPE_CRITICAL_DETECTED,
-            "Critical threat activity detected",
-            summary_text,
-            severity=NOTIFICATION_SEVERITY_CRITICAL,
-            job_id=job_id,
-            metadata=metadata,
+        notifications.append(
+            create_user_notification(
+                job_state.owner_user_id,
+                NOTIFICATION_TYPE_CRITICAL_DETECTED,
+                "Critical threat activity detected",
+                summary_text,
+                severity=NOTIFICATION_SEVERITY_CRITICAL,
+                job_id=job_id,
+                metadata=metadata,
+                send_email_side_effect=False,
+            )
         )
         user = User.query.get(int(job_state.owner_user_id))
         _send_security_event_telegram_notification(
@@ -14312,14 +15212,17 @@ def _create_job_completed_notifications(job_state, report):
             ],
         )
     elif suspicious_detected:
-        create_user_notification(
-            job_state.owner_user_id,
-            NOTIFICATION_TYPE_SUSPICIOUS_DETECTED,
-            "Suspicious network activity detected",
-            summary_text,
-            severity=NOTIFICATION_SEVERITY_WARNING,
-            job_id=job_id,
-            metadata=metadata,
+        notifications.append(
+            create_user_notification(
+                job_state.owner_user_id,
+                NOTIFICATION_TYPE_SUSPICIOUS_DETECTED,
+                "Suspicious network activity detected",
+                summary_text,
+                severity=NOTIFICATION_SEVERITY_WARNING,
+                job_id=job_id,
+                metadata=metadata,
+                send_email_side_effect=False,
+            )
         )
         high_detected = (
             _safe_int(signal_context.get("high_count"), 0) > 0
@@ -14338,6 +15241,7 @@ def _create_job_completed_notifications(job_state, report):
                     f"Risk level: {str(signal_context.get('risk_level') or 'High')}",
                 ],
             )
+    return [notification for notification in notifications if notification]
 
 
 def _create_job_failed_notification(job_state, error_text):
@@ -14440,13 +15344,28 @@ def _notify_job_success(job_state, report):
                 "Failed to persist PCAP alert records for job %s", job_state.job_id
             )
         try:
-            _create_job_completed_notifications(job_state, report)
+            _send_pcap_admin_alert_email(job_state, report)
+        except Exception:
+            logging.exception(
+                "Failed to process PCAP admin alert email for job %s", job_state.job_id
+            )
+        completion_notifications = []
+        try:
+            completion_notifications = _create_job_completed_notifications(job_state, report) or []
         except Exception:
             logging.exception(
                 "Failed to create completion notifications for job %s", job_state.job_id
             )
         try:
-            _send_pcap_completion_email(job_state, report)
+            generic_email_sent = any(
+                bool(getattr(notification, "_email_side_effect_sent", False))
+                for notification in completion_notifications
+            )
+            _send_pcap_completion_email(
+                job_state,
+                report,
+                generic_email_sent=generic_email_sent,
+            )
         except Exception:
             logging.exception(
                 "Failed to send PCAP completion email for job %s", job_state.job_id
@@ -14734,6 +15653,226 @@ def _mask_channel_value(value: str | None, *, visible_prefix: int = 3, visible_s
 def _mail_is_configured() -> bool:
     required = ("MAIL_SERVER", "MAIL_USERNAME", "MAIL_PASSWORD")
     return all(str(app.config.get(key) or "").strip() for key in required)
+
+
+_ADMIN_ALERT_SENSITIVE_KEY_RE = re.compile(
+    r"(password|passwd|pwd|secret|token|api[_-]?key|cookie|credential|smtp|mail_password|"
+    r"virustotal_api|vault_content|encrypted_content|file_content|raw_content|hash)",
+    flags=re.IGNORECASE,
+)
+
+
+def _admin_alert_safe_text(value: object, fallback: str = "") -> str:
+    text_value = re.sub(r"\s+", " ", _safe_str(value, fallback)).strip()
+    if not text_value:
+        return fallback
+    sensitive_patterns = [
+        r"\bpassword\s*[:=]\s*\S+",
+        r"\btoken\s*[:=]\s*\S+",
+        r"\bapi[_ -]?key\s*[:=]\s*\S+",
+        r"\bsecret\s*[:=]\s*\S+",
+        r"\bcookie\s*[:=]\s*\S+",
+    ]
+    if any(re.search(pattern, text_value, flags=re.IGNORECASE) for pattern in sensitive_patterns):
+        return "[redacted-sensitive-value]"
+    return text_value[:1000]
+
+
+def _admin_alert_safe_metadata(metadata: dict | None) -> dict[str, str]:
+    if not isinstance(metadata, dict):
+        return {}
+
+    safe: dict[str, str] = {}
+    for key, value in metadata.items():
+        safe_key = re.sub(r"[^a-zA-Z0-9_. -]+", "", _safe_str(key)).strip()[:80]
+        if not safe_key or _ADMIN_ALERT_SENSITIVE_KEY_RE.search(safe_key):
+            continue
+        if isinstance(value, (dict, list, tuple, set)):
+            safe_value = json.dumps(_sanitize_for_json(value), sort_keys=True)[:1000]
+        else:
+            safe_value = _admin_alert_safe_text(value)
+        if safe_value:
+            safe[safe_key] = safe_value[:1000]
+    return safe
+
+
+def _build_admin_alert_email_payload(
+    *,
+    module: str,
+    title: str,
+    message: str,
+    severity: str,
+    source_id: str | None = None,
+    affected_user_email: str | None = None,
+    metadata: dict | None = None,
+) -> tuple[str, str, str]:
+    safe_module = _admin_alert_safe_text(module, "Security")
+    safe_title = _admin_alert_safe_text(title, "Security Event")
+    safe_message = _admin_alert_safe_text(message, "A high-risk security event was detected.")
+    safe_severity = _admin_alert_safe_text(severity, "high").lower()
+    safe_source_id = _admin_alert_safe_text(source_id, "")
+    safe_user = _admin_alert_safe_text(affected_user_email, "")
+    safe_metadata = _admin_alert_safe_metadata(metadata)
+
+    subject_title = re.sub(r"\s+", " ", safe_title).strip()[:140] or "Security Event"
+    subject = f"[Sentinel AI Admin Alert] {subject_title}"
+
+    details_lines = [f"{key}: {value}" for key, value in safe_metadata.items()]
+    text_body = "\n".join(
+        line
+        for line in [
+            "Admin Security Alert",
+            "",
+            f"Module: {safe_module}",
+            f"Severity: {safe_severity}",
+            f"Affected User: {safe_user or 'Unavailable'}",
+            f"Source ID: {safe_source_id}" if safe_source_id else "",
+            f"Event: {safe_title}",
+            f"Summary: {safe_message}",
+            "",
+            "Key Details:",
+            *(details_lines or ["No additional safe metadata provided."]),
+            "",
+            "Recommended Action:",
+            "Review this event in Sentinel AI Admin Dashboard / Threat Management and take the required action.",
+            "",
+            "This is an automated Sentinel AI admin security alert.",
+        ]
+        if line != ""
+    )
+
+    details_rows = "".join(
+        "<tr>"
+        f"<td style=\"padding:9px 12px;color:#94a3b8;border-bottom:1px solid rgba(148,163,184,0.14);width:34%;\">{escape(key)}</td>"
+        f"<td style=\"padding:9px 12px;color:#e2e8f0;border-bottom:1px solid rgba(148,163,184,0.14);word-break:break-word;\">{escape(value)}</td>"
+        "</tr>"
+        for key, value in safe_metadata.items()
+    ) or (
+        '<tr><td colspan="2" style="padding:12px;color:#94a3b8;">'
+        "No additional safe metadata provided.</td></tr>"
+    )
+    source_row = (
+        f'<tr><td style="padding:9px 12px;color:#94a3b8;border-bottom:1px solid rgba(148,163,184,0.14);">Source ID</td>'
+        f'<td style="padding:9px 12px;color:#e2e8f0;border-bottom:1px solid rgba(148,163,184,0.14);word-break:break-word;">{escape(safe_source_id)}</td></tr>'
+        if safe_source_id
+        else ""
+    )
+    html_body = f"""
+    <div style="margin:0;padding:24px;background:#020817;font-family:Arial,sans-serif;color:#e2e8f0;">
+      <div style="max-width:720px;margin:0 auto;background:#0f172a;border:1px solid rgba(248,113,113,0.28);border-radius:16px;overflow:hidden;">
+        <div style="padding:24px 28px;background:#7f1d1d;">
+          <div style="font-size:13px;letter-spacing:0.16em;text-transform:uppercase;color:#fecaca;">Sentinel AI Admin Alert</div>
+          <div style="margin-top:8px;font-size:24px;font-weight:700;color:#ffffff;">{escape(safe_title)}</div>
+        </div>
+        <div style="padding:24px 28px;">
+          <h2 style="margin:0 0 14px;color:#f8fafc;font-size:18px;">Admin Security Alert</h2>
+          <table style="width:100%;border-collapse:collapse;background:#111c2f;border:1px solid rgba(148,163,184,0.14);border-radius:12px;overflow:hidden;">
+            <tr><td style="padding:9px 12px;color:#94a3b8;border-bottom:1px solid rgba(148,163,184,0.14);">Module</td><td style="padding:9px 12px;color:#e2e8f0;border-bottom:1px solid rgba(148,163,184,0.14);">{escape(safe_module)}</td></tr>
+            <tr><td style="padding:9px 12px;color:#94a3b8;border-bottom:1px solid rgba(148,163,184,0.14);">Severity</td><td style="padding:9px 12px;color:#fecaca;border-bottom:1px solid rgba(148,163,184,0.14);font-weight:700;">{escape(safe_severity)}</td></tr>
+            <tr><td style="padding:9px 12px;color:#94a3b8;border-bottom:1px solid rgba(148,163,184,0.14);">Affected User</td><td style="padding:9px 12px;color:#e2e8f0;border-bottom:1px solid rgba(148,163,184,0.14);word-break:break-word;">{escape(safe_user or "Unavailable")}</td></tr>
+            {source_row}
+            <tr><td style="padding:9px 12px;color:#94a3b8;">Summary</td><td style="padding:9px 12px;color:#e2e8f0;line-height:1.55;">{escape(safe_message)}</td></tr>
+          </table>
+          <h3 style="margin:22px 0 10px;color:#f8fafc;font-size:16px;">Key Details</h3>
+          <table style="width:100%;border-collapse:collapse;background:#08111f;border:1px solid rgba(148,163,184,0.14);border-radius:12px;overflow:hidden;">
+            {details_rows}
+          </table>
+          <div style="margin-top:22px;padding:16px;border-radius:12px;background:#082f49;border:1px solid rgba(56,189,248,0.22);color:#e0f2fe;line-height:1.6;">
+            <strong>Recommended Action:</strong> Review this event in Sentinel AI Admin Dashboard / Threat Management and take the required action.
+          </div>
+          <div style="margin-top:20px;color:#94a3b8;font-size:12px;line-height:1.6;">
+            This is an automated Sentinel AI admin security alert.
+          </div>
+        </div>
+      </div>
+    </div>
+    """.strip()
+    return subject, html_body, text_body
+
+
+def _admin_alert_claim_dedupe_key(dedupe_key: str | None) -> bool:
+    key = _admin_alert_safe_text(dedupe_key, "")
+    if not key:
+        return True
+    with _admin_alert_email_lock:
+        if key in _admin_alert_email_dedupe_keys:
+            return False
+        _admin_alert_email_dedupe_keys.add(key)
+        if len(_admin_alert_email_dedupe_keys) > 4096:
+            _admin_alert_email_dedupe_keys.clear()
+            _admin_alert_email_dedupe_keys.add(key)
+        return True
+
+
+def send_admin_alert_email_best_effort(
+    *,
+    module: str,
+    title: str,
+    message: str,
+    severity: str,
+    source_id: str | None = None,
+    affected_user_email: str | None = None,
+    metadata: dict | None = None,
+    dedupe_key: str | None = None,
+) -> tuple[bool, str]:
+    safe_module = _admin_alert_safe_text(module, "unknown")
+    safe_severity = _admin_alert_safe_text(severity, "unknown").lower()
+    recipient = _safe_str(ADMIN_ALERT_EMAIL_TO).strip()
+    trigger_passed = safe_severity in {"high", "critical"}
+
+    logging.info("[admin-alert-email] module=%s", safe_module)
+    logging.info("[admin-alert-email] severity=%s", safe_severity)
+    logging.info("[admin-alert-email] trigger_passed=%s", bool(trigger_passed))
+    logging.info("[admin-alert-email] recipient_configured=%s", bool(recipient))
+
+    if not trigger_passed:
+        reason = "safe_or_not_high_risk"
+        logging.info("[admin-alert-email] sent=false")
+        logging.info("[admin-alert-email] reason=%s", reason)
+        return False, reason
+    if not recipient:
+        reason = "admin_alert_email_skipped_no_recipient"
+        logging.info("[admin-alert-email] sent=false")
+        logging.info("[admin-alert-email] reason=%s", reason)
+        return False, reason
+    if not _mail_is_configured():
+        reason = "mail_not_configured"
+        logging.info("[admin-alert-email] sent=false")
+        logging.info("[admin-alert-email] reason=%s", reason)
+        return False, reason
+    if not _admin_alert_claim_dedupe_key(dedupe_key):
+        reason = "duplicate_dedupe_key"
+        logging.info("[admin-alert-email] sent=false")
+        logging.info("[admin-alert-email] reason=%s", reason)
+        return False, reason
+
+    try:
+        subject, html_body, text_body = _build_admin_alert_email_payload(
+            module=safe_module,
+            title=title,
+            message=message,
+            severity=safe_severity,
+            source_id=source_id,
+            affected_user_email=affected_user_email,
+            metadata=metadata,
+        )
+        send_email(recipient, subject, html_body, text_body)
+    except Exception as exc:
+        reason = _friendly_smtp_error(exc)
+        logging.warning(
+            "[admin-alert-email] delivery failed safely | module=%s severity=%s reason=%s exception_class=%s",
+            safe_module,
+            safe_severity,
+            reason,
+            exc.__class__.__name__,
+        )
+        logging.info("[admin-alert-email] sent=false")
+        logging.info("[admin-alert-email] reason=%s", reason)
+        return False, reason
+
+    logging.info("[admin-alert-email] sent=true")
+    logging.info("[admin-alert-email] reason=sent")
+    return True, "sent"
 
 
 def _is_email_notification_enabled_for_user(user) -> bool:
@@ -15278,37 +16417,38 @@ def _build_pcap_completion_email_payload(
     return subject, html_body, text_body
 
 
-def _send_pcap_completion_email(job_state, report) -> None:
-    if EMAIL_NOTIFICATIONS_ENABLED:
+def _send_pcap_completion_email(job_state, report, *, generic_email_sent: bool = False) -> bool:
+    if generic_email_sent:
         logging.info(
-            "Skipping dedicated PCAP completion email for job %s because generic notification email delivery is enabled",
+            "[pcap-email] trigger_passed=true helper_called=false sent=true reason=generic_notification_email_sent job_id=%s",
             getattr(job_state, "job_id", None),
         )
-        return
+        return True
     user_id = getattr(job_state, "owner_user_id", None)
     if not user_id:
-        return
+        logging.info("[pcap-email] trigger_passed=false user_id_exists=false sent=false reason=user_id_missing")
+        return False
     if not _mail_is_configured():
         logging.info(
-            "Skipping PCAP completion email for job %s because SMTP is not configured",
+            "[pcap-email] trigger_passed=true user_id_exists=true helper_called=false sent=false reason=mail_not_configured job_id=%s",
             getattr(job_state, "job_id", None),
         )
-        return
+        return False
 
     user = db.session.get(User, int(user_id))
     if user is None or not str(getattr(user, "email", "") or "").strip():
         logging.warning(
-            "Skipping PCAP completion email for job %s because the owner user/email was not found",
+            "[pcap-email] trigger_passed=true user_id_exists=true recipient_exists=false sent=false reason=recipient_missing job_id=%s",
             getattr(job_state, "job_id", None),
         )
-        return
+        return False
     if not _is_email_notification_enabled_for_user(user):
         logging.info(
-            "Skipping PCAP completion email for job %s because email notifications are disabled for user_id=%s",
+            "[pcap-email] trigger_passed=true user_id_exists=true recipient_exists=true sent=false reason=user_email_notifications_disabled job_id=%s user_id=%s",
             getattr(job_state, "job_id", None),
             user.id,
         )
-        return
+        return False
 
     subject, html_body, text_body = _build_pcap_completion_email_payload(
         user, job_state, report
@@ -15317,7 +16457,7 @@ def _send_pcap_completion_email(job_state, report) -> None:
         send_email(user.email, subject, html_body, text_body)
     except Exception as exc:
         logging.error(
-            "PCAP completion email delivery failed | job_id=%s | user_id=%s | email=%s | reason=%s",
+            "[pcap-email] trigger_passed=true user_id_exists=true recipient_exists=true app_context_available=true helper_called=true sent=false job_id=%s user_id=%s email=%s reason=%s",
             getattr(job_state, "job_id", None),
             user.id,
             user.email,
@@ -15325,11 +16465,12 @@ def _send_pcap_completion_email(job_state, report) -> None:
         )
         raise
     logging.info(
-        "PCAP completion email sent | job_id=%s | user_id=%s | email=%s",
+        "[pcap-email] trigger_passed=true user_id_exists=true recipient_exists=true app_context_available=true helper_called=true sent=true reason=sent job_id=%s user_id=%s email=%s",
         getattr(job_state, "job_id", None),
         user.id,
         user.email,
     )
+    return True
 
 
 def _identity_main_category(findings: list[dict]) -> str:
@@ -15433,6 +16574,56 @@ def _build_identity_alert_email_payload(user, scan: dict, result: dict, findings
 def _send_identity_alert_email(alert_id: int | None, user_id: int, scan: dict, result: dict, findings: list[dict]) -> str:
     if not alert_id:
         return "skipped"
+    try:
+        risk_level = _safe_str(result.get("risk_level"), "Low")
+        confirmed_breach_count = sum(
+            1
+            for item in findings
+            if isinstance(item, dict)
+            and _safe_str(item.get("category")).lower() in {"confirmed_breach", "confirmed_exposure"}
+        )
+        high_finding = next(
+            (
+                item
+                for item in findings
+                if isinstance(item, dict)
+                and _safe_str(item.get("severity")).lower() in {"high", "critical"}
+            ),
+            {},
+        )
+        admin_trigger = (
+            _identity_risk_rank(risk_level) >= _identity_risk_rank("High")
+            or confirmed_breach_count > 0
+            or bool(high_finding)
+        )
+        if admin_trigger:
+            user = db.session.get(User, int(user_id))
+            target_type = "email" if scan.get("email") else "phone" if scan.get("phone") else "domain" if scan.get("domain") else "identity"
+            send_admin_alert_email_best_effort(
+                module="Identity Leak Monitor",
+                title="High-Risk Identity Exposure Detected",
+                message=_admin_alert_safe_text(
+                    result.get("summary") or result.get("recommendation"),
+                    "Identity exposure findings require admin review.",
+                ),
+                severity="critical" if _identity_risk_rank(risk_level) >= _identity_risk_rank("Critical") or confirmed_breach_count else "high",
+                source_id=str(alert_id),
+                affected_user_email=_safe_str(getattr(user, "email", None)) or f"user_id:{user_id}",
+                metadata={
+                    "scan_id": scan.get("scan_id"),
+                    "exposed_identifier_type": target_type,
+                    "risk_level": risk_level,
+                    "risk_score": result.get("risk_score"),
+                    "total_findings": result.get("total_findings"),
+                    "confirmed_breach_count": confirmed_breach_count,
+                    "source_category": _safe_str(high_finding.get("category") if isinstance(high_finding, dict) else "") or "identity_exposure",
+                    "exposure_summary": result.get("summary") or result.get("recommendation"),
+                    "recommended_action": "Review exposed identity assets and rotate affected credentials.",
+                },
+                dedupe_key=f"identity-admin-email:{user_id}:{alert_id}",
+            )
+    except Exception:
+        logging.exception("Failed to process Identity admin alert email | alert_id=%s | user_id=%s", alert_id, user_id)
     if not _identity_email_should_send(result, findings):
         update_identity_alert_email_status(alert_id, user_id, "skipped")
         return "skipped"
@@ -16036,6 +17227,11 @@ def _get_pending_2fa_context(expected_states: set[str]):
 
 
 app.extensions["get_current_user"] = get_current_user
+app.extensions["log_user_event"] = log_user_event
+app.extensions["create_phishing_scan_notification"] = create_phishing_scan_notification
+app.extensions["send_phishing_scan_email_alert"] = send_phishing_scan_email_alert
+app.extensions["create_phishing_scanner_security_alert"] = create_phishing_scanner_security_alert
+app.extensions["send_admin_alert_email_best_effort"] = send_admin_alert_email_best_effort
 app.extensions["run_monthly_security_reports"] = lambda **kwargs: run_monthly_security_reports(
     users=kwargs.get("users") or User.query.all(),
     base_dir=BASE_DIR,
@@ -16046,7 +17242,9 @@ app.extensions["run_monthly_security_reports"] = lambda **kwargs: run_monthly_se
     load_report_payload_for_job=_load_report_payload_for_job,
     render_pdf=render_monthly_security_report_pdf,
     create_notification=create_user_notification,
+    activity_log_query=_query_user_activity_log_records,
     password_check_query=_query_user_password_check_records,
+    phishing_scan_query=_query_user_phishing_scan_records,
     target_year=kwargs.get("target_year"),
     target_month=kwargs.get("target_month"),
 )
@@ -17000,6 +18198,18 @@ def _admin_password_risk_report_summary_early():
 @admin_auth_required
 def _admin_password_risk_report_export_early():
     return admin_password_risk_report_export()
+
+
+@app.route("/api/admin/reports/phishing-incidents", methods=["GET"], endpoint="admin_phishing_incidents_report_summary_early")
+@admin_auth_required
+def _admin_phishing_incidents_report_summary_early():
+    return admin_phishing_incidents_report_summary()
+
+
+@app.route("/api/admin/reports/phishing-incidents/export", methods=["GET"], endpoint="admin_phishing_incidents_report_export_early")
+@admin_auth_required
+def _admin_phishing_incidents_report_export_early():
+    return admin_phishing_incidents_report_export()
 
 
 @app.route("/api/admin/reports/monthly-security", methods=["GET"], endpoint="admin_monthly_security_report_summary_early")
@@ -19719,6 +20929,7 @@ def _apply_activity_log_filters(query, *, user_id: int):
                 UserActivityLog.target_label.ilike(pattern),
                 UserActivityLog.action_type.ilike(pattern),
                 UserActivityLog.event_id.ilike(pattern),
+                UserActivityLog.metadata_json.ilike(pattern),
             )
         )
 
@@ -20494,14 +21705,13 @@ def _vault_email_recipients(user) -> list[str]:
 
 
 def _send_vault_ai_email_alerts(user, alerts: list[dict]) -> list[dict[str, object]]:
-    if not VAULT_EMAIL_ALERTS_ENABLED or not alerts:
+    if not alerts:
         return []
 
     email_results: list[dict[str, object]] = []
-    recipients = _vault_email_recipients(user)
-    if not recipients:
+    recipients = _vault_email_recipients(user) if VAULT_EMAIL_ALERTS_ENABLED else []
+    if VAULT_EMAIL_ALERTS_ENABLED and not recipients:
         logging.warning("Vault AI email alert skipped because no recipient email was available.")
-        return email_results
 
     for alert in alerts:
         if not isinstance(alert, dict):
@@ -20559,19 +21769,52 @@ def _send_vault_ai_email_alerts(user, alerts: list[dict]) -> list[dict[str, obje
         """
 
         sent_any = False
-        for recipient in recipients:
-            sent = _send_email_message(recipient, subject, text_body, html_body)
-            sent_any = sent_any or sent
-            email_results.append(
-                {
-                    "recipient": recipient,
-                    "sent": bool(sent),
-                    "fingerprint": fingerprint,
-                    "risk_score": risk_score,
-                    "severity": severity,
-                    "title": action_name,
-                }
-            )
+        if VAULT_EMAIL_ALERTS_ENABLED:
+            for recipient in recipients:
+                sent = _send_email_message(recipient, subject, text_body, html_body)
+                sent_any = sent_any or sent
+                email_results.append(
+                    {
+                        "recipient": recipient,
+                        "sent": bool(sent),
+                        "fingerprint": fingerprint,
+                        "risk_score": risk_score,
+                        "severity": severity,
+                        "title": action_name,
+                    }
+                )
+
+        admin_sent, admin_reason = send_admin_alert_email_best_effort(
+            module="File Vault",
+            title=f"{severity_label} Vault Threat Detected",
+            message="Suspicious encrypted vault activity requires admin review.",
+            severity=severity,
+            source_id=fingerprint,
+            affected_user_email=_safe_str(getattr(user, "email", None)) or f"user_id:{getattr(user, 'id', '')}",
+            metadata={
+                "event_type": action_name,
+                "risk_score": risk_score,
+                "scope": scope,
+                "target": target,
+                "count": count,
+                "window_minutes": window_minutes,
+                "detected_at": detected_at,
+                "recommended_action": "Review vault activity and confirm whether access was authorized.",
+            },
+            dedupe_key=f"vault-admin-email:{getattr(user, 'id', '')}:{fingerprint}",
+        )
+        email_results.append(
+            {
+                "recipient": "ADMIN_ALERT_EMAIL_TO",
+                "sent": bool(admin_sent),
+                "reason": admin_reason,
+                "fingerprint": fingerprint,
+                "risk_score": risk_score,
+                "severity": severity,
+                "title": action_name,
+                "admin_alert": True,
+            }
+        )
 
         logging.info(
             "Vault AI email alert processed | user_id=%s | title=%s | risk_score=%s | sent=%s",
@@ -20656,7 +21899,20 @@ def analyze_my_vault_behavior():
         "created_alert": bool(created_events),
         "alert_created": bool(created_events),
         "email_alerts": email_alerts,
-        "email_alert_sent": any(bool(item.get("sent")) for item in email_alerts),
+        "email_alert_sent": any(
+            bool(item.get("sent")) for item in email_alerts if not bool(item.get("admin_alert"))
+        ),
+        "admin_email_alert_sent": any(
+            bool(item.get("sent")) for item in email_alerts if bool(item.get("admin_alert"))
+        ),
+        "admin_email_alert_reason": next(
+            (
+                str(item.get("reason") or "")
+                for item in email_alerts
+                if bool(item.get("admin_alert")) and item.get("reason")
+            ),
+            "safe_or_not_high_risk",
+        ),
     }
 
     return jsonify(frontend_payload)
@@ -20767,6 +22023,7 @@ def _monthly_report_payload_with_repaired_vault(report_record: "MonthlySecurityR
             load_report_payload_for_job=_load_report_payload_for_job,
             activity_log_query=_query_user_activity_log_records,
             password_check_query=_query_user_password_check_records,
+            phishing_scan_query=_query_user_phishing_scan_records,
         )
         repaired_sections = repaired.get("sections") if isinstance(repaired.get("sections"), dict) else {}
         repaired_vault = repaired_sections.get("vault") if isinstance(repaired_sections.get("vault"), dict) else None
@@ -20819,6 +22076,69 @@ def _query_user_password_check_records(user_id: int):
         .all()
     )
 
+
+def _query_user_phishing_scan_records(user_id: int):
+    scans_db_path = BASE_DIR / "data" / "scans.db"
+    if not scans_db_path.exists() or not scans_db_path.is_file():
+        return []
+
+    safe_columns = {
+        "id",
+        "scan_id",
+        "user_id",
+        "url",
+        "domain",
+        "final_category",
+        "category",
+        "result",
+        "final_risk_score",
+        "risk",
+        "risk_score",
+        "ml_probability",
+        "virustotal_malicious",
+        "virustotal_suspicious",
+        "timestamp",
+        "created_at",
+    }
+
+    try:
+        conn = sqlite3.connect(str(scans_db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            table_info = conn.execute("PRAGMA table_info(scans)").fetchall()
+            existing_columns = [str(row["name"]) for row in table_info if str(row["name"] or "") in safe_columns]
+            if not existing_columns or "user_id" not in existing_columns:
+                return []
+
+            order_column = "timestamp" if "timestamp" in existing_columns else "created_at" if "created_at" in existing_columns else "id"
+            selected_columns = ", ".join(f'"{column}"' for column in existing_columns)
+            rows = conn.execute(
+                f"""
+                SELECT {selected_columns}
+                FROM scans
+                WHERE user_id = ?
+                ORDER BY "{order_column}" DESC, id DESC
+                """,
+                (int(user_id),),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        logging.exception(
+            "Failed to read phishing scans for monthly report | user_id=%s",
+            user_id,
+        )
+        return []
+
+    records = []
+    for row in rows:
+        record = {key: row[key] for key in row.keys() if key in safe_columns}
+        if not str(record.get("url") or "").strip():
+            continue
+        records.append(record)
+    return records
+
+
 def _generate_monthly_report_for_user(
     user,
     report_month_key: Optional[str] = None,
@@ -20847,6 +22167,7 @@ def _generate_monthly_report_for_user(
         create_notification=create_user_notification,
         activity_log_query=_query_user_activity_log_records,
         password_check_query=_query_user_password_check_records,
+        phishing_scan_query=_query_user_phishing_scan_records,
     )
 
 
@@ -22822,6 +24143,169 @@ SECURITY_SCORE_STATIC_MODULE_KNOWLEDGE = {
 }
 
 
+PHISHING_STATIC_MODULE_KNOWLEDGE = {
+    "overview": (
+        "Phishing Scanner validates submitted HTTP/HTTPS URLs, extracts URL/domain signals, runs the "
+        "existing ML phishing predictor, enriches with VirusTotal domain reputation, and returns a "
+        "final user-facing risk category and score."
+    ),
+    "scoring": (
+        "The base risk comes from ML phishing probability. VirusTotal can boost risk when suspicious "
+        "or malicious detections exist, but it never reduces ML risk. Final categories are 0-39 safe, "
+        "40-69 suspicious, and 70-100 dangerous. Trusted domains can be marked safe/0 by the existing "
+        "trusted-domain logic."
+    ),
+    "safe_fields": [
+        "url",
+        "domain",
+        "final_category",
+        "final_risk_score",
+        "ml_probability",
+        "virustotal_malicious",
+        "virustotal_suspicious",
+        "timestamp",
+        "guidance",
+    ],
+    "side_effects": (
+        "Completed scans can update Dashboard/Security Score context, create Recent Security Alerts, "
+        "create notifications, and send email only for risky scans when email is configured."
+    ),
+}
+
+
+def _phishing_chatbot_scan_record_from_row(row, metadata_by_scan_id: dict[int, dict]) -> dict[str, object]:
+    scan_id = _safe_int(row["id"] if "id" in row.keys() else row[0], 0)
+    url = _safe_str(row["url"] if "url" in row.keys() else row[1])
+    risk = _safe_int(row["risk"] if "risk" in row.keys() else row[2], 0)
+    result = _safe_str(row["result"] if "result" in row.keys() else row[3]).lower()
+    timestamp = _safe_str(row["timestamp"] if "timestamp" in row.keys() else row[4])
+    metadata = metadata_by_scan_id.get(scan_id, {})
+    domain = _safe_str(metadata.get("domain")) or _phishing_domain_from_url(url)
+    category = _safe_str(metadata.get("final_category") or result).lower() or _normalize_phishing_alert_category(result, risk)
+    final_risk_score = _safe_int(metadata.get("final_risk_score"), risk)
+    return {
+        "scan_id": scan_id,
+        "url": url,
+        "domain": domain,
+        "final_category": category,
+        "final_risk_score": final_risk_score,
+        "ml_probability": metadata.get("ml_probability"),
+        "virustotal_reputation": _safe_str(metadata.get("virustotal_reputation")) or None,
+        "virustotal_malicious": _safe_int(metadata.get("virustotal_malicious"), 0),
+        "virustotal_suspicious": _safe_int(metadata.get("virustotal_suspicious"), 0),
+        "timestamp": timestamp,
+        "guidance": get_user_guidance(category),
+    }
+
+
+def _safe_phishing_llm_context(user_id: int | None) -> dict[str, object]:
+    if not user_id:
+        context = _chatbot_empty_context("phishing", "No authenticated Phishing Scanner data is available yet.")
+        context.update({"static_context_available": True, "static_module_knowledge": PHISHING_STATIC_MODULE_KNOWLEDGE})
+        return context
+
+    try:
+        db_path = next((path for path in _phishing_db_candidates() if path.exists()), None)
+        if db_path is None:
+            context = _chatbot_empty_context("phishing", "No phishing scans are available yet.")
+            context.update({"static_context_available": True, "static_module_knowledge": PHISHING_STATIC_MODULE_KNOWLEDGE})
+            return context
+
+        alert_records = (
+            PcapAlertRecord.query.filter_by(user_id=int(user_id), source_type="phishing_scanner")
+            .order_by(PcapAlertRecord.event_at.desc(), PcapAlertRecord.created_at.desc(), PcapAlertRecord.id.desc())
+            .limit(50)
+            .all()
+        )
+        metadata_by_scan_id: dict[int, dict] = {}
+        for record in alert_records:
+            metadata = _pcap_alert_metadata_from_json(getattr(record, "metadata_json", None))
+            scan_id = _safe_int(metadata.get("scan_id") or metadata.get("source_id"), 0)
+            if scan_id > 0 and scan_id not in metadata_by_scan_id:
+                metadata_by_scan_id[scan_id] = metadata
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT id, url, risk, result, timestamp FROM scans WHERE user_id = ? ORDER BY id DESC LIMIT 20",
+                (int(user_id),),
+            ).fetchall()
+            total_scans = _safe_int(
+                conn.execute("SELECT COUNT(*) FROM scans WHERE user_id = ?", (int(user_id),)).fetchone()[0],
+                0,
+            )
+        finally:
+            conn.close()
+
+        scans = [_phishing_chatbot_scan_record_from_row(row, metadata_by_scan_id) for row in rows]
+        if not scans:
+            context = _chatbot_empty_context("phishing", "No phishing scans are available yet.")
+            context.update(
+                {
+                    "available": False,
+                    "dynamic_context_available": False,
+                    "static_context_available": True,
+                    "static_module_knowledge": PHISHING_STATIC_MODULE_KNOWLEDGE,
+                    "scan_counts": {"total": 0, "safe": 0, "suspicious": 0, "dangerous": 0},
+                    "recommendations": ["Run a Phishing Scanner URL check to populate chatbot context."],
+                }
+            )
+            return context
+
+        counts = {"safe": 0, "suspicious": 0, "dangerous": 0}
+        for scan in scans:
+            category = _safe_str(scan.get("final_category")).lower()
+            if category in counts:
+                counts[category] += 1
+        latest = scans[0]
+        risky_count = counts["suspicious"] + counts["dangerous"]
+        summary = (
+            f"Latest phishing scan: {_chatbot_sanitize_text(latest.get('url'))} "
+            f"was {latest.get('final_category')} with final risk score {latest.get('final_risk_score')}/100."
+        )
+        evidence = [
+            f"Total phishing scans: {total_scans}",
+            f"Recent safe/suspicious/dangerous counts: {counts['safe']}/{counts['suspicious']}/{counts['dangerous']}",
+            f"Latest domain: {_chatbot_sanitize_text(latest.get('domain')) or 'unknown'}",
+            f"Latest final category: {latest.get('final_category')}",
+            f"Latest final risk score: {latest.get('final_risk_score')}/100",
+        ]
+        if latest.get("ml_probability") is not None:
+            evidence.append(f"Latest ML probability: {latest.get('ml_probability')}")
+        if _safe_int(latest.get("virustotal_malicious"), 0) or _safe_int(latest.get("virustotal_suspicious"), 0):
+            evidence.append(
+                f"VirusTotal detections: malicious {_safe_int(latest.get('virustotal_malicious'), 0)}, suspicious {_safe_int(latest.get('virustotal_suspicious'), 0)}"
+            )
+        recommendations = [
+            "Do not open dangerous URLs; report them to an admin or security team.",
+            "Review suspicious URLs carefully before visiting.",
+            "Use known trusted domains directly instead of clicking unknown links.",
+        ]
+        if risky_count <= 0:
+            recommendations.insert(0, "Recent phishing scans look safe; continue checking unknown links before opening them.")
+
+        return {
+            "module": "phishing",
+            "available": True,
+            "dynamic_context_available": True,
+            "static_context_available": True,
+            "summary": summary,
+            "risk_level": _security_score_label_from_score(max(0, 100 - _safe_int(latest.get("final_risk_score"), 0))),
+            "static_module_knowledge": PHISHING_STATIC_MODULE_KNOWLEDGE,
+            "latest_scan": latest,
+            "recent_scans": scans[:5],
+            "scan_counts": {"total": total_scans, **counts},
+            "evidence": evidence,
+            "recommendations": recommendations,
+        }
+    except Exception:
+        logging.exception("Safe Phishing chatbot context failed | user_id=%s", user_id)
+        context = _chatbot_empty_context("phishing", "No phishing scans are available yet.")
+        context.update({"static_context_available": True, "static_module_knowledge": PHISHING_STATIC_MODULE_KNOWLEDGE})
+        return context
+
+
 REPORTS_STATIC_MODULE_KNOWLEDGE = {
     "overview": (
         "The Reports & Export Center is used to review, summarize, and export security activity "
@@ -24227,6 +25711,8 @@ def get_chatbot_security_context(user_id: int | None, module: str, user=None) ->
         return _safe_pcap_llm_context(user, user_id)
     if module == "identity":
         return _safe_identity_llm_context(user_id)
+    if module == "phishing":
+        return _safe_phishing_llm_context(user_id)
     if module == "security_score" or module == "general":
         context = _safe_security_score_llm_context(user_id, module)
         identity_context = _safe_identity_llm_context(user_id)
@@ -24245,8 +25731,6 @@ def get_chatbot_security_context(user_id: int | None, module: str, user=None) ->
     try:
         if module == "password":
             return _chatbot_context_from_security_payload("password", _score_password_module(int(user_id)))
-        if module == "phishing":
-            return _chatbot_context_from_security_payload("phishing", _score_phishing_module(int(user_id)))
         if module == "file_vault":
             context = _chatbot_context_from_security_payload("file_vault", _score_vault_module(int(user_id)))
             try:
@@ -24358,6 +25842,8 @@ def _chatbot_detect_intent(message: str, module: str) -> str:
         return "latest_summary"
 
     if module == "security_score":
+        if "phishing" in text and ("affect" in text or "adding" in text or "added" in text):
+            return "phishing_score_effect"
         if "improve" in text or "increase" in text or "raise" in text or "fix" in text or "recommend" in text:
             return "improve_score"
         if "weakest" in text or "lowest" in text or "worst" in text:
@@ -24371,6 +25857,25 @@ def _chatbot_detect_intent(message: str, module: str) -> str:
         if "why" in text or "low" in text or "high" in text or "risk" in text or "meaning" in text:
             return "risk_interpretation"
         return "explain_score"
+
+    if module == "phishing":
+        if "calculate" in text or "calculated" in text or "score" in text or "final_risk_score" in text:
+            return "phishing_scoring"
+        if "latest" in text or "last scan" in text or "what was my" in text or "history summary" in text:
+            return "phishing_latest"
+        if "history" in text or "summary" in text or "counts" in text:
+            return "phishing_history"
+        if "virustotal" in text or "virus total" in text or "vt" in text:
+            return "phishing_virustotal"
+        if "github" in text or "safe" in text:
+            return "phishing_safe_reason"
+        if "malware.wicar" in text or "dangerous" in text or "malicious" in text:
+            return "phishing_dangerous_reason"
+        if "suspicious" in text or "what should i do" in text or "next" in text or "recommend" in text:
+            return "phishing_next_steps"
+        if "explain" in text or "why" in text or "risk" in text:
+            return "phishing_explain_latest"
+        return "phishing_latest"
 
     if module == "reports":
         if "export" in text or "download" in text or "csv" in text or "pdf" in text:
@@ -24423,7 +25928,19 @@ def _chatbot_response_guidance(module: str, intent: str) -> str:
             "calculation_method": "Explain the implemented/intended 25% component weighting: Password, File Vault, Phishing, Identity. PCAP is excluded.",
             "component_breakdown": "Return only the four Security Score components and their available scores/statuses.",
             "risk_interpretation": "Explain why the score status is low/medium/high and the focused next steps.",
+            "phishing_score_effect": "Explain Phishing Scanner as a Security Score component. Do not confuse phishing final_risk_score with security score; lower phishing risk means better security score.",
         }.get(intent, "Answer the selected Security Score intent without including PCAP as a component.")
+    if module == "phishing":
+        return {
+            "phishing_scoring": "Explain ML base probability, VirusTotal boost, no VT risk reduction, 0-39 safe, 40-69 suspicious, 70-100 dangerous, and trusted-domain safe logic.",
+            "phishing_latest": "Use latest_scan only. Include URL/domain/category/final_risk_score/timestamp. If unavailable, say no phishing scans are available yet.",
+            "phishing_history": "Summarize scan_counts and recent_scans only. Do not invent scans.",
+            "phishing_virustotal": "Use latest_scan VirusTotal reputation/malicious/suspicious fields. If unavailable or zero, say VirusTotal did not add malicious/suspicious evidence in the available context.",
+            "phishing_safe_reason": "Explain safe results using latest_scan and scoring logic. Do not call a safe result dangerous.",
+            "phishing_dangerous_reason": "Explain dangerous results using latest_scan final score/category and VirusTotal counts if present.",
+            "phishing_next_steps": "Give safe handling steps for suspicious/dangerous URLs without changing scanner behavior.",
+            "phishing_explain_latest": "Explain latest_scan result and what the final_risk_score means.",
+        }.get(intent, "Answer using Phishing Scanner context only. Do not invent scan results.")
     if module == "reports":
         return {
             "available_reports": "List report categories only. Include PCAP as a separate network-traffic report category if connected. Do not show Security Score component breakdown.",
@@ -24611,18 +26128,57 @@ def _fallback_security_score_answer(intent: str, safe_context: dict) -> str:
         return "Your Security Score has not been calculated yet because there is not enough activity from Password Checker, File Vault, Phishing Scanner, and Identity Leak."
 
     if intent == "calculation_method":
-        return "\n".join(
-            [
-                "**Security Score calculation**",
-                "",
-                "Security Score is calculated from four equal components:",
+        if components:
+            available_component_lines = [
+                f"- {safe_activity_str(item.get('component'))}: {safe_activity_str(item.get('score'), 'unknown')}/100, status {safe_activity_str(item.get('status'), 'unknown')}, weight {safe_activity_str(item.get('weight'), '25')}%"
+                for item in components
+            ]
+        else:
+            available_component_lines = [
                 "- Password Checker 25%",
                 "- File Vault 25%",
                 "- Phishing Scanner 25%",
                 "- Identity Leak 25%",
+            ]
+        return "\n".join(
+            [
+                "**Security Score calculation**",
+                "",
+                "Security Score uses the component data returned by the backend score payload. Higher component scores improve the overall score.",
+                "",
+                "Current components:",
+                *available_component_lines,
                 "",
                 "PCAP Analyzer is separate and not included.",
             ]
+        )
+
+    if intent == "phishing_score_effect":
+        phishing_component = next(
+            (
+                item for item in components
+                if safe_activity_str(item.get("module_key")).lower() == "phishing"
+                or safe_activity_str(item.get("component")).lower() == "phishing scanner"
+            ),
+            None,
+        )
+        if phishing_component:
+            return "\n".join(
+                [
+                    "**How Phishing affects your Security Score**",
+                    "",
+                    "Phishing Scanner is one of the personal Security Score components.",
+                    "Important distinction: phishing final_risk_score is URL risk, while the Security Score component is safety posture.",
+                    "So a low phishing risk score improves the Phishing component, and a high phishing risk score lowers it.",
+                    "",
+                    f"Current Phishing component: {safe_activity_str(phishing_component.get('score'), 'unknown')}/100, status {safe_activity_str(phishing_component.get('status'), 'unknown')}.",
+                    f"Summary: {safe_activity_str(phishing_component.get('summary'), 'No phishing summary is available yet.')}",
+                ]
+            )
+        return (
+            "Phishing Scanner is included as a Security Score component when phishing scan data exists. "
+            "A safe/low final_risk_score improves the component, while suspicious or dangerous scans lower it. "
+            "No current Phishing component data is available in this score context."
         )
 
     def component_lines() -> list[str]:
@@ -24808,6 +26364,120 @@ def _fallback_reports_answer(intent: str, safe_context: dict) -> str:
             *[f"- {item}" for item in categories],
         ]
     )
+
+
+def _format_phishing_probability(value: object) -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "unavailable"
+    if numeric <= 1:
+        numeric *= 100
+    return f"{max(0.0, min(100.0, numeric)):.2f}%"
+
+
+def _fallback_phishing_answer(intent: str, safe_context: dict) -> str:
+    latest = safe_context.get("latest_scan") if isinstance(safe_context.get("latest_scan"), dict) else None
+    recent_scans = [item for item in (safe_context.get("recent_scans") or []) if isinstance(item, dict)]
+    counts = safe_context.get("scan_counts") if isinstance(safe_context.get("scan_counts"), dict) else {}
+    recommendations = [
+        _chatbot_sanitize_text(item)
+        for item in (safe_context.get("recommendations") or [])
+        if _chatbot_sanitize_text(item)
+    ]
+
+    if intent == "phishing_scoring":
+        return "\n".join(
+            [
+                "**How Phishing Scanner risk is calculated**",
+                "",
+                "- The base score comes from the ML phishing probability.",
+                "- VirusTotal can boost the final score when suspicious or malicious detections exist.",
+                "- VirusTotal never reduces ML risk.",
+                "- 0-39 = safe, 40-69 = suspicious, 70-100 = dangerous.",
+                "- Trusted domains can be scored as safe/0 when the existing trusted-domain logic marks them trusted.",
+                "",
+                "The phishing final_risk_score is URL risk. In Security Score, lower phishing risk improves the Phishing component."
+            ]
+        )
+
+    if not latest:
+        return "No phishing scans are available yet. Run a URL through Phishing Scanner first, then I can explain the latest URL, domain, category, score, and VirusTotal context."
+
+    url = _chatbot_sanitize_text(latest.get("url")) or "unknown URL"
+    domain = _chatbot_sanitize_text(latest.get("domain")) or "unknown domain"
+    category = safe_activity_str(latest.get("final_category"), "unknown")
+    score = _safe_int(latest.get("final_risk_score"), 0)
+    timestamp = safe_activity_str(latest.get("timestamp"), "unavailable")
+    ml_probability = _format_phishing_probability(latest.get("ml_probability"))
+    vt_malicious = _safe_int(latest.get("virustotal_malicious"), 0)
+    vt_suspicious = _safe_int(latest.get("virustotal_suspicious"), 0)
+
+    if intent in {"phishing_latest", "phishing_explain_latest", "phishing_safe_reason", "phishing_dangerous_reason"}:
+        lines = [
+            "**Latest Phishing Scanner result**",
+            "",
+            f"- URL: {url}",
+            f"- Domain: {domain}",
+            f"- Final category: {category}",
+            f"- Final risk score: {score}/100",
+            f"- ML probability: {ml_probability}",
+            f"- VirusTotal detections: malicious {vt_malicious}, suspicious {vt_suspicious}",
+            f"- Timestamp: {timestamp}",
+            "",
+        ]
+        if score <= 39 and category == "safe":
+            lines.append("This is safe because the final score is in the 0-39 safe band, and the available context does not show malicious VirusTotal detections.")
+        elif category == "dangerous" or score >= 70:
+            lines.append("This is dangerous because the final score is in the 70-100 dangerous band or the final category was dangerous.")
+            if vt_malicious or vt_suspicious:
+                lines.append("VirusTotal contributed risk evidence because malicious or suspicious detections were present.")
+        elif category == "suspicious" or score >= 40:
+            lines.append("This is suspicious because the final score is in the 40-69 band. Review carefully before visiting.")
+        else:
+            lines.append("I can explain only the stored safe scan metadata; no extra hidden evidence is available.")
+        return "\n".join(lines)
+
+    if intent == "phishing_history":
+        lines = [
+            "**Phishing scan history summary**",
+            "",
+            f"- Total scans: {_safe_int(counts.get('total'), len(recent_scans))}",
+            f"- Recent safe: {_safe_int(counts.get('safe'), 0)}",
+            f"- Recent suspicious: {_safe_int(counts.get('suspicious'), 0)}",
+            f"- Recent dangerous: {_safe_int(counts.get('dangerous'), 0)}",
+            "",
+            "Recent scans:",
+        ]
+        for item in recent_scans[:5]:
+            lines.append(
+                f"- {_chatbot_sanitize_text(item.get('url'))}: {safe_activity_str(item.get('final_category'), 'unknown')} ({_safe_int(item.get('final_risk_score'), 0)}/100)"
+            )
+        return "\n".join(lines)
+
+    if intent == "phishing_virustotal":
+        if vt_malicious or vt_suspicious:
+            return (
+                f"VirusTotal affected the latest result with malicious={vt_malicious} and suspicious={vt_suspicious}. "
+                "In this project, VirusTotal can boost risk but never reduces ML risk."
+            )
+        return "The latest stored Phishing Scanner context does not show malicious or suspicious VirusTotal detections. VirusTotal did not add risky evidence in the available context."
+
+    if intent == "phishing_next_steps":
+        lines = ["**What to do with suspicious URLs**", ""]
+        for recommendation in recommendations[:4]:
+            lines.append(f"- {recommendation}")
+        if len(lines) == 2:
+            lines.extend(
+                [
+                    "- Do not open unknown suspicious links directly.",
+                    "- Verify the sender and domain out of band.",
+                    "- Report dangerous URLs to your admin or security team.",
+                ]
+            )
+        return "\n".join(lines)
+
+    return safe_activity_str(safe_context.get("summary"), "No phishing scans are available yet.")
 
 
 def is_password_fallback_context(module, message) -> bool:
@@ -25032,6 +26702,8 @@ def _rule_based_llm_chatbot_answer(message: str, module: str, user, user_id: int
                 "Identity Leak has not been assessed yet because you have not completed an Identity Leak scan. "
                 "Run your first scan to check whether your email, username, or domain appears in public exposure sources."
             )
+    if module == "phishing":
+        return _fallback_phishing_answer(intent, safe_context or {})
     if is_password_fallback_context(module, message):
         return build_password_rule_based_fallback(message, safe_context or {})
 
@@ -26531,6 +28203,388 @@ def admin_password_risk_report_export():
             "weak_findings": _safe_int(summary.get("weak_findings"), 0),
         },
         request=request,
+    )
+    return response
+
+
+PHISHING_INCIDENTS_EMPTY_MESSAGE = "No phishing scanner activity is available for this reporting period."
+
+
+def _phishing_report_no_filter(value) -> str:
+    normalized = _safe_str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    return "" if normalized in {"", "all", "any", "none", "null", "undefined"} else normalized
+
+
+def _phishing_report_datetime(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    text = _safe_str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            parsed = datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
+def _phishing_report_category(final_category, final_risk_score) -> str:
+    category = _safe_str(final_category).strip().lower().replace("-", "_").replace(" ", "_")
+    if category in {"safe", "suspicious", "dangerous"}:
+        return category
+    score = max(0, min(100, _safe_int(final_risk_score, 0)))
+    if score >= 70:
+        return "dangerous"
+    if score >= 40:
+        return "suspicious"
+    return "safe"
+
+
+def _phishing_report_risk_level(category: str) -> str:
+    if category == "dangerous":
+        return "high"
+    if category == "suspicious":
+        return "medium"
+    if category == "safe":
+        return "low"
+    return "unknown"
+
+
+def _phishing_report_vt_status(malicious: int, suspicious: int, raw_status=None) -> str:
+    raw = _safe_str(raw_status).strip().lower().replace(" ", "_")
+    if raw:
+        return raw
+    if malicious > 0:
+        return "malicious"
+    if suspicious > 0:
+        return "suspicious"
+    return "clean"
+
+
+def _phishing_report_domain(url, domain=None) -> str:
+    explicit = _safe_str(domain).strip().lower()
+    if explicit:
+        return explicit[:255]
+    try:
+        parsed = urlparse(_safe_str(url))
+        return _safe_str(parsed.netloc or parsed.path.split("/")[0]).strip().lower()[:255]
+    except Exception:
+        return ""
+
+
+def _phishing_report_period(args) -> tuple[datetime | None, datetime | None, str]:
+    date_from = _safe_str((args or {}).get("date_from") or (args or {}).get("dateFrom")).strip()
+    date_to = _safe_str((args or {}).get("date_to") or (args or {}).get("dateTo")).strip()
+    start = _phishing_report_datetime(f"{date_from}T00:00:00+00:00") if date_from else None
+    end = _phishing_report_datetime(f"{date_to}T23:59:59+00:00") if date_to else None
+    if start or end:
+        return start, end, "Custom Range"
+
+    range_value = _phishing_report_no_filter((args or {}).get("date_range") or (args or {}).get("period"))
+    now = datetime.now(UTC)
+    if range_value in {"last_7_days", "7d", "week"}:
+        return now - timedelta(days=7), now, "Last 7 Days"
+    if range_value in {"last_30_days", "30d", "month"}:
+        return now - timedelta(days=30), now, "Last 30 Days"
+    if range_value in {"current_month"}:
+        return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0), now, "Current Month"
+    return None, None, "All Time"
+
+
+def _empty_phishing_incidents_report(args=None) -> dict[str, object]:
+    start, end, label = _phishing_report_period(args or {})
+    generated_at = datetime.now(UTC).isoformat()
+    return {
+        "report_name": "Phishing Incidents Summary",
+        "status": "active",
+        "generated_at": generated_at,
+        "last_generated": None,
+        "reporting_period": {
+            "label": label,
+            "start": start.isoformat() if start else None,
+            "end": end.isoformat() if end else None,
+        },
+        "data_source": "phishing_scanner",
+        "summary": {
+            "total_url_scans": 0,
+            "safe_urls": 0,
+            "suspicious_urls": 0,
+            "dangerous_urls": 0,
+            "risky_urls": 0,
+            "average_risk_score": 0,
+            "latest_scan_time": None,
+            "virustotal_malicious_total": 0,
+            "virustotal_suspicious_total": 0,
+        },
+        "category_distribution": {"safe": 0, "suspicious": 0, "dangerous": 0},
+        "risk_distribution": {"low": 0, "medium": 0, "high": 0, "unknown": 0},
+        "highest_risk_scan": None,
+        "latest_scans": [],
+        "recommendations": [PHISHING_INCIDENTS_EMPTY_MESSAGE],
+        "empty": True,
+        "message": PHISHING_INCIDENTS_EMPTY_MESSAGE,
+        "supported_formats": ["pdf", "csv"],
+        "report_available": True,
+        "evidence_available": False,
+        "usingFallback": False,
+    }
+
+
+def _phishing_incidents_report_rows(args=None) -> tuple[list[dict[str, object]], dict[str, object]]:
+    args = args or {}
+    db_path = _phishing_scans_db_path()
+    start, end, period_label = _phishing_report_period(args)
+    context = {"period_start": start, "period_end": end, "period_label": period_label}
+    if not db_path.exists() or not db_path.is_file():
+        return [], context
+
+    safe_columns = {
+        "id",
+        "scan_id",
+        "user_id",
+        "url",
+        "domain",
+        "final_category",
+        "category",
+        "result",
+        "final_risk_score",
+        "risk",
+        "risk_score",
+        "ml_probability",
+        "virustotal_status",
+        "virustotal_reputation",
+        "virustotal_malicious",
+        "virustotal_suspicious",
+        "timestamp",
+        "created_at",
+        "status",
+    }
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            table_info = conn.execute("PRAGMA table_info(scans)").fetchall()
+            columns = {str(row["name"] or "") for row in table_info}
+            if "url" not in columns:
+                return [], context
+            select_columns = [
+                f'"{column}"' if column in columns else f"NULL AS {column}"
+                for column in sorted(safe_columns)
+            ]
+            order_column = "timestamp" if "timestamp" in columns else "created_at" if "created_at" in columns else "id"
+            rows = conn.execute(
+                f"""
+                SELECT {", ".join(select_columns)}
+                FROM scans
+                ORDER BY "{order_column}" DESC, id DESC
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        logging.exception("Failed to build admin Phishing Incidents Summary report")
+        return [], context
+
+    risk_filter = _phishing_report_no_filter(args.get("risk_level") or args.get("riskLevel"))
+    category_filter = _phishing_report_no_filter(args.get("category") or args.get("status"))
+    if risk_filter in {"critical"}:
+        risk_filter = "high"
+    if category_filter in {"low"}:
+        category_filter = "safe"
+    elif category_filter in {"medium"}:
+        category_filter = "suspicious"
+    elif category_filter in {"high", "critical"}:
+        category_filter = "dangerous"
+
+    records: list[dict[str, object]] = []
+    for row in rows:
+        url = _safe_str(row["url"]).strip()
+        if not url:
+            continue
+        raw_status = _safe_str(row["status"]).strip().lower()
+        if raw_status in {"failed", "error", "cancelled", "queued", "running", "pending"}:
+            continue
+        timestamp = _phishing_report_datetime(row["timestamp"] or row["created_at"])
+        if start and (not timestamp or timestamp < start):
+            continue
+        if end and (not timestamp or timestamp > end):
+            continue
+
+        score_value = row["final_risk_score"] if row["final_risk_score"] is not None else row["risk_score"]
+        if score_value is None:
+            score_value = row["risk"]
+        final_score = max(0, min(100, _safe_int(score_value, 0)))
+        final_category = _phishing_report_category(row["final_category"] or row["category"] or row["result"], final_score)
+        risk_level = _phishing_report_risk_level(final_category)
+        if risk_filter and risk_level != risk_filter and final_category != risk_filter:
+            continue
+        if category_filter and final_category != category_filter:
+            continue
+
+        malicious = max(0, _safe_int(row["virustotal_malicious"], 0))
+        suspicious = max(0, _safe_int(row["virustotal_suspicious"], 0))
+        scan_id = row["scan_id"] if row["scan_id"] is not None else row["id"]
+        records.append(
+            {
+                "scan_id": _safe_str(scan_id),
+                "user_id": _safe_int(row["user_id"], 0) or None,
+                "timestamp": timestamp.isoformat() if timestamp else None,
+                "url": url[:2048],
+                "domain": _phishing_report_domain(url, row["domain"]),
+                "final_category": final_category,
+                "final_risk_score": final_score,
+                "risk_level": risk_level,
+                "ml_probability": row["ml_probability"],
+                "virustotal_status": _phishing_report_vt_status(malicious, suspicious, row["virustotal_status"] or row["virustotal_reputation"]),
+                "virustotal_malicious": malicious,
+                "virustotal_suspicious": suspicious,
+            }
+        )
+    return records, context
+
+
+def _phishing_incidents_report_payload(args=None) -> dict[str, object]:
+    records, context = _phishing_incidents_report_rows(args)
+    if not records:
+        return _empty_phishing_incidents_report(args)
+
+    category_distribution = {"safe": 0, "suspicious": 0, "dangerous": 0}
+    risk_distribution = {"low": 0, "medium": 0, "high": 0, "unknown": 0}
+    total_score = 0
+    vt_malicious_total = 0
+    vt_suspicious_total = 0
+    for item in records:
+        category = _safe_str(item.get("final_category"), "safe")
+        category_distribution[category] = category_distribution.get(category, 0) + 1
+        risk = _safe_str(item.get("risk_level"), "unknown")
+        risk_distribution[risk] = risk_distribution.get(risk, 0) + 1
+        total_score += _safe_int(item.get("final_risk_score"), 0)
+        vt_malicious_total += _safe_int(item.get("virustotal_malicious"), 0)
+        vt_suspicious_total += _safe_int(item.get("virustotal_suspicious"), 0)
+
+    highest_risk_scan = max(records, key=lambda item: _safe_int(item.get("final_risk_score"), 0))
+    risky_total = category_distribution.get("suspicious", 0) + category_distribution.get("dangerous", 0)
+    latest_scan_time = records[0].get("timestamp") if records else None
+    recommendations: list[str] = []
+    if risky_total <= 0:
+        recommendations.append("No risky phishing URLs were detected. Continue scanning unknown links before opening.")
+    else:
+        recommendations.append("Review risky URLs, block dangerous domains, and warn users not to open suspicious links.")
+    if vt_malicious_total > 0:
+        recommendations.append("Prioritize domains with confirmed malicious VirusTotal detections.")
+
+    return {
+        "report_name": "Phishing Incidents Summary",
+        "status": "active",
+        "generated_at": datetime.now(UTC).isoformat(),
+        "last_generated": latest_scan_time,
+        "reporting_period": {
+            "label": context.get("period_label", "All Time"),
+            "start": context.get("period_start").isoformat() if isinstance(context.get("period_start"), datetime) else None,
+            "end": context.get("period_end").isoformat() if isinstance(context.get("period_end"), datetime) else None,
+        },
+        "data_source": "phishing_scanner",
+        "summary": {
+            "total_url_scans": len(records),
+            "safe_urls": category_distribution.get("safe", 0),
+            "suspicious_urls": category_distribution.get("suspicious", 0),
+            "dangerous_urls": category_distribution.get("dangerous", 0),
+            "risky_urls": risky_total,
+            "average_risk_score": round(total_score / len(records), 2) if records else 0,
+            "latest_scan_time": latest_scan_time,
+            "virustotal_malicious_total": vt_malicious_total,
+            "virustotal_suspicious_total": vt_suspicious_total,
+        },
+        "category_distribution": category_distribution,
+        "risk_distribution": risk_distribution,
+        "highest_risk_scan": highest_risk_scan,
+        "latest_scans": records[:50],
+        "recommendations": recommendations,
+        "empty": False,
+        "message": "",
+        "supported_formats": ["pdf", "csv"],
+        "report_available": True,
+        "evidence_available": risky_total > 0 or vt_malicious_total > 0 or vt_suspicious_total > 0,
+        "usingFallback": False,
+    }
+
+
+def admin_phishing_incidents_report_summary():
+    report = _phishing_incidents_report_payload(request.args)
+    summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    _log_reports_center_action(
+        "report_viewed",
+        "Viewed Phishing Incidents Summary",
+        "Phishing Incidents Summary",
+        severity="medium" if _safe_int(summary.get("risky_urls"), 0) else "low",
+        metadata={
+            "total_url_scans": _safe_int(summary.get("total_url_scans"), 0),
+            "risky_urls": _safe_int(summary.get("risky_urls"), 0),
+            "filters": dict(request.args),
+        },
+    )
+    return jsonify({"success": True, "report": report})
+
+
+def admin_phishing_incidents_report_export():
+    export_format = _safe_str(request.args.get("format"), "csv").lower()
+    if export_format != "csv":
+        return jsonify({"success": False, "message": "Phishing Incidents Summary PDF export is generated in the Reports & Export Center."}), 400
+
+    report = _phishing_incidents_report_payload(request.args)
+    rows = report.get("latest_scans") if isinstance(report.get("latest_scans"), list) else []
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        sanitize_csv_row([
+            "scan_id",
+            "timestamp",
+            "url",
+            "domain",
+            "final_category",
+            "final_risk_score",
+            "ml_probability",
+            "virustotal_status",
+            "virustotal_malicious",
+            "virustotal_suspicious",
+        ])
+    )
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        writer.writerow(
+            sanitize_csv_row([
+                _safe_str(item.get("scan_id")),
+                _safe_str(item.get("timestamp")),
+                _safe_str(item.get("url")),
+                _safe_str(item.get("domain")),
+                _safe_str(item.get("final_category")),
+                _safe_int(item.get("final_risk_score"), 0),
+                item.get("ml_probability"),
+                _safe_str(item.get("virustotal_status")),
+                _safe_int(item.get("virustotal_malicious"), 0),
+                _safe_int(item.get("virustotal_suspicious"), 0),
+            ])
+        )
+
+    response = make_response(output.getvalue().encode("utf-8-sig"))
+    response.headers["Content-Type"] = "text/csv; charset=utf-8"
+    response.headers["Content-Disposition"] = 'attachment; filename="phishing-incidents-summary.csv"'
+    _log_reports_center_action(
+        "report_exported",
+        "Exported Phishing Incidents Summary CSV",
+        "Phishing Incidents Summary",
+        severity="medium",
+        metadata={
+            "format": "csv",
+            "exported_rows": len(rows),
+            "filters": dict(request.args),
+        },
     )
     return response
 
@@ -29735,6 +31789,12 @@ def _admin_audit_action_options() -> list[dict[str, str]]:
     seen = set()
     options = []
     for value in (
+        [
+            "phishing_scan_completed",
+            "phishing_suspicious_url_detected",
+            "phishing_dangerous_url_detected",
+        ]
+        +
         _admin_audit_distinct_values(AdminAuditLog.action_type)
         + [
             str(row[0] or "").strip()
@@ -29747,10 +31807,17 @@ def _admin_audit_action_options() -> list[dict[str, str]]:
             )
         ]
     ):
+        if value == "phishing_suspicious_url_reviewed":
+            value = "phishing_suspicious_url_detected"
         if not value or value in seen:
             continue
         seen.add(value)
-        options.append({"value": value, "label": value.replace("_", " ").title()})
+        options.append(
+            {
+                "value": value,
+                "label": USER_ACTIVITY_LABELS.get(value, value.replace("_", " ").title()),
+            }
+        )
     return options
 
 
@@ -29804,6 +31871,8 @@ def _serialize_user_activity_as_admin_audit(entry: UserActivityLog) -> dict[str,
     created_at = _as_utc_datetime(getattr(entry, "created_at", None))
     module_key = _admin_audit_module_key(getattr(entry, "module", ""))
     action_type = normalize_activity_action_type(getattr(entry, "action_type", None))
+    if module_key == "phishing_scanner" and action_type == "phishing_suspicious_url_reviewed":
+        action_type = "phishing_suspicious_url_detected"
     actor_email = str(getattr(user, "email", "") or "").strip().lower() if user else ""
     actor_name = str(getattr(user, "full_name", "") or "").strip() if user else ""
     if not actor_name and actor_email:
@@ -29878,7 +31947,17 @@ def _filtered_user_activity_audit_query(args):
             )
         )
     if action_type and action_type.lower() != "all":
-        query = query.filter(UserActivityLog.action_type == action_type)
+        if action_type == "phishing_suspicious_url_detected":
+            query = query.filter(
+                UserActivityLog.action_type.in_(
+                    [
+                        "phishing_suspicious_url_detected",
+                        "phishing_suspicious_url_reviewed",
+                    ]
+                )
+            )
+        else:
+            query = query.filter(UserActivityLog.action_type == action_type)
     if status and status != "all":
         if status == "success":
             query = query.filter(UserActivityLog.status.in_([STATUS_SUCCESS, STATUS_INFO]))

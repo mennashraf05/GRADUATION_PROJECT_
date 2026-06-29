@@ -1003,6 +1003,13 @@ const MODULE_QUICK_ACTIONS: Record<string, Array<{ icon: React.FC<any>; label: s
     { icon: Activity, label: "Analyze my current Vault AI risk", color: "#34D399" },
     { icon: Zap, label: "Professional next steps for the Vault module", color: "#F472B6" },
   ],
+  phishing: [
+    { icon: FileText, label: "Explain my latest phishing scan", color: "#FBBF24" },
+    { icon: AlertTriangle, label: "Why was this URL dangerous?", color: "#FB7185" },
+    { icon: BarChart3, label: "How is phishing risk calculated?", color: "#22D3EE" },
+    { icon: ShieldCheck, label: "What should I do with suspicious links?", color: "#34D399" },
+    { icon: Database, label: "Show my phishing scan history summary", color: "#A78BFA" },
+  ],
   identity: [
     { icon: FileText, label: "Summarize my latest identity leak scan", color: "#FB7185" },
     { icon: AlertTriangle, label: "What identity risks were found?", color: "#F59E0B" },
@@ -1091,15 +1098,15 @@ const MODULE_CONTEXT: Record<
   },
   phishing: {
     panels: [
-      { icon: Layers, title: "Scan Flow", badge: "Core", color: "#FBBF24", stat: "URL Analysis", description: "Validates submitted URLs, runs ML-based prediction, then maps results into safer user-facing risk categories." },
-      { icon: BarChart3, title: "Risk Output", badge: "ML", color: "#22D3EE", stat: "Guided", description: "The scanner returns a suspiciousness decision plus practical next-step guidance instead of a bare model score." },
-      { icon: GitBranch, title: "History", badge: "Tracking", color: "#818CF8", stat: "Saved", description: "Past scans can be stored and reviewed so phishing checks become an ongoing workflow instead of a one-off action." },
-      { icon: MessageSquare, title: "Module Scope", badge: "Phishing", color: "#34D399", stat: "Social Defense", description: "This mode focuses on malicious links, phishing indicators, sender trust, and user-safe recommendations." },
+      { icon: Layers, title: "Scan Flow", badge: "Core", color: "#FBBF24", stat: "URL + Domain", description: "Validates submitted URLs, runs ML prediction, enriches with VirusTotal, and returns a user-facing risk category." },
+      { icon: BarChart3, title: "Risk Output", badge: "ML + VT", color: "#22D3EE", stat: "Final Risk", description: "Shows final risk score, final category, ML probability, VirusTotal reputation, and safe guidance." },
+      { icon: GitBranch, title: "History", badge: "Tracking", color: "#818CF8", stat: "Per User", description: "Uses saved scan history for the logged-in user so the chatbot can explain real recent URL checks." },
+      { icon: MessageSquare, title: "Module Scope", badge: "Phishing", color: "#34D399", stat: "Safe Context", description: "Answers from safe scan metadata only, without exposing keys, cookies, tokens, or hidden configuration." },
     ],
     systems: [
       { label: "URL Validation", status: "Ready", color: "#FBBF24" },
       { label: "ML Scan", status: "Active", color: "#22D3EE" },
-      { label: "Risk Mapper", status: "Nominal", color: "#34D399" },
+      { label: "VirusTotal", status: "Enriched", color: "#34D399" },
       { label: "History Log", status: "Available", color: "#818CF8" },
     ],
   },
@@ -1120,13 +1127,13 @@ const MODULE_CONTEXT: Record<
   security_score: {
     panels: [
       { icon: BarChart3, title: "Overall Score", badge: "Posture", color: "#22D3EE", stat: "0-100", description: "Summarizes user security health across connected Sentinel AI modules." },
-      { icon: Layers, title: "Components", badge: "Weighted", color: "#818CF8", stat: "4 Areas", description: "Uses Password Checker, File Vault, Phishing Scanner, and Identity Leak evidence when available." },
+      { icon: Layers, title: "Components", badge: "Weighted", color: "#818CF8", stat: "Dynamic", description: "Uses the backend score payload, including Password Checker, File Vault, Phishing Scanner, Identity Leak, and any connected score components." },
       { icon: AlertTriangle, title: "Weakest Area", badge: "Priority", color: "#F59E0B", stat: "Focus", description: "Helps prioritize the module that needs attention first." },
       { icon: Zap, title: "Improvements", badge: "Actions", color: "#34D399", stat: "Guided", description: "Turns module health into practical remediation steps." },
     ],
     systems: [
       { label: "Score Engine", status: "Ready", color: "#22D3EE" },
-      { label: "Module Weights", status: "25% Each", color: "#818CF8" },
+      { label: "Module Weights", status: "Backend", color: "#818CF8" },
       { label: "Weakest Component", status: "Tracked", color: "#F59E0B" },
       { label: "Recommendations", status: "Active", color: "#34D399" },
     ],
@@ -1176,9 +1183,9 @@ function createInitialMessage(module: (typeof MODULE_OPTIONS)[number], applicati
 - Summarize how vault risks appear in Dashboard, Alerts, Monthly Reports, and PDF Export`,
     phishing: `You are now in **Phishing Scanner** mode.
 
-- Review suspicious email signals, sender trust, and URL indicators
-- Explain phishing reasoning in a clear investigation style
-- Help summarize whether a message looks safe, suspicious, or malicious`,
+- Explain real URL scan history when available
+- Interpret final risk score, final category, ML probability, and VirusTotal detections
+- Explain safe, suspicious, and dangerous URL handling without inventing scan results`,
     identity: `You are now in **Identity Leak Monitor** mode.
 
 - Review leaked accounts, breach exposure, and identity risk

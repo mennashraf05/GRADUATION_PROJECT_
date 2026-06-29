@@ -32,13 +32,22 @@ export interface DashboardPcapAlert {
   filename: string | null;
   created_at: string;
   relative_time: string;
-  source: "pcap";
+  source: "pcap" | "phishing";
   source_type?: string;
   attack_type?: string;
   protocol?: string;
   src_ip?: string;
   dst_ip?: string;
   user_id?: number;
+  url?: string | null;
+  domain?: string | null;
+  risk_score?: number;
+  final_category?: string | null;
+  final_risk_score?: number;
+  ml_probability?: number | string | null;
+  virustotal_malicious?: number;
+  virustotal_suspicious?: number;
+  metadata?: RawRecord;
 }
 
 type RawRecord = Record<string, unknown>;
@@ -375,6 +384,29 @@ function deriveAlertType(rawType: unknown, raw: RawRecord): DashboardPcapAlertTy
   return hasSummarySignals ? "analysis_result" : "pcap_alert";
 }
 
+function isPhishingAlertRecord(raw: RawRecord): boolean {
+  const metadata = toOptionalObject(raw.metadata);
+  const values = [
+    raw.source,
+    raw.source_type,
+    raw.risk_label,
+    raw.module,
+    raw.source_module,
+    metadata?.module,
+    metadata?.module_key,
+    metadata?.source_module,
+  ]
+    .map((value) => String(value ?? "").trim().toLowerCase())
+    .filter(Boolean);
+
+  return values.some(
+    (value) =>
+      value === "phishing" ||
+      value === "phishing_scanner" ||
+      value === "phishing scanner"
+  );
+}
+
 function buildDetailTitle(attackType: string, severity: AlertSeverity): string {
   const label = humanizeIndicatorLabel(attackType);
   if (severity === "critical") {
@@ -571,6 +603,10 @@ export function normalizeDashboardPcapAlert(
 
   const userId = toOptionalInt(raw.user_id);
 
+  const metadata = toOptionalObject(raw.metadata);
+  const sourceType = firstText(raw.source_type);
+  const phishingRecord = isPhishingAlertRecord(raw);
+
   return {
     id:
       firstText(raw.id) ||
@@ -588,13 +624,22 @@ export function normalizeDashboardPcapAlert(
     filename: filename || null,
     created_at: createdAt,
     relative_time: firstText(raw.relative_time) || formatRelativeTime(createdAt),
-    source: "pcap",
-    source_type: firstText(raw.source_type),
+    source: phishingRecord ? "phishing" : "pcap",
+    source_type: phishingRecord ? "phishing_scanner" : sourceType,
     attack_type: attackType,
     protocol,
     src_ip: srcIp,
     dst_ip: dstIp,
     user_id: userId && userId > 0 ? userId : undefined,
+    url: firstText(raw.url, metadata?.url) || null,
+    domain: firstText(raw.domain, metadata?.domain) || null,
+    risk_score: toOptionalInt(raw.risk_score ?? metadata?.risk_score),
+    final_category: firstText(raw.final_category, metadata?.final_category) || null,
+    final_risk_score: toOptionalInt(raw.final_risk_score ?? metadata?.final_risk_score),
+    ml_probability: raw.ml_probability ?? metadata?.ml_probability ?? null,
+    virustotal_malicious: toOptionalInt(raw.virustotal_malicious ?? metadata?.virustotal_malicious),
+    virustotal_suspicious: toOptionalInt(raw.virustotal_suspicious ?? metadata?.virustotal_suspicious),
+    metadata,
   };
 }
 

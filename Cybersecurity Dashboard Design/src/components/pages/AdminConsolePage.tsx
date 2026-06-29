@@ -970,24 +970,27 @@ const AdminConsolePage: React.FC = () => {
       : [],
   });
 
+  const normalizeThreatSourceModule = (value: unknown): Alert['sourceModule'] => {
+    const normalized = String(value || '').trim().toLowerCase().replace(/[_-]+/g, ' ');
+    if (normalized === 'pcap' || normalized === 'pcap analyzer') return 'PCAP Analyzer';
+    if (normalized === 'phishing' || normalized === 'phishing scanner' || normalized === 'phishing scan') return 'Phishing Scanner';
+    if (normalized === 'password' || normalized === 'password checker') return 'Password Checker';
+    if (normalized === 'file vault' || normalized === 'vault' || normalized === 'encrypted file vault') return 'File Vault';
+    if (normalized === 'identity' || normalized === 'identity leak' || normalized === 'identity leak monitor') return 'Identity Leak Monitor';
+    return 'Other/Unknown';
+  };
+
   const mapThreatAlert = (payload: any): Alert => {
     const severity = String(payload?.severity ?? '').trim().toLowerCase();
+    const sourceModule = normalizeThreatSourceModule(
+      payload?.source_module || payload?.module || payload?.source_type || payload?.source,
+    );
 
     return {
       id: String(payload?.id ?? ''),
       title: sanitizeAdminThreatText(payload?.title, 'Security alert'),
       description: sanitizeAdminThreatText(payload?.description ?? payload?.message, ''),
-      sourceModule: payload?.source_module === 'PCAP Analyzer'
-        ? 'PCAP Analyzer'
-        : payload?.source_module === 'Phishing Scanner'
-          ? 'Phishing Scanner'
-          : payload?.source_module === 'Password Checker'
-          ? 'Password Checker'
-          : payload?.source_module === 'File Vault'
-            ? 'File Vault'
-            : payload?.source_module === 'Identity Leak Monitor'
-              ? 'Identity Leak Monitor'
-              : 'Other/Unknown',
+      sourceModule,
       affectedUserName: String(payload?.affected_user_name ?? 'Unknown user'),
       affectedUserEmail: String(payload?.masked_user_identifier || maskEmail(payload?.affected_user_email)),
       severity: severity === 'critical'
@@ -1016,7 +1019,7 @@ const AdminConsolePage: React.FC = () => {
         : [],
       evidenceAvailable: Boolean(payload?.evidence_available ?? true),
       threatDetected: Boolean(payload?.threat_detected ?? (
-        payload?.source_module === 'PCAP Analyzer'
+        sourceModule === 'PCAP Analyzer'
           ? severity === 'critical' || severity === 'high'
           : true
       )),
@@ -2690,8 +2693,6 @@ const AdminConsolePage: React.FC = () => {
                         <SelectContent className="bg-[#1E293B] border-white/10">
                           <SelectItem value="all">All Statuses</SelectItem>
                           <SelectItem value="New">New</SelectItem>
-                          <SelectItem value="Acknowledged">Acknowledged</SelectItem>
-                          <SelectItem value="False Positive">False Positive</SelectItem>
                         </SelectContent>
                       </Select>
                       <Select value={threatModuleFilter} onValueChange={setThreatModuleFilter}>

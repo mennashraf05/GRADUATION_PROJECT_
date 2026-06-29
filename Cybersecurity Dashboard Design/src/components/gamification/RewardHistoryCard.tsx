@@ -10,6 +10,7 @@ import { useLanguage } from "../../contexts/LanguageContext";
 
 function historyModuleLabel(item: GamificationHistoryItem): string | null {
   const text = `${item.event_type || ""} ${item.human_readable_reason || ""}`.toLowerCase();
+  if (text.includes("phishing")) return "Phishing";
   if (text.includes("password")) return "Password";
   if (text.includes("identity")) return "Identity";
   if (text.includes("pcap") || text.includes("alert") || text.includes("evidence") || text.includes("report")) return "PCAP";

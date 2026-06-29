@@ -46,6 +46,9 @@ type ReportSummary = {
   latest_identity_alert_count?: number;
   latest_identity_confirmed_breach_count?: number;
   latest_identity_risky_asset_count?: number;
+  latest_phishing_scan_count?: number;
+  latest_phishing_risky_url_count?: number;
+  latest_phishing_dangerous_url_count?: number;
 };
 
 type PcapThreatType = {
@@ -129,6 +132,33 @@ type IdentitySection = {
   category_summary?: IdentitySummaryMap;
   recent_alerts?: IdentityAlertItem[];
   recent_high_risk_scans?: IdentityHighRiskScan[];
+  recommendations?: string[];
+};
+
+type PhishingScanItem = {
+  scan_id?: number | string | null;
+  url?: string;
+  domain?: string;
+  final_category?: string;
+  final_risk_score?: number;
+  ml_probability?: number | string | null;
+  virustotal_malicious?: number;
+  virustotal_suspicious?: number;
+  timestamp?: string;
+};
+
+type PhishingSection = {
+  total_phishing_scans?: number;
+  safe_urls?: number;
+  suspicious_urls?: number;
+  dangerous_urls?: number;
+  risky_urls?: number;
+  highest_risk_url?: PhishingScanItem | null;
+  average_phishing_risk_score?: number;
+  virustotal_malicious_total?: number;
+  virustotal_suspicious_total?: number;
+  latest_scans?: PhishingScanItem[];
+  analyst_summary?: string;
   recommendations?: string[];
 };
 
@@ -801,6 +831,10 @@ export function MonthlyReportsPage() {
     | IdentitySection
     | undefined;
 
+  const phishingSection = selectedReport?.payload?.sections?.phishing as
+    | PhishingSection
+    | undefined;
+
   const passwordSection =
     (selectedReport?.payload?.password_checker_summary as
       | PasswordCheckerSummary
@@ -812,7 +846,7 @@ export function MonthlyReportsPage() {
   const activeCoverage =
     latest?.available_sections && latest.available_sections.length > 0
       ? latest.available_sections.join(" / ")
-      : "pcap / vault / identity";
+      : "pcap / vault / identity / phishing";
 
   const heroCards = useMemo(
     () => [
@@ -881,6 +915,24 @@ export function MonthlyReportsPage() {
         title: "Risky Assets",
         value: latest?.latest_identity_risky_asset_count ?? 0,
         note: "Monitored identity assets needing attention",
+      },
+      {
+        icon: Eye,
+        title: "Phishing Scans",
+        value: latest?.latest_phishing_scan_count ?? 0,
+        note: "Phishing Scanner activity captured in this cycle",
+      },
+      {
+        icon: AlertTriangle,
+        title: "Risky URLs",
+        value: latest?.latest_phishing_risky_url_count ?? 0,
+        note: "Suspicious plus dangerous phishing scan results",
+      },
+      {
+        icon: Shield,
+        title: "Dangerous URLs",
+        value: latest?.latest_phishing_dangerous_url_count ?? 0,
+        note: "Dangerous phishing URLs in the latest report",
       },
     ],
     [latest]
@@ -1555,6 +1607,105 @@ export function MonthlyReportsPage() {
                 </section>
               )}
 
+              {phishingSection ? (
+                <section className="mr-sheet-card mr-sheet-card-strong">
+                  <div className="mr-sheet-heading">
+                    <AlertTriangle className="mr-sheet-heading-icon" />
+                    <p className="mr-sheet-section-title">
+                      Phishing Scanner Activity
+                    </p>
+                  </div>
+
+                  <div className="mr-sheet-stats-grid">
+                    <div className="mr-sheet-mini-card">
+                      <p className="mr-sheet-kicker">Total Scans</p>
+                      <p className="mr-sheet-mini-value">
+                        {phishingSection.total_phishing_scans ?? 0}
+                      </p>
+                    </div>
+                    <div className="mr-sheet-mini-card">
+                      <p className="mr-sheet-kicker">Safe URLs</p>
+                      <p className="mr-sheet-mini-value">
+                        {phishingSection.safe_urls ?? 0}
+                      </p>
+                    </div>
+                    <div className="mr-sheet-mini-card">
+                      <p className="mr-sheet-kicker">Suspicious URLs</p>
+                      <p className="mr-sheet-mini-value">
+                        {phishingSection.suspicious_urls ?? 0}
+                      </p>
+                    </div>
+                    <div className="mr-sheet-mini-card">
+                      <p className="mr-sheet-kicker">Dangerous URLs</p>
+                      <p className="mr-sheet-mini-value">
+                        {phishingSection.dangerous_urls ?? 0}
+                      </p>
+                    </div>
+                    <div className="mr-sheet-mini-card">
+                      <p className="mr-sheet-kicker">Average Risk</p>
+                      <p className="mr-sheet-mini-value">
+                        {phishingSection.average_phishing_risk_score ?? 0}
+                      </p>
+                    </div>
+                    <div className="mr-sheet-mini-card">
+                      <p className="mr-sheet-kicker">VT Malicious / Suspicious</p>
+                      <p className="mr-sheet-mini-value">
+                        {phishingSection.virustotal_malicious_total ?? 0} / {phishingSection.virustotal_suspicious_total ?? 0}
+                      </p>
+                    </div>
+                  </div>
+
+                  {phishingSection.highest_risk_url ? (
+                    <div className="mr-sheet-group">
+                      <p className="mr-sheet-subtitle">Highest Risk URL</p>
+                      <div className="mr-sheet-list">
+                        <div className="mr-sheet-list-item">
+                          {phishingSection.highest_risk_url.domain || phishingSection.highest_risk_url.url || "Unknown URL"} - {humanize(phishingSection.highest_risk_url.final_category)} ({phishingSection.highest_risk_url.final_risk_score ?? 0})
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  <div className="mr-sheet-group">
+                    <p className="mr-sheet-subtitle">Analyst Summary</p>
+                    <p className="mr-sheet-muted">
+                      {phishingSection.analyst_summary || "No phishing scans were recorded during this cycle."}
+                    </p>
+                  </div>
+
+                  <div className="mr-sheet-group">
+                    <p className="mr-sheet-subtitle">Latest Phishing Scans</p>
+                    <div className="mr-sheet-list">
+                      {(phishingSection.latest_scans || []).length > 0 ? (
+                        phishingSection.latest_scans?.map((scan, index) => (
+                          <div
+                            key={`${scan.scan_id || scan.timestamp || "phishing"}-${index}`}
+                            className="mr-sheet-list-item"
+                          >
+                            #{scan.scan_id ?? "-"} - {scan.domain || scan.url || "Unknown URL"} - {humanize(scan.final_category)} ({scan.final_risk_score ?? 0})
+                          </div>
+                        ))
+                      ) : (
+                        <div className="mr-sheet-list-item mr-sheet-muted-box">
+                          No phishing scans were recorded during this cycle.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="mr-sheet-group">
+                    <p className="mr-sheet-subtitle">Recommendations</p>
+                    <div className="mr-sheet-list">
+                      {(phishingSection.recommendations || []).map((item) => (
+                        <div key={item} className="mr-sheet-list-item">
+                          {item}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </section>
+              ) : null}
+
               {passwordSection ? (
                 <section className="mr-sheet-card mr-sheet-card-strong">
                   <div className="mr-sheet-heading">
@@ -1663,7 +1814,7 @@ export function MonthlyReportsPage() {
                 </section>
               ) : null}
 
-              {!pcapSection && !vaultSection && !identitySection && !passwordSection ? (
+              {!pcapSection && !vaultSection && !identitySection && !phishingSection && !passwordSection ? (
                 <section className="mr-sheet-card">
                   <div className="mr-sheet-heading">
                     <HardDrive className="mr-sheet-heading-icon" />

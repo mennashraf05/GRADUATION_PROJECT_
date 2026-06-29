@@ -199,6 +199,7 @@ def check_password():
         app_module = _app_module()
         PasswordCheck = app_module.PasswordCheck
         db = app_module.db
+        created_notifications = []
 
         record = PasswordCheck(
             user_id=int(user.id),
@@ -215,14 +216,15 @@ def check_password():
         notify_password_check = getattr(app_module, "process_password_check_notifications", None)
         if callable(notify_password_check):
             try:
-                notify_password_check(user, record)
+                created_notifications = notify_password_check(user, record) or []
             except Exception:
                 logging.exception("Failed to create password security notification")
 
         create_password_alert = getattr(app_module, "create_password_checker_security_alert", None)
+        password_security_alert = None
         if callable(create_password_alert):
             try:
-                create_password_alert(user, record)
+                password_security_alert = create_password_alert(user, record)
             except Exception:
                 logging.exception("Failed to create password checker security alert")
 
@@ -243,6 +245,31 @@ def check_password():
         logging.exception("Failed to save password check metadata")
         return jsonify({"status": "error", "message": "Could not save password check history."}), 500
 
+    is_risky_password = bool(count > 0 or score <= 1)
+    email_alert_sent = any(
+        bool(getattr(notification, "_email_side_effect_sent", False))
+        for notification in created_notifications
+    )
+    admin_email_alert_sent = bool(getattr(password_security_alert, "_admin_email_alert_sent", False))
+    admin_email_alert_reason = str(
+        getattr(password_security_alert, "_admin_email_alert_reason", "")
+        or ("safe_or_not_high_risk" if not is_risky_password else "admin_alert_not_attempted")
+    )
+    email_alert_reason = "safe_password_no_email"
+    if is_risky_password:
+        if email_alert_sent:
+            email_alert_reason = "sent"
+        elif created_notifications:
+            email_alert_reason = str(
+                getattr(
+                    created_notifications[0],
+                    "_email_side_effect_reason",
+                    "email_not_sent",
+                )
+            )
+        else:
+            email_alert_reason = "notification_not_created"
+
     return (
         jsonify(
             {
@@ -252,6 +279,10 @@ def check_password():
                 "strength_label": strength_label,
                 "score": score,
                 "history_item": history_item,
+                "email_alert_sent": email_alert_sent,
+                "email_alert_reason": email_alert_reason,
+                "admin_email_alert_sent": admin_email_alert_sent,
+                "admin_email_alert_reason": admin_email_alert_reason,
             }
         ),
         200,

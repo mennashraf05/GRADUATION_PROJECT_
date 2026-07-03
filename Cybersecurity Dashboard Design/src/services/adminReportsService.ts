@@ -436,59 +436,17 @@ export interface ReportExportResult {
   fallback: boolean;
 }
 
-const DEMO_NOW = "2026-04-25T00:39:49.000Z";
 const GENERATED_REPORTS_STORAGE_KEY = "sentinel_admin_generated_pcap_reports";
 
-const DEMO_RECENT_PCAP_REPORTS: RecentPcapReport[] = [
-  {
-    id: "demo-pcap-report-001",
-    file_name: "office_traffic_24may.pcap",
-    job_id: "JOB-2026-0542",
-    status: "completed",
-    risk_level: "critical",
-    detected_attack_family: "C2 Activity",
-    analysis_mode: "Hybrid",
-    generated_at: DEMO_NOW,
-    report_available: true,
-    evidence_available: true,
-  },
-  {
-    id: "demo-pcap-report-002",
-    file_name: "network_capture_23may.pcap",
-    job_id: "JOB-2026-0541",
-    status: "completed",
-    risk_level: "high",
-    detected_attack_family: "Brute Force",
-    analysis_mode: "ML",
-    generated_at: "2026-04-24T21:18:00.000Z",
-    report_available: true,
-    evidence_available: true,
-  },
-  {
-    id: "demo-pcap-report-003",
-    file_name: "scan_attempts_23may.pcap",
-    job_id: "JOB-2026-0540",
-    status: "running",
-    risk_level: "medium",
-    detected_attack_family: "Port Scan",
-    analysis_mode: "Zeek-enriched",
-    generated_at: "2026-04-24T18:45:00.000Z",
-    report_available: false,
-    evidence_available: false,
-  },
-  {
-    id: "demo-pcap-report-004",
-    file_name: "web_traffic_22may.pcap",
-    job_id: "JOB-2026-0539",
-    status: "failed",
-    risk_level: "medium",
-    detected_attack_family: "Not classified",
-    analysis_mode: "Heuristics",
-    generated_at: "2026-04-23T08:17:00.000Z",
-    report_available: false,
-    evidence_available: false,
-  },
-];
+function isDemoPcapReport(report: RecentPcapReport): boolean {
+  const demoFileNames = new Set([
+    "office_traffic_24may.pcap",
+    "network_capture_23may.pcap",
+    "scan_attempts_23may.pcap",
+    "web_traffic_22may.pcap",
+  ]);
+  return report.id.startsWith("demo-pcap-report-") || demoFileNames.has(report.file_name);
+}
 
 function buildAdminJsonFetchInit(init: RequestInit = {}): RequestInit {
   const headers = new Headers(init.headers || undefined);
@@ -575,7 +533,7 @@ function readGeneratedReports(): RecentPcapReport[] {
   if (typeof window === "undefined") return [];
   try {
     const parsed = JSON.parse(window.localStorage.getItem(GENERATED_REPORTS_STORAGE_KEY) || "[]");
-    return Array.isArray(parsed) ? parsed : [];
+    return Array.isArray(parsed) ? parsed.filter((report) => !isDemoPcapReport(report)) : [];
   } catch {
     return [];
   }
@@ -583,7 +541,10 @@ function readGeneratedReports(): RecentPcapReport[] {
 
 function writeGeneratedReports(reports: RecentPcapReport[]) {
   if (typeof window === "undefined") return;
-  window.localStorage.setItem(GENERATED_REPORTS_STORAGE_KEY, JSON.stringify(reports.slice(0, 25)));
+  window.localStorage.setItem(
+    GENERATED_REPORTS_STORAGE_KEY,
+    JSON.stringify(reports.filter((report) => !isDemoPcapReport(report)).slice(0, 25))
+  );
 }
 
 function mergeGeneratedReports(reports: RecentPcapReport[]): RecentPcapReport[] {
@@ -642,22 +603,9 @@ async function loadPcapOverviewWithFallback(): Promise<{
     // Reports Center stays usable while backend reporting endpoints are being wired.
   }
 
-  const fallbackOverview = emptyAdminPcapOverview();
-  fallbackOverview.summary = {
-    total_uploaded_files: 4,
-    total_jobs: 4,
-    queued_jobs: 0,
-    running_jobs: 1,
-    completed_jobs: 2,
-    failed_jobs: 1,
-    average_processing_time_seconds: 42,
-    last_analysis_time: DEMO_NOW,
-  };
-  fallbackOverview.generated_at = DEMO_NOW;
-
   return {
-    overview: fallbackOverview,
-    reports: mergeGeneratedReports(DEMO_RECENT_PCAP_REPORTS),
+    overview: emptyAdminPcapOverview(),
+    reports: mergeGeneratedReports([]),
     usingFallback: true,
   };
 }
@@ -737,17 +685,6 @@ export async function generatePcapReport(
   filters?: Partial<PcapReportFilters>
 ): Promise<PcapReportSummary> {
   const { reports } = await getRecentPcapReports(filters);
-  const source = reports[0] || DEMO_RECENT_PCAP_REPORTS[0];
-  const timestamp = new Date().toISOString();
-  const generatedReport: RecentPcapReport = {
-    ...source,
-    id: `generated-pcap-report-${Date.now()}`,
-    job_id: source.job_id || `JOB-${Date.now()}`,
-    status: "completed",
-    generated_at: timestamp,
-    report_available: true,
-    evidence_available: source.evidence_available,
-  };
 
   try {
     const response = await fetch(
@@ -759,10 +696,23 @@ export async function generatePcapReport(
     );
     if (!response.ok) throw new Error("PCAP report generation endpoint is not connected.");
   } catch {
-    // The UI will communicate that backend generation is pending and keep using report-ready PCAP data.
+    if (reports.length === 0) {
+      throw new Error("No real PCAP analysis jobs are available to generate a report yet.");
+    }
+
+    const source = reports[0];
+    const generatedReport: RecentPcapReport = {
+      ...source,
+      id: `generated-pcap-report-${Date.now()}`,
+      job_id: source.job_id || `JOB-${Date.now()}`,
+      status: "completed",
+      generated_at: new Date().toISOString(),
+      report_available: true,
+      evidence_available: source.evidence_available,
+    };
+    writeGeneratedReports([generatedReport, ...readGeneratedReports()]);
   }
 
-  writeGeneratedReports([generatedReport, ...readGeneratedReports()]);
   return getPcapReportSummary();
 }
 
@@ -929,7 +879,10 @@ export async function exportPcapReport(
   }
 
   const { reports } = await getRecentPcapReports();
-  const report = reports.find((item) => item.id === reportId || item.job_id === reportId) || reports[0] || DEMO_RECENT_PCAP_REPORTS[0];
+  const report = reports.find((item) => item.id === reportId || item.job_id === reportId) || reports[0];
+  if (!report) {
+    throw new Error("No real PCAP report is available to export yet.");
+  }
   return {
     blob: buildPcapPdfBlob(report, reports),
     filename: fallbackName.endsWith(".pdf") ? fallbackName : `${fallbackName}.pdf`,

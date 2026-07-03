@@ -10,6 +10,8 @@ import { AboutPage } from "./components/pages/AboutPage";
 import { ContactPage } from "./components/pages/ContactPage";
 import { SignUpPage } from "./components/pages/SignUpPage";
 import LoginPage from "./components/pages/LoginPage";
+import ForgotPasswordPage from "./components/pages/ForgotPasswordPage";
+import ResetPasswordPage from "./components/pages/ResetPasswordPage";
 
 // Auth Pages
 import VerifyEmailPage from "./components/pages/VerifyEmailPage";
@@ -55,6 +57,8 @@ export default function App() {
         <Route path="/contact" element={<ContactPage />} />
         <Route path="/signup" element={<SignUpPage />} />
         <Route path="/login" element={<LoginPage />} />
+        <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+        <Route path="/reset-password" element={<ResetPasswordPage />} />
         <Route path="/emergency-locked" element={<EmergencyLockedPage />} />
 
         {/* ---------- AUTH FLOW ---------- */}

@@ -1318,7 +1318,7 @@ export default function ReportsExportCenterPage() {
       });
       if (showToast) toast.success("Reports refreshed");
       if (overviewResult.usingFallback || summaryResult.usingFallback || recentResult.usingFallback) {
-        toast.info("PCAP reporting backend is partially unavailable. Showing report-ready demo data.");
+        toast.info("PCAP reporting backend is unavailable or empty. No demo PCAP reports are shown.");
       }
     } catch (loadError) {
       if (requestId !== pcapReportRequestId.current) return;
@@ -1755,7 +1755,7 @@ export default function ReportsExportCenterPage() {
       await loadReports(appliedFilters);
       toast.success("PCAP report generated and added to Recent PCAP Reports");
       if (nextSummary.usingFallback) {
-        toast.info("Backend generation is not connected yet, so Sentinel created a report-ready local PCAP entry.");
+        toast.info("Backend generation is not connected yet. Reports will appear after a real PCAP analysis exists.");
       }
     } catch {
       toast.error(`${activeReportTitle} refresh failed safely.`);
@@ -1779,7 +1779,7 @@ export default function ReportsExportCenterPage() {
       downloadBlob(result.blob, result.filename);
       toast.success(`PCAP ${format.toUpperCase()} export ready`);
       if (result.fallback) {
-        toast.info("PCAP export service is not connected yet. Showing report-ready demo data.");
+        toast.info("PCAP export service is not connected yet. Exported from real local PCAP report data.");
       }
     } catch (exportError) {
       toast.info(
@@ -2449,7 +2449,7 @@ export default function ReportsExportCenterPage() {
       {usingFallback ? (
         <div className="reports-info">
           <Sparkles className="h-4 w-4" />
-          PCAP reporting is running with safe fallback data until every backend report endpoint is connected.
+          PCAP reporting is waiting for real analysis data. Demo PCAP report rows are hidden.
         </div>
       ) : null}
 
@@ -3925,7 +3925,7 @@ export default function ReportsExportCenterPage() {
           ) : reports.length === 0 ? (
             <div className="reports-empty-state">
               <FileSearch className="h-6 w-6" />
-              No PCAP reports match the current filters.
+              No real PCAP reports are available yet. Run a PCAP analysis to generate report rows.
             </div>
           ) : (
             <div className="reports-table-wrap">

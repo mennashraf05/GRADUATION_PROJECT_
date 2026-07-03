@@ -402,6 +402,14 @@ export default function LoginPage() {
                       {language === "arabic" ? "تذكرني" : "Remember me"}
                     </label>
                   </div>
+                  <button
+                    type="button"
+                    onClick={() => navigate("/forgot-password")}
+                    className="text-sm text-[#64FFDA] hover:text-[#3B82F6] transition-colors duration-200 disabled:opacity-60"
+                    disabled={isLoading}
+                  >
+                    {language === "arabic" ? "Forgot Password?" : "Forgot Password?"}
+                  </button>
                 </div>
 
                 {/* SUBMIT */}

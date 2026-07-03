@@ -205,11 +205,13 @@ BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT_DIR = BASE_DIR.parent
 FRONTEND_DIR = PROJECT_ROOT_DIR / "Cybersecurity Dashboard Design"
 BACKEND_ENV_PATH = BASE_DIR / ".env"
+ROOT_ENV_PATH = PROJECT_ROOT_DIR / ".env"
 FRONTEND_ENV_PATH = FRONTEND_DIR / ".env"
 
 
 def _load_project_env_files() -> None:
     env_paths = [
+        (ROOT_ENV_PATH, True),
         (BACKEND_ENV_PATH, True),
         (FRONTEND_ENV_PATH, False),
     ]
@@ -295,9 +297,9 @@ EMAIL_NOTIFICATIONS_ENABLED = str(os.getenv("EMAIL_NOTIFICATIONS_ENABLED") or ""
 SMTP_HOST = str(os.getenv("SMTP_HOST") or "").strip()
 SMTP_PORT = _env_positive_int("SMTP_PORT", 587)
 SMTP_USE_TLS = str(os.getenv("SMTP_USE_TLS") or "").strip().lower() == "true"
-SMTP_USERNAME = str(os.getenv("SMTP_USERNAME") or "").strip()
-SMTP_PASSWORD = str(os.getenv("SMTP_PASSWORD") or "").strip()
-SMTP_FROM_EMAIL = str(os.getenv("SMTP_FROM_EMAIL") or "").strip()
+SMTP_USERNAME = str(os.getenv("SMTP_USERNAME") or os.getenv("SMTP_USER") or "").strip()
+SMTP_PASSWORD = str(os.getenv("SMTP_PASSWORD") or os.getenv("SMTP_PASS") or "").strip()
+SMTP_FROM_EMAIL = str(os.getenv("SMTP_FROM_EMAIL") or os.getenv("SMTP_FROM") or "").strip()
 SMTP_FROM_NAME = str(os.getenv("SMTP_FROM_NAME") or "Sentinel AI").strip() or "Sentinel AI"
 SMTP_TIMEOUT_SECONDS = _env_positive_int("SMTP_TIMEOUT_SECONDS", 10)
 
@@ -6348,6 +6350,27 @@ class User(db.Model):
     last_login_at = db.Column(db.DateTime, nullable=True)
 
 
+class PasswordResetToken(db.Model):
+    __tablename__ = "password_reset_tokens"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    token_hash = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    expires_at = db.Column(db.DateTime, nullable=False, index=True)
+    used_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(
+        db.DateTime, nullable=False, default=lambda: datetime.now(UTC)
+    )
+    updated_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+    user = db.relationship("User", backref=db.backref("password_reset_tokens", lazy=True))
+
+
 class PasswordHistory(db.Model):
     __tablename__ = "password_history"
 
@@ -10849,6 +10872,47 @@ def _ensure_auth_security_schema_initialized() -> None:
         except Exception:
             db.session.rollback()
             logging.exception("Failed to ensure password checks schema")
+            raise
+
+        try:
+            db.session.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL,
+                        token_hash VARCHAR(64) NOT NULL UNIQUE,
+                        expires_at DATETIME NOT NULL,
+                        used_at DATETIME,
+                        created_at DATETIME NOT NULL,
+                        updated_at DATETIME NOT NULL,
+                        FOREIGN KEY(user_id) REFERENCES user (id)
+                    )
+                    """
+                )
+            )
+            db.session.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_password_reset_tokens_user_id "
+                    "ON password_reset_tokens (user_id)"
+                )
+            )
+            db.session.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_password_reset_tokens_token_hash "
+                    "ON password_reset_tokens (token_hash)"
+                )
+            )
+            db.session.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_password_reset_tokens_expires_at "
+                    "ON password_reset_tokens (expires_at)"
+                )
+            )
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            logging.exception("Failed to ensure password reset token schema")
             raise
 
         if inspector.has_table(User.__tablename__):
@@ -15920,6 +15984,163 @@ def _is_valid_linked_account_email(value: str | None) -> bool:
     )
 
 
+PASSWORD_RESET_GENERIC_MESSAGE = "If this email exists, a password reset link has been sent."
+PASSWORD_RESET_SUCCESS_MESSAGE = "Password reset successfully. You can now sign in."
+PASSWORD_RESET_INVALID_MESSAGE = "This reset link is invalid or has expired. Please request a new one."
+PASSWORD_RESET_EXPIRE_MINUTES = 30
+
+
+def _password_reset_token_hash(token: str | None) -> str:
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+
+def _invalidate_unused_password_reset_tokens(user_id: int) -> int:
+    now = datetime.now(UTC)
+    updated = (
+        PasswordResetToken.query.filter_by(user_id=int(user_id), used_at=None)
+        .update({"used_at": now, "updated_at": now}, synchronize_session=False)
+    )
+    return int(updated or 0)
+
+
+def _password_reset_frontend_base_url() -> str:
+    configured = (
+        str(os.getenv("APP_FRONTEND_URL") or "").strip()
+        or str(FRONTEND_BASE_URL or "").strip()
+        or "http://localhost:5173"
+    )
+    return configured.rstrip("/")
+
+
+def _password_reset_smtp_configured() -> bool:
+    return bool(SMTP_HOST and SMTP_PORT and SMTP_USERNAME and SMTP_PASSWORD and SMTP_FROM_EMAIL)
+
+
+def _build_password_reset_email_bodies(reset_link: str) -> tuple[str, str]:
+    safe_link = escape(reset_link)
+    text_body = f"""
+Hello,
+
+A password reset was requested for your Sentinel AI account.
+
+Use this secure link to create a new password:
+{reset_link}
+
+This link expires in 30 minutes and can only be used once.
+
+If you did not request this reset, you can ignore this email and your password will stay unchanged.
+
+Sentinel AI
+""".strip()
+
+    html_body = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Reset your Sentinel AI password</title>
+</head>
+<body style="margin:0;padding:0;background:#020817;font-family:Arial,Helvetica,sans-serif;color:#e2e8f0;">
+  <table role="presentation" style="width:100%;border-collapse:collapse;background:#020817;">
+    <tr>
+      <td style="padding:32px 18px;">
+        <table role="presentation" style="width:100%;max-width:620px;margin:0 auto;background:#071426;border:1px solid rgba(56,189,248,0.2);border-radius:20px;overflow:hidden;">
+          <tr>
+            <td style="padding:30px 32px;background:linear-gradient(135deg,#0f172a 0%,#1d4ed8 58%,#22d3ee 100%);">
+              <div style="font-size:13px;letter-spacing:0.16em;text-transform:uppercase;color:#bae6fd;">Sentinel AI</div>
+              <h1 style="margin:12px 0 0;color:#ffffff;font-size:28px;line-height:1.2;">Reset your password</h1>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:30px 32px;">
+              <p style="margin:0 0 16px;color:#dbeafe;font-size:16px;line-height:1.7;">Hello,</p>
+              <p style="margin:0 0 22px;color:#cbd5e1;font-size:16px;line-height:1.7;">
+                A password reset was requested for your Sentinel AI account.
+              </p>
+              <table role="presentation" style="width:100%;margin:26px 0;">
+                <tr>
+                  <td style="text-align:center;">
+                    <a href="{safe_link}" style="display:inline-block;padding:14px 28px;border-radius:12px;background:linear-gradient(135deg,#2563eb 0%,#22d3ee 100%);color:#020817;text-decoration:none;font-size:16px;font-weight:800;">
+                      Create New Password
+                    </a>
+                  </td>
+                </tr>
+              </table>
+              <div style="border-radius:14px;background:#082f49;border:1px solid rgba(56,189,248,0.28);padding:16px 18px;color:#e0f2fe;font-size:14px;line-height:1.65;">
+                This link expires in 30 minutes and can only be used once.
+              </div>
+              <p style="margin:22px 0 0;color:#94a3b8;font-size:13px;line-height:1.7;word-break:break-word;">
+                If the button does not open, copy and paste this link into your browser:<br>
+                <a href="{safe_link}" style="color:#38bdf8;text-decoration:none;">{safe_link}</a>
+              </p>
+              <p style="margin:22px 0 0;color:#94a3b8;font-size:13px;line-height:1.7;">
+                If you did not request this reset, ignore this email and your password will stay unchanged.
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+""".strip()
+    return text_body, html_body
+
+
+def send_password_reset_email(user: User, token: str) -> bool:
+    email = _normalize_linked_account_email(getattr(user, "email", ""))
+    if not email:
+        return False
+
+    reset_link = f"{_password_reset_frontend_base_url()}/reset-password?token={quote(token)}"
+    text_body, html_body = _build_password_reset_email_bodies(reset_link)
+    subject = "Reset your Sentinel AI password"
+
+    try:
+        if _password_reset_smtp_configured():
+            safe_from_name = re.sub(r"[\r\n<>]+", "", SMTP_FROM_NAME).strip()[:80] or "Sentinel AI"
+            safe_from_email = re.sub(r"[\r\n]+", "", SMTP_FROM_EMAIL).strip()
+            safe_recipient = re.sub(r"[\r\n]+", "", email).strip()
+
+            message = MIMEMultipart("alternative")
+            message["Subject"] = subject
+            message["From"] = f"{safe_from_name} <{safe_from_email}>"
+            message["To"] = safe_recipient
+            message.attach(MIMEText(text_body, "plain", "utf-8"))
+            message.attach(MIMEText(html_body, "html", "utf-8"))
+
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as server:
+                if SMTP_USE_TLS:
+                    server.starttls()
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+                server.sendmail(safe_from_email, [safe_recipient], message.as_string())
+            logging.warning("[PasswordReset] reset email sent | recipient=%s", mask_email(email))
+            return True
+
+        if _mail_is_configured():
+            send_email(email, subject, html_body, text_body)
+            logging.warning("[PasswordReset] reset email sent via MAIL_* fallback | recipient=%s", mask_email(email))
+            return True
+    except Exception as exc:
+        logging.exception(
+            "[PasswordReset] reset email delivery failed | recipient=%s | error=%s",
+            mask_email(email),
+            _friendly_smtp_error(exc),
+        )
+        if app.debug or str(os.getenv("FLASK_ENV") or "").strip().lower() == "development":
+            logging.warning("[PasswordReset] development fallback reset link for %s: %s", mask_email(email), reset_link)
+            return False
+        raise
+
+    if app.debug or str(os.getenv("FLASK_ENV") or "").strip().lower() == "development":
+        logging.warning("[PasswordReset] SMTP not configured. Local reset link for %s: %s", mask_email(email), reset_link)
+        return False
+
+    raise RuntimeError("Password reset email is not configured for production.")
+
+
 def _normalize_linked_account_type(value: str | None) -> Optional[str]:
     normalized = str(value or "").strip().lower()
     if normalized in VALID_LINKED_ACCOUNT_TYPES:
@@ -17725,6 +17946,142 @@ def signup():
         ),
         201,
     )
+
+
+@app.route("/api/auth/forgot-password", methods=["POST"])
+@limiter.limit(lambda: _rate_limit_value("RATELIMIT_FORGOT_PASSWORD", "5 per minute;20 per hour"), key_func=get_remote_address)
+def forgot_password():
+    data = request.get_json(silent=True) or {}
+    email = _normalize_linked_account_email(data.get("email", ""))
+
+    # The response intentionally stays generic for every valid request shape.
+    generic_response = jsonify({"success": True, "message": PASSWORD_RESET_GENERIC_MESSAGE})
+
+    if not email or not _is_valid_linked_account_email(email):
+        return jsonify({"success": False, "message": "Please enter a valid email address."}), 400
+
+    try:
+        user, _ = _resolve_login_user_and_account(email)
+        if user is None:
+            logging.warning(
+                "[PasswordReset] forgot-password requested | user_found=false | email=%s | smtp_configured=%s",
+                mask_email(email),
+                bool(_password_reset_smtp_configured() or _mail_is_configured()),
+            )
+            return generic_response, 200
+
+        now = datetime.now(UTC)
+        plain_token = secrets.token_urlsafe(48)
+        token_hash = _password_reset_token_hash(plain_token)
+
+        _invalidate_unused_password_reset_tokens(user.id)
+        db.session.add(
+            PasswordResetToken(
+                user_id=int(user.id),
+                token_hash=token_hash,
+                expires_at=now + timedelta(minutes=PASSWORD_RESET_EXPIRE_MINUTES),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        db.session.commit()
+
+        try:
+            email_sent = send_password_reset_email(user, plain_token)
+            logging.warning(
+                "[PasswordReset] forgot-password processed | user_found=true | user_id=%s | email=%s | email_sent=%s | smtp_configured=%s",
+                getattr(user, "id", None),
+                mask_email(getattr(user, "email", "")),
+                bool(email_sent),
+                bool(_password_reset_smtp_configured() or _mail_is_configured()),
+            )
+        except Exception:
+            logging.exception("Failed to send password reset email safely | user_id=%s", user.id)
+
+        return generic_response, 200
+    except Exception:
+        db.session.rollback()
+        logging.exception("Password reset request failed")
+        return jsonify({"success": False, "message": "Unable to process password reset right now. Please try again later."}), 500
+
+
+@app.route("/api/auth/reset-password", methods=["POST"])
+@limiter.limit(lambda: _rate_limit_value("RATELIMIT_RESET_PASSWORD", "5 per minute;20 per hour"), key_func=get_remote_address)
+def reset_password():
+    data = request.get_json(silent=True) or {}
+    token = str(data.get("token") or "").strip()
+    new_password = str(data.get("newPassword") or data.get("password") or "")
+    confirm_password = str(data.get("confirmPassword") or "")
+
+    if not token:
+        return jsonify({"success": False, "message": PASSWORD_RESET_INVALID_MESSAGE}), 400
+    if not new_password or not confirm_password:
+        return jsonify({"success": False, "message": "New password and confirmation are required."}), 400
+    if new_password != confirm_password:
+        return jsonify({"success": False, "message": "Passwords do not match."}), 400
+
+    password_policy_error = _validate_password_against_admin_policy(new_password)
+    if password_policy_error:
+        return jsonify({"success": False, "message": password_policy_error}), 400
+
+    try:
+        now = datetime.now(UTC)
+        token_hash = _password_reset_token_hash(token)
+        reset_token = PasswordResetToken.query.filter_by(token_hash=token_hash).first()
+
+        if reset_token is None or reset_token.used_at is not None:
+            return jsonify({"success": False, "message": PASSWORD_RESET_INVALID_MESSAGE}), 400
+
+        expires_at = _as_utc_datetime(reset_token.expires_at)
+        if expires_at is None or expires_at < now:
+            reset_token.used_at = now
+            reset_token.updated_at = now
+            db.session.commit()
+            return jsonify({"success": False, "message": PASSWORD_RESET_INVALID_MESSAGE}), 400
+
+        user = User.query.get(int(reset_token.user_id))
+        if user is None:
+            reset_token.used_at = now
+            reset_token.updated_at = now
+            db.session.commit()
+            return jsonify({"success": False, "message": PASSWORD_RESET_INVALID_MESSAGE}), 400
+
+        if check_password_hash(user.password_hash, new_password):
+            return jsonify({"success": False, "message": "New password must be different from the old password."}), 400
+
+        user.password_hash = generate_password_hash(new_password)
+        user.session_version = _get_user_session_version(user) + 1
+        user.updated_at = now
+        reset_token.used_at = now
+        reset_token.updated_at = now
+        _invalidate_unused_password_reset_tokens(user.id)
+        RefreshToken.query.filter_by(user_id=int(user.id)).delete(synchronize_session=False)
+        db.session.commit()
+
+        try:
+            log_user_event(
+                user_id=user.id,
+                module=MODULE_AUTH,
+                action_type="password_changed",
+                title=USER_ACTIVITY_LABELS.get("password_changed", "Password changed"),
+                description="Account password was reset using a password reset link.",
+                status=STATUS_SUCCESS,
+                severity=SEVERITY_MEDIUM,
+                is_sensitive=True,
+                target_type="account",
+                target_id=str(user.id),
+                target_label=str(user.email or "").strip() or "Account",
+                metadata_json={"method": "forgot_password"},
+                commit=True,
+            )
+        except Exception:
+            logging.exception("Failed to record password reset activity | user_id=%s", user.id)
+
+        return jsonify({"success": True, "message": PASSWORD_RESET_SUCCESS_MESSAGE}), 200
+    except Exception:
+        db.session.rollback()
+        logging.exception("Password reset failed")
+        return jsonify({"success": False, "message": "Unable to reset password right now. Please try again later."}), 500
 
 
 @app.route("/api/auth/login", methods=["POST"])
@@ -32493,6 +32850,8 @@ def _apply_route_specific_rate_limits() -> None:
         ("refresh", "RATELIMIT_REFRESH", "30 per minute", user),
         ("logout", "RATELIMIT_LOGOUT", "30 per minute", user),
         ("verify_email", "RATELIMIT_EMAIL_VERIFY", "3 per minute;10 per hour", ip),
+        ("forgot_password", "RATELIMIT_FORGOT_PASSWORD", "5 per minute;20 per hour", ip),
+        ("reset_password", "RATELIMIT_RESET_PASSWORD", "5 per minute;20 per hour", ip),
         ("verify_2fa_login", "RATELIMIT_AUTH_2FA", "5 per minute;20 per hour", ip),
         ("verify_2fa", "RATELIMIT_AUTH_2FA", "5 per minute;20 per hour", ip),
         ("setup_2fa", "RATELIMIT_AUTH_2FA", "5 per minute;20 per hour", ip),

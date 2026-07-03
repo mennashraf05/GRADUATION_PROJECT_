@@ -6,6 +6,7 @@ services:
     image: sentinel-ai-backend:local
     env_file:
       - .env
+      - Backend/.env
     ports:
       - "5000:5000"
     environment:
@@ -36,7 +37,7 @@ services:
       context: .
       dockerfile: Dockerfile.frontend
       args:
-        VITE_API_BASE_URL: https://localhost:5000
+        VITE_API_BASE_URL: https://localhost:8081
         VITE_SUPPORT_EMAIL: ${VITE_SUPPORT_EMAIL:-support@example.com}
     image: sentinel-ai-frontend:local
     ports:

@@ -12,6 +12,7 @@ services:
     environment:
       PCAP_RUN_FOLDER: /app/Backend/pcap_runs
       LOCAL_PCAP_ALLOWED_ROOT: /app/Backend/pcap_runs
+      ZEEK_BIN: /usr/local/zeek/bin/zeek
       FRONTEND_BASE_URL: https://localhost:8081
       CORS_ALLOWED_ORIGINS: http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173,https://localhost:5173,https://localhost:5000,https://localhost:8081
       HTTPS_ENABLED: "true"

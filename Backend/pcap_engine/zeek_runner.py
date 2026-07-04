@@ -1,10 +1,12 @@
 import logging
+import os
 import re
+import shutil
 import subprocess
 import uuid
 from pathlib import Path
 
-ZEEK_PATH = "/usr/local/zeek/bin/zeek"
+DEFAULT_ZEEK_PATH = "/usr/local/zeek/bin/zeek"
 LOGGER = logging.getLogger(__name__)
 WINDOWS_ABS_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
@@ -33,6 +35,60 @@ def _windows_to_wsl_path(path_value: str, *, label: str) -> str:
     return f"/mnt/{drive}{normalized[2:]}"
 
 
+def _is_linux_absolute_path(path_value: str) -> bool:
+    return str(path_value or "").startswith("/")
+
+
+def _resolve_linux_zeek_bin() -> str:
+    configured = str(os.getenv("ZEEK_BIN") or "").strip()
+    if configured:
+        return configured
+    discovered = shutil.which("zeek")
+    if discovered:
+        return discovered
+    if Path(DEFAULT_ZEEK_PATH).exists():
+        return DEFAULT_ZEEK_PATH
+    return "zeek"
+
+
+def _build_zeek_command(pcap_path: str, run_folder: Path):
+    raw_pcap_path = str(pcap_path or "").strip()
+    raw_run_folder = str(run_folder)
+
+    if WINDOWS_ABS_PATH_RE.match(raw_pcap_path):
+        wsl_path = _windows_to_wsl_path(raw_pcap_path, label="pcap_path")
+        wsl_output = _windows_to_wsl_path(raw_run_folder, label="run_folder")
+        return (
+            [
+                "wsl",
+                "bash",
+                "-lc",
+                f'cd "{wsl_output}" && {DEFAULT_ZEEK_PATH} -C -r "{wsl_path}" LogAscii::use_json=T',
+            ],
+            None,
+            "wsl",
+        )
+
+    if _is_linux_absolute_path(raw_pcap_path):
+        linux_cwd = raw_run_folder.replace("\\", "/")
+        return (
+            [
+                _resolve_linux_zeek_bin(),
+                "-C",
+                "-r",
+                raw_pcap_path,
+                "LogAscii::use_json=T",
+            ],
+            linux_cwd,
+            "linux",
+        )
+
+    LOGGER.error("Invalid path passed to Zeek | pcap_path=%s", raw_pcap_path)
+    raise ValueError(
+        f"Zeek requires a Windows or Linux absolute path for pcap_path: {raw_pcap_path!r}"
+    )
+
+
 def run_zeek(
     pcap_path: str,
     output_base: str,
@@ -43,15 +99,7 @@ def run_zeek(
     run_folder.mkdir(parents=True, exist_ok=True)
     LOGGER.info("Starting Zeek run | pcap=%s | run_folder=%s", pcap_path, run_folder)
 
-    wsl_path = _windows_to_wsl_path(pcap_path, label="pcap_path")
-    wsl_output = _windows_to_wsl_path(str(run_folder), label="run_folder")
-
-    command = [
-        "wsl",
-        "bash",
-        "-lc",
-        f'cd "{wsl_output}" && {ZEEK_PATH} -C -r "{wsl_path}" LogAscii::use_json=T',
-    ]
+    command, cwd, mode = _build_zeek_command(pcap_path, run_folder)
 
     pcap_size_mb = Path(pcap_path).stat().st_size / (1024 * 1024)
     timeout_s = int(
@@ -60,6 +108,7 @@ def run_zeek(
 
     process = subprocess.Popen(
         command,
+        cwd=cwd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -94,7 +143,8 @@ def run_zeek(
 
     log_count = len(list(run_folder.glob("*.log")))
     LOGGER.info(
-        "Zeek run completed | run_folder=%s | log_files=%s",
+        "Zeek run completed | mode=%s | run_folder=%s | log_files=%s",
+        mode,
         run_folder,
         log_count,
     )

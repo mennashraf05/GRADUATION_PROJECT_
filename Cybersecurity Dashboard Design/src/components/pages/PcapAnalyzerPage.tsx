@@ -196,6 +196,11 @@ interface PcapJob {
   error?: string;
   report_available?: boolean;
   evidence_available?: boolean;
+  zeek_requested?: boolean;
+  zeek_status?: string;
+  zeek_error?: string;
+  zeek_required_files_found?: string[];
+  zeek_log_count?: number;
   artifact_protection?: ArtifactProtectionMetadata | null;
 }
 
@@ -350,6 +355,11 @@ type JobHistoryItem = {
   has_report?: boolean;
   report_available?: boolean;
   evidence_available?: boolean;
+  zeek_requested?: boolean;
+  zeek_status?: string;
+  zeek_error?: string;
+  zeek_required_files_found?: string[];
+  zeek_log_count?: number;
   artifact_protection?: ArtifactProtectionMetadata | null;
 };
 
@@ -365,6 +375,38 @@ type ExportableJobRef = {
   report_available: boolean;
   evidence_available: boolean;
 };
+
+function normalizeStringArray(raw: unknown): string[] {
+  return Array.isArray(raw) ? raw.map((item) => String(item)) : [];
+}
+
+function formatZeekEvidenceStatus(job?: {
+  evidence_available?: boolean;
+  zeek_requested?: boolean;
+  zeek_status?: string;
+  zeek_error?: string;
+  zeek_required_files_found?: string[];
+  zeek_log_count?: number;
+} | null): string {
+  if (!job) return "Zeek evidence is not available for this job.";
+  if (job.evidence_available) return "Evidence export is available for this job.";
+  const status = String(job.zeek_status ?? "").trim().toLowerCase();
+  if (status === "not_requested" || job.zeek_requested === false) {
+    return "Zeek evidence was not requested for this job.";
+  }
+  if (status === "running" || status === "requested") {
+    return "Zeek evidence is still being prepared.";
+  }
+  if (status === "failed") {
+    return job.zeek_error
+      ? `Zeek evidence failed: ${job.zeek_error}`
+      : "Zeek evidence failed for this job.";
+  }
+  if (status === "no_logs") {
+    return "Zeek ran, but no recognized evidence logs were found.";
+  }
+  return "Zeek evidence is not available for this job.";
+}
 
 /** ================== Helpers ================== **/
 function normalizeArtifactProtection(
@@ -2531,6 +2573,10 @@ export function PcapAnalyzerPage() {
         duration_s: 0,
         report_available: false,
         evidence_available: false,
+        zeek_requested: includeZeek,
+        zeek_status: includeZeek ? "requested" : "not_requested",
+        zeek_required_files_found: [],
+        zeek_log_count: 0,
       });
       setPollingEnabled(
         nextStatus === "queued" || nextStatus === "running"
@@ -2735,6 +2781,11 @@ export function PcapAnalyzerPage() {
                 error: (j.error as string | undefined) ?? prev.error,
                 report_available: Boolean(j.report_available),
                 evidence_available: Boolean(j.evidence_available),
+                zeek_requested: Boolean(j.zeek_requested),
+                zeek_status: j.zeek_status ? String(j.zeek_status) : undefined,
+                zeek_error: j.zeek_error ? String(j.zeek_error) : undefined,
+                zeek_required_files_found: normalizeStringArray(j.zeek_required_files_found),
+                zeek_log_count: Number(j.zeek_log_count ?? 0) || 0,
                 artifact_protection: artifactProtection,
               }
             : prev
@@ -2861,6 +2912,11 @@ export function PcapAnalyzerPage() {
           has_report: Boolean(item.has_report),
           report_available: Boolean(item.report_available),
           evidence_available: Boolean(item.evidence_available),
+          zeek_requested: Boolean(item.zeek_requested),
+          zeek_status: item.zeek_status ? String(item.zeek_status) : undefined,
+          zeek_error: item.zeek_error ? String(item.zeek_error) : undefined,
+          zeek_required_files_found: normalizeStringArray(item.zeek_required_files_found),
+          zeek_log_count: Number(item.zeek_log_count ?? 0) || 0,
           artifact_protection: normalizeArtifactProtection(item.artifact_protection),
         })
       );
@@ -3112,6 +3168,11 @@ export function PcapAnalyzerPage() {
         error: payload.error ? String(payload.error) : undefined,
         report_available: Boolean(payload.report_available),
         evidence_available: Boolean(payload.evidence_available),
+        zeek_requested: Boolean(payload.zeek_requested),
+        zeek_status: payload.zeek_status ? String(payload.zeek_status) : undefined,
+        zeek_error: payload.zeek_error ? String(payload.zeek_error) : undefined,
+        zeek_required_files_found: normalizeStringArray(payload.zeek_required_files_found),
+        zeek_log_count: Number(payload.zeek_log_count ?? 0) || 0,
         artifact_protection: normalizeArtifactProtection(
           payload.artifact_protection ??
             ((payload.report as Record<string, unknown> | undefined)?.meta as
@@ -3534,7 +3595,7 @@ export function PcapAnalyzerPage() {
         detail: job?.evidence_available
           ? "Evidence export is available for this job."
           : report
-          ? "Evidence exports depend on backend artifacts."
+          ? formatZeekEvidenceStatus(job)
           : "Artifacts appear after analysis completes.",
         tone:
           job?.evidence_available || job?.report_available || report
@@ -3933,6 +3994,11 @@ export function PcapAnalyzerPage() {
                                   <Button
                                     size="sm"
                                     variant="outline"
+                                    title={
+                                      cardCanExportEvidence
+                                        ? "Evidence export is available for this job."
+                                        : formatZeekEvidenceStatus(j)
+                                    }
                                     disabled={!cardCanExportEvidence || exporting !== null}
                                     onClick={() =>
                                       void downloadJobArtifact(j.job_id, "evidence")
@@ -3941,6 +4007,11 @@ export function PcapAnalyzerPage() {
                                     <Archive className="w-4 h-4" />
                                     Evidence
                                   </Button>
+                                  {normalizedStatus === "done" && !cardCanExportEvidence ? (
+                                    <div className="basis-full text-xs text-slate-500 xl:max-w-[260px] xl:text-right">
+                                      {formatZeekEvidenceStatus(j)}
+                                    </div>
+                                  ) : null}
                                 </div>
                               </div>
                             </div>

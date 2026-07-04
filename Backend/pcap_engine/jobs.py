@@ -75,6 +75,11 @@ class JobState:
     analysis_key: Optional[str] = None
     file_hash: Optional[str] = None
     artifact_protection: Optional[Dict[str, Any]] = None
+    zeek_requested: bool = False
+    zeek_status: Optional[str] = None
+    zeek_error: Optional[str] = None
+    zeek_required_files_found: Optional[list[str]] = None
+    zeek_log_count: int = 0
     cancellation_requested: bool = False
     cancelled_at: Optional[str] = None
     cancel_reason: Optional[str] = None

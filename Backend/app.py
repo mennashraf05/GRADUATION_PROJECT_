@@ -3213,6 +3213,14 @@ def run_pcap_pipeline(
     zeek_run_folder = None
     zeek_load_succeeded = False
     zeek_evidence_available = False
+    jobs.update(
+        job_id,
+        zeek_requested=bool(include_zeek),
+        zeek_status="requested" if include_zeek else "not_requested",
+        zeek_error=None,
+        zeek_required_files_found=[],
+        zeek_log_count=0,
+    )
 
     try:
         _raise_if_pcap_cancelled(job_id)
@@ -3221,6 +3229,7 @@ def run_pcap_pipeline(
                 job_id,
                 progress=12,
                 message="Exporting packets (Zeek running in parallel)",
+                zeek_status="running",
             )
             _raise_if_pcap_cancelled(job_id)
             zeek_bg_pool = ThreadPoolExecutor(max_workers=1)
@@ -3334,7 +3343,21 @@ def run_pcap_pipeline(
                     frame is not None and not frame.empty
                     for frame in (conn_df, dns_ev, http_ev, ssl_ev)
                 )
-            except Exception:
+                required_files_found = [
+                    name
+                    for name in ZEEK_EVIDENCE_FILES
+                    if (Path(zeek_folder) / name).exists()
+                    and (Path(zeek_folder) / name).is_file()
+                ]
+                jobs.update(
+                    job_id,
+                    zeek_status="succeeded" if required_files_found else "no_logs",
+                    zeek_error=None,
+                    zeek_required_files_found=required_files_found,
+                    zeek_log_count=len(list(Path(zeek_folder).glob("*.log"))),
+                )
+            except Exception as exc:
+                zeek_error = str(exc).strip() or exc.__class__.__name__
                 logging.exception(
                     "Zeek evidence loading failed; continuing with base detection only | job_id=%s",
                     job_id,
@@ -3343,6 +3366,10 @@ def run_pcap_pipeline(
                     job_id,
                     progress=zeek_loading_progress,
                     message="Continuing without Zeek evidence",
+                    zeek_status="failed",
+                    zeek_error=zeek_error[-1000:],
+                    zeek_required_files_found=[],
+                    zeek_log_count=0,
                 )
                 conn_df = None
                 dns_ev = pd.DataFrame()
@@ -3469,12 +3496,23 @@ def _collect_job_export_artifacts(st):
         state_path = None
 
     zeek_files = []
+    evidence_path = None
+    invalid_evidence_dir = False
     evidence_dir = getattr(st, "evidence_dir", None)
     if evidence_dir:
-        evidence_path = Path(evidence_dir)
-        if evidence_path.exists():
+        try:
+            evidence_path = ensure_path_within_directory(evidence_dir, BASE_RUN_FOLDER)
+        except (OSError, ValueError):
+            invalid_evidence_dir = True
+            evidence_path = None
+        if evidence_path is not None and evidence_path.exists() and evidence_path.is_dir():
             for name in ZEEK_EVIDENCE_FILES:
                 path = evidence_path / name
+                try:
+                    path = ensure_path_within_directory(path, evidence_path)
+                except (OSError, ValueError):
+                    invalid_evidence_dir = True
+                    continue
                 if path.exists() and path.is_file():
                     zeek_files.append((name, path))
 
@@ -3482,12 +3520,16 @@ def _collect_job_export_artifacts(st):
         "job_dir": job_dir,
         "report_path": report_path,
         "state_path": state_path,
+        "evidence_dir": evidence_path,
+        "invalid_evidence_dir": invalid_evidence_dir,
         "zeek_files": zeek_files,
     }
 
 
 def _build_job_evidence_bundle(st):
     artifacts = _collect_job_export_artifacts(st)
+    if artifacts.get("invalid_evidence_dir"):
+        raise ValueError("Evidence directory is outside the allowed PCAP run folder")
     if not artifacts["zeek_files"]:
         return None
 
@@ -3503,14 +3545,45 @@ def _build_job_evidence_bundle(st):
             state_path = ensure_path_within_directory(artifacts["state_path"], job_dir)
             zf.write(state_path, "state.json")
         for name, path in artifacts["zeek_files"]:
-            evidence_path = ensure_path_within_directory(path, job_dir)
+            evidence_path = ensure_path_within_directory(path, BASE_RUN_FOLDER)
             zf.write(evidence_path, f"zeek/{name}")
 
     return bundle_path
 
 
+def _job_zeek_diagnostics(st, artifacts=None) -> dict:
+    artifacts = artifacts or _collect_job_export_artifacts(st)
+    found_files = [name for name, _path in artifacts.get("zeek_files", [])]
+    requested = bool(
+        getattr(st, "zeek_requested", False)
+        or getattr(st, "evidence_dir", None)
+        or found_files
+    )
+    status = getattr(st, "zeek_status", None)
+    if artifacts.get("invalid_evidence_dir"):
+        status = "failed"
+    elif not status:
+        if not requested:
+            status = "not_requested"
+        elif found_files:
+            status = "succeeded"
+        else:
+            status = "no_logs"
+    error = getattr(st, "zeek_error", None)
+    if artifacts.get("invalid_evidence_dir") and not error:
+        error = "Configured evidence directory is outside the allowed PCAP run folder."
+    return {
+        "zeek_requested": requested,
+        "zeek_status": status,
+        "zeek_error": error,
+        "zeek_required_files_found": found_files,
+        "zeek_log_count": int(getattr(st, "zeek_log_count", 0) or len(found_files)),
+    }
+
+
 def _job_history_item(st):
     artifacts = _collect_job_export_artifacts(st)
+    zeek_diagnostics = _job_zeek_diagnostics(st, artifacts)
     upload_name = _safe_pcap_upload_name(st)
     has_upload = bool(getattr(st, "upload_path", None))
     has_report = artifacts["report_path"] is not None
@@ -3532,6 +3605,7 @@ def _job_history_item(st):
         "has_report": has_report,
         "report_available": has_report,
         "evidence_available": bool(artifacts["zeek_files"]),
+        **zeek_diagnostics,
         "artifact_protection": getattr(st, "artifact_protection", None),
         "error": error_summary,
     }
@@ -4481,7 +4555,15 @@ def analyze_pcap():
             return reused_response
 
         job_id = st.job_id
-        jobs.update(job_id, file_hash=file_hash)
+        jobs.update(
+            job_id,
+            file_hash=file_hash,
+            zeek_requested=bool(include_zeek),
+            zeek_status="requested" if include_zeek else "not_requested",
+            zeek_error=None,
+            zeek_required_files_found=[],
+            zeek_log_count=0,
+        )
         upload_name = Path(upload_path).name
         has_prior_analysis = (
             UserActivityLog.query.filter(
@@ -5806,6 +5888,7 @@ def get_job(job_id):
         return job_error
 
     artifacts = _collect_job_export_artifacts(st)
+    zeek_diagnostics = _job_zeek_diagnostics(st, artifacts)
     upload_name = _safe_pcap_upload_name(st)
     has_upload = bool(getattr(st, "upload_path", None))
     has_report = artifacts["report_path"] is not None
@@ -5826,6 +5909,7 @@ def get_job(job_id):
         "has_report": has_report,
         "report_available": has_report,
         "evidence_available": bool(artifacts["zeek_files"]),
+        **zeek_diagnostics,
         "artifact_protection": getattr(st, "artifact_protection", None),
     }
     if st.status in {"queued", "running"}:
@@ -6193,7 +6277,15 @@ def analyze_local():
             return reused_response
 
         job_id = st.job_id
-        jobs.update(job_id, file_hash=file_hash)
+        jobs.update(
+            job_id,
+            file_hash=file_hash,
+            zeek_requested=bool(include_zeek),
+            zeek_status="requested" if include_zeek else "not_requested",
+            zeek_error=None,
+            zeek_required_files_found=[],
+            zeek_log_count=0,
+        )
         upload_name = Path(pcap_path).name
         has_prior_analysis = (
             UserActivityLog.query.filter(

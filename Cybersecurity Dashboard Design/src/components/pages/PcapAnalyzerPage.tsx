@@ -1742,7 +1742,7 @@ function AlertDetailsSheet({
         animate={{ x: 0, opacity: 1 }}
         exit={{ x: 56, opacity: 0 }}
         transition={{ duration: 0.22 }}
-        className="absolute inset-y-0 right-0 w-full max-w-6xl border-l border-white/10 cyber-card shadow-2xl"
+        className="absolute inset-y-0 right-0 w-full border-l border-white/10 cyber-card shadow-2xl"
       >
         <div className="flex h-full min-h-0 flex-col">
           <div className="shrink-0 border-b border-white/10 cyber-panel px-6 py-5">
